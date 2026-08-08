@@ -59,8 +59,8 @@ function parseComponent(value: unknown): ComponentHealth | null {
 
 /**
  * Validates an arbitrary JSON payload against the shape `/healthz` promises.
- * Returns null rather than throwing, so a wrong `NEXT_PUBLIC_API_URL` pointing
- * at some other service degrades into a rendered message instead of a crash.
+ * Returns null rather than throwing, so a wrong `API_URL` pointing at some
+ * other service degrades into a rendered message instead of a crash.
  */
 export function parseHealth(value: unknown): ApiHealth | null {
   if (!isRecord(value) || typeof value.status !== "string") {
