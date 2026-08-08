@@ -197,6 +197,15 @@ func (h *Hub) dispatch() {
 // loop does per connection is a non-blocking channel send. Connections whose
 // buffer is full are collected and dealt with after the lock is released:
 // closing one takes the write lock, so doing it inline would deadlock.
+//
+// Note that closing a connection here does not deregister it here. That happens
+// in [Conn.serve]'s cleanup, which cannot run until the connection's own
+// goroutines stop — and for a stalled peer that means waiting out the frame in
+// flight, up to WriteTimeout. So a dropped client can still appear in this map
+// for a moment afterwards. It is harmless: trySend short-circuits on a closed
+// connection, so it receives nothing and costs nothing. Deregistering from this
+// goroutine instead would mean taking the write lock in the middle of fan-out,
+// which is the one thing this loop exists to avoid.
 func (h *Hub) deliver(msg Message) {
 	var slow []*Conn
 
