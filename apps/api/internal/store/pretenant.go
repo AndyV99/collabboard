@@ -3,10 +3,20 @@ package store
 // The pre-tenant identity path — the second door, and the only other one.
 //
 // [Store.WithTenant] is the door for everything that happens inside a tenant.
-// This is the door for the three things that happen before there is one: login
-// by email, "which organizations do I belong to", and creating a global user so
-// that an invite has something to point at. See issue #13,
+// This is the door for the things that happen before there is one: login by
+// email and password, "which organizations do I belong to", and creating a
+// global user so that an invite has something to point at. See issue #13,
 // docs/adr/0002-pre-tenant-identity-path.md, and migration 00004.
+//
+// Issue #8 added the credential queries — [IdentityQuerier.PasswordParams],
+// [IdentityQuerier.VerifyPassword] and [IdentityQuerier.CreatePassword]. They
+// travel this same Go door, but their SECURITY DEFINER functions are owned by a
+// *different* database role from the four originals: collabboard_credentials,
+// which holds column privileges on one table in a schema (auth) the serving
+// role has no USAGE on, and no privilege of any kind in public. So the identity
+// role's reach did not grow by one column to accommodate a password — a
+// strictly narrower second role was created for it. See migration 00005 and
+// docs/adr/0003-password-verifier-storage.md.
 //
 // # Why it cannot be a widened WithTenant
 //
@@ -26,15 +36,19 @@ package store
 //     querier. The two share no methods, so q.ListProjects is a compile error
 //     here — not a lint warning, not a review comment.
 //  2. Every one of those methods is a call to a SECURITY DEFINER function
-//     created in migration 00004. The app role holds EXECUTE on exactly four
-//     functions and can read nothing without a tenant otherwise.
-//  3. Those functions run as collabboard_identity, which holds column-level
-//     privileges on users, memberships and organizations and *no privileges at
-//     all* on projects, boards, columns or cards. A function body that reached
-//     for a tenant-scoped table would fail with "permission denied for table
-//     projects" rather than returning another tenant's rows.
+//     created in migration 00004 or 00005. The app role holds EXECUTE on
+//     exactly those functions and can read nothing without a tenant otherwise.
+//  3. Those functions run as one of two NOLOGIN roles, neither of which can
+//     reach the other's data. collabboard_identity holds column-level
+//     privileges on users, memberships and organizations, *no privileges at
+//     all* on projects, boards, columns or cards, and nothing in the auth
+//     schema — so it cannot read a password verifier. collabboard_credentials
+//     holds column privileges on auth.user_credentials and nothing in public
+//     at all — so it cannot read an email, a display name or a membership. A
+//     function body that reached across would fail with "permission denied"
+//     rather than returning the data.
 //  4. Every call names an [IdentityReason] from a closed set and is logged.
-//     A use that does not fit one of the four reasons has nowhere to hide.
+//     A use that does not fit one of the reasons has nowhere to hide.
 //
 // So widening this path is not a matter of adding a Go method. It takes a
 // migration that adds a function, a grant, possibly a privilege on a table the
@@ -57,7 +71,7 @@ import (
 // tenant-scoped ones are: callers need to name them without being able to
 // import the package that constructs a querier. See types.go.
 type (
-	// IdentityQuerier is the complete pre-tenant surface: four queries, each
+	// IdentityQuerier is the complete pre-tenant surface: seven queries, each
 	// one a call to a SECURITY DEFINER function. Callers never construct one;
 	// [Store.WithoutTenant] hands it over.
 	//
@@ -80,6 +94,22 @@ type (
 	// [IdentityQuerier.ListUserOrganizations] — an organization the user
 	// belongs to, and their role in it.
 	UserOrganization = identitygen.ListUserOrganizationsRow
+
+	// PasswordKDFParams are the argon2id parameters
+	// [IdentityQuerier.PasswordParams] returns: a salt and a cost, both public
+	// by construction. There is no verifier field, here or anywhere else — the
+	// stored value never leaves the database. See ADR 0003.
+	PasswordKDFParams = identitygen.PasswordParamsRow
+
+	// VerifyPasswordParams are the arguments to
+	// [IdentityQuerier.VerifyPassword]. Key is the raw argon2id output, which
+	// the database hashes once more before comparing; it is not the password
+	// and not the stored value.
+	VerifyPasswordParams = identitygen.VerifyPasswordParams
+
+	// CreatePasswordParams are the arguments to
+	// [IdentityQuerier.CreatePassword].
+	CreatePasswordParams = identitygen.CreatePasswordParams
 )
 
 // ErrNotFound is what a single-row query returns when there is no row.
@@ -113,8 +143,8 @@ const clearTenantSQL = `SELECT set_config('app.tenant_id', '', true)`
 //
 // A struct with one unexported field rather than a string, so the set of
 // reasons is closed: the constants below are the only values any package can
-// name, and a caller who wants a fifth has to add it here, next to the other
-// four and next to the queries they justify. That is the same friction as
+// name, and a caller who wants another has to add it here, next to the existing
+// ones and next to the queries they justify. That is the same friction as
 // adding an alias to types.go, and it exists for the same reason.
 type IdentityReason struct{ name string }
 
@@ -127,7 +157,7 @@ func (r IdentityReason) String() string {
 	return r.name
 }
 
-// The four reasons the pre-tenant path exists. Each one maps to an operation
+// The reasons the pre-tenant path exists. Each one maps to an operation
 // that cannot run inside a tenant-scoped transaction — see identity_query.sql
 // for the justification per query.
 var (
@@ -143,10 +173,22 @@ var (
 	// which by definition lives outside the inviting tenant's visibility.
 	ReasonInviteLookup = IdentityReason{name: "invite_lookup"}
 
-	// ReasonRegisterUser: creating a global identity. A tenant-scoped
-	// transaction cannot, because the membership that would satisfy the users
-	// policy cannot exist before the user row does.
+	// ReasonRegisterUser: creating a global identity, together with the
+	// credential that identity authenticates with. Both halves run in one
+	// transaction, so a user row can never be committed without the password
+	// that makes it usable.
 	ReasonRegisterUser = IdentityReason{name: "register_user"}
+
+	// ReasonPasswordParams: reading the argon2id parameters for a login, which
+	// happens before any organization has been claimed. Separate from
+	// ReasonVerifyPassword because it is a separate transaction — the ~80ms
+	// derivation happens between the two, and holding a pooled connection open
+	// across it would let a handful of concurrent logins exhaust the pool.
+	ReasonPasswordParams = IdentityReason{name: "password_params"}
+
+	// ReasonVerifyPassword: comparing a derived key against the stored
+	// verifier. Pre-tenant for the same reason the lookup that preceded it is.
+	ReasonVerifyPassword = IdentityReason{name: "verify_password"}
 )
 
 // IdentityFunc runs inside the pre-tenant transaction. The querier it receives
@@ -249,7 +291,7 @@ func (s *Store) WithoutTenant(ctx context.Context, reason IdentityReason, fn Ide
 }
 
 // WithoutTenantValue is [Store.WithoutTenant] for a callback that produces a
-// value, exactly as [InTenant] is for [Store.WithTenant]. Every one of the four
+// value, exactly as [InTenant] is for [Store.WithTenant]. Every one of the
 // pre-tenant operations returns something, so without this each call site would
 // declare a variable outside a closure just to smuggle the result out.
 //

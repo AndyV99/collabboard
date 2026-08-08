@@ -11,6 +11,20 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 )
 
+// Password verifiers: sha256(argon2id(password)). Not the password hash — the stored value cannot be replayed to the verify function. See ADR 0003.
+type AuthUserCredential struct {
+	UserID      uuid.UUID
+	Algorithm   string
+	Salt        []byte
+	MemoryKib   int32
+	Iterations  int32
+	Parallelism int32
+	KeyLength   int32
+	// sha256() of the argon2id derived key. The application never receives this column; it sends the derived key and the database hashes and compares.
+	Verifier  []byte
+	CreatedAt time.Time
+}
+
 type Board struct {
 	ID         uuid.UUID
 	TenantID   uuid.UUID

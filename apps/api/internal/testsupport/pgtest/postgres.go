@@ -42,6 +42,20 @@ const (
 	// the catalog what it is and is not allowed to touch.
 	IdentityRole = "collabboard_identity"
 
+	// CredentialsRole owns the three password functions that migration 00005
+	// creates. Like IdentityRole it cannot log in and has no DSN. It is a
+	// separate role from IdentityRole precisely so that the identity path
+	// cannot read a password verifier and the credential path cannot read an
+	// email — see docs/adr/0003-password-verifier-storage.md.
+	//nolint:gosec // G101 pattern-matches the word "credentials"; this is a
+	// Postgres role name, and the role has no password by construction.
+	CredentialsRole = "collabboard_credentials"
+
+	// AuthSchema holds credential storage. The serving role deliberately has no
+	// USAGE on it, which is a stronger boundary than a row-level policy: it
+	// cannot name the table at all.
+	AuthSchema = "auth"
+
 	// Database is the database the migrations are applied to.
 	Database = "collabboard"
 )

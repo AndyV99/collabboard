@@ -118,7 +118,10 @@ Identity operations that happen *before* a tenant is known cannot run through
 a row is visible only if a membership joins it to the current tenant — so with
 no tenant set, the app role sees zero rows in `users`, `memberships` and
 `organizations`. That is the correct fail-closed behaviour, and it is also why
-these four operations are *impossible* rather than merely awkward.
+these operations are *impossible* rather than merely awkward. The same is
+true of the credential half added by issue #8: `auth.user_credentials` lives in
+a schema the app role holds no `USAGE` on, so it cannot name the table at all,
+with or without a tenant.
 
 ```go
 user, err := store.WithoutTenantValue(ctx, s, store.ReasonLogin,
@@ -133,6 +136,9 @@ user, err := store.WithoutTenantValue(ctx, s, store.ReasonLogin,
 | `ResolveUserIDByEmail` | inviting an existing account: the point is to look *outside* the inviting tenant's visibility |
 | `ListUserOrganizations` | the org switcher: the question is "which tenants", so none can be current |
 | `CreateUser` | the `users` `WITH CHECK` policy needs a membership that cannot exist before the user row does |
+| `PasswordParams` | login: the KDF parameters, read before any organization has been claimed |
+| `VerifyPassword` | login: the comparison, performed inside the database |
+| `CreatePassword` | registration: same transaction as `CreateUser`, and before any tenant exists |
 
 Everything else belongs in `WithTenant`. Adding a member to an organization,
 for instance, is *not* pre-tenant: `CreateMembership` lives in `query.sql` and
@@ -156,30 +162,38 @@ single edit makes them all true.
    Both are under a nested `internal`, so neither constructor is importable
    outside `internal/store`.
 
-2. **Function grants.** Every one of those four methods is a call to a
+2. **Function grants.** Every one of those methods is a call to a
    `SECURITY DEFINER` function created in
-   [`migrations/00004_pre_tenant_identity.sql`](../../migrations/00004_pre_tenant_identity.sql).
-   `collabboard_app` holds `EXECUTE` on exactly those four and can read nothing
+   [`migrations/00004_pre_tenant_identity.sql`](../../migrations/00004_pre_tenant_identity.sql)
+   or [`migrations/00005_auth_credentials.sql`](../../migrations/00005_auth_credentials.sql).
+   `collabboard_app` holds `EXECUTE` on exactly those seven and can read nothing
    without a tenant otherwise.
 
-3. **Table grants.** Those functions run as `collabboard_identity`, which holds
-   *column-level* privileges on `users`, `memberships` and `organizations` and
-   **no privilege of any kind** on `projects`, `boards`, `columns` or `cards`.
-   A definer function that reached for a tenant-scoped table fails with
-   `permission denied for table projects` — asserted at runtime in
-   `pretenant_narrow_test.go`, which builds that exact function and calls it.
-   `collabboard_identity` also cannot log in, is not a superuser, holds no
-   `BYPASSRLS` and owns no tables, and `collabboard_app` is not a member of it,
-   so the serving role cannot `SET ROLE` to it.
+3. **Table grants, and two owners rather than one.** The four identity functions
+   run as `collabboard_identity`, which holds *column-level* privileges on
+   `users`, `memberships` and `organizations`, **no privilege of any kind** on
+   `projects`, `boards`, `columns` or `cards`, and nothing in schema `auth`. The
+   three credential functions run as `collabboard_credentials`, which holds
+   column privileges on `auth.user_credentials` and **no privilege of any kind
+   in schema `public`**. Neither role can reach the other's data: the identity
+   path cannot read a password verifier, and the credential path cannot read an
+   email. A definer function that reached across fails with `permission denied`
+   — asserted at runtime in `credentials_test.go`, which builds both of those
+   functions and calls them. Neither role can log in, neither is a superuser,
+   neither holds `BYPASSRLS`, neither owns a table, and `collabboard_app` is a
+   member of neither, so the serving role cannot `SET ROLE` to either.
 
 4. **A named reason.** Every call passes an `IdentityReason` from a closed set
-   (a struct with an unexported field, so the four constants are the only
-   values any package can name), and every call is logged with it. The zero
-   value is rejected.
+   (a struct with an unexported field, so the constants are the only values
+   any package can name), and every call is logged with it. The zero value is
+   rejected.
 
 So widening the path is not a Go method away. It takes a migration that adds a
-function, a grant, possibly a privilege the identity role has never held, and a
-fifth reason — each a line in a diff that says what it is doing.
+function, a grant, possibly a privilege no pre-tenant role has ever held, and a
+new reason — each a line in a diff that says what it is doing. Issue #8 is the
+worked example: it needed all four, and it chose a *new role* over a new grant
+to the existing one, so the identity role's reach is byte-for-byte what ADR 0002
+left it. See [ADR 0003](../../../../docs/adr/0003-password-verifier-storage.md).
 
 **The one thing it cannot enforce:** `ListUserOrganizations` does not authorize.
 Callers must pass the id of the already-authenticated subject; passing one from
@@ -209,6 +223,7 @@ go test -tags=integration ./internal/store/...  # ~4s, brings up Postgres
 | `identity_test.go` | `integration` | that the connection under test is actually `collabboard_app` |
 | `pretenant_test.go` | `integration` | each pre-tenant query, including one user's memberships spanning two tenants and an invite end to end |
 | `pretenant_narrow_test.go` | `integration` | that the pre-tenant path cannot reach tenant-scoped data, from the catalog *and* by building a definer function that tries |
+| `credentials_test.go` | `integration` | that the two pre-tenant roles cannot reach each other's data, that the app role cannot enter schema `auth`, and a password round trip |
 | `main_test.go`, `testdb_test.go` | `integration` | container lifecycle and fixtures |
 
 The harness is `internal/testsupport/pgtest`: a Postgres container on a random

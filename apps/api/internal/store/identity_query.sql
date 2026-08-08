@@ -83,3 +83,65 @@ SELECT
     c.display_name::text AS display_name,
     c.created_at::timestamptz AS created_at
 FROM public.identity_create_user(@email, @display_name) AS c(id, email, display_name, created_at);
+
+-- The three queries below are the credential half of the pre-tenant path, added
+-- by issue #8. They travel the same Go door as the four above —
+-- Store.WithoutTenant — but their SECURITY DEFINER functions are owned by
+-- collabboard_credentials rather than collabboard_identity, and that role's
+-- privileges are strictly narrower: one table, in a schema (`auth`) the serving
+-- role holds no USAGE on, and nothing at all in `public`.
+--
+-- So the identity door did not widen to accommodate a password. A second,
+-- smaller door was cut next to it. See migration 00005 and ADR 0003.
+--
+-- Admission rule, same as above: each has to be *impossible* through
+-- Store.WithTenant. All three are, for the reason login is — they run before
+-- any organization has been claimed, and their subject is a global user rather
+-- than a tenant-scoped row.
+
+-- name: PasswordParams :one
+-- Step one of a login: the argon2id parameters needed to reproduce the
+-- derivation for this user.
+--
+-- Returns no secret. A salt and a cost are public by construction — the code
+-- that needs them is the code that has to run the KDF — and the verifier is not
+-- in the function's return list at all. There is no query anywhere that returns
+-- it, which is the property ADR 0003 is about.
+--
+-- No row means the user has no password set. internal/auth must not branch
+-- visibly on that: it derives stand-in parameters and does the full derivation
+-- anyway, so an unknown account costs what a known one does.
+SELECT
+    p.salt::bytea AS salt,
+    p.memory_kib::integer AS memory_kib,
+    p.iterations::integer AS iterations,
+    p.parallelism::integer AS parallelism,
+    p.key_length::integer AS key_length
+FROM public.identity_password_params(@user_id) AS p(salt, memory_kib, iterations, parallelism, key_length);
+
+-- name: VerifyPassword :one
+-- Step two of a login: the comparison, performed inside the database.
+--
+-- The argument is the raw argon2id output, not the password and not the stored
+-- value. Postgres hashes it once more and compares against the stored verifier,
+-- so what is stored can never be replayed here.
+--
+-- A uuid or no row. Never a boolean and never a reason: "no such user", "no
+-- password set" and "wrong password" are the same empty result, so no caller
+-- can leak which one happened by forwarding a status it was handed.
+SELECT v.user_id::uuid AS user_id
+FROM public.identity_verify_password(@user_id, @key) AS v(user_id);
+
+-- name: CreatePassword :one
+-- Registration. Pre-tenant for the same reason CreateUser is: it runs in the
+-- same transaction, immediately after the user row it refers to, and before any
+-- organization exists to scope it to.
+--
+-- INSERT with no ON CONFLICT, so calling it for a user who already has a
+-- credential raises unique_violation (23505) rather than silently overwriting
+-- one. Changing a password is a different feature and needs a different
+-- function, a different grant and its own review — this path cannot do it.
+SELECT c.user_id::uuid AS user_id
+FROM public.identity_create_password(
+    @user_id, @salt, @memory_kib, @iterations, @parallelism, @key_length, @key
+) AS c(user_id);

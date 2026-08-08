@@ -25,13 +25,23 @@ import (
 //
 // Kept here rather than derived, because a test that read the method set and
 // compared it to itself would pass no matter what the method set became. Adding
-// a fifth pre-tenant query has to break this test: that is the whole point of
-// writing the list down.
+// a pre-tenant query has to break this test: that is the whole point of writing
+// the list down.
+//
+// It went from four to seven in issue #8. The three additions are the
+// credential half of login and registration, and the reason that is not a
+// widening of #13's door is that their SECURITY DEFINER functions are owned by
+// collabboard_credentials, a role with no privilege of any kind in schema
+// public — see migration 00005, ADR 0003, and credentials_test.go, which
+// asserts the two roles cannot reach each other's data.
 var identityQueries = []string{
+	"CreatePassword",
 	"CreateUser",
 	"FindUserByEmail",
 	"ListUserOrganizations",
+	"PasswordParams",
 	"ResolveUserIDByEmail",
+	"VerifyPassword",
 }
 
 func TestWithoutTenantRejectsBadArgumentsBeforeTouchingTheDatabase(t *testing.T) {
@@ -93,6 +103,8 @@ func TestEveryReasonIsDistinctAndNamed(t *testing.T) {
 		"ReasonListOrganizations": store.ReasonListOrganizations,
 		"ReasonInviteLookup":      store.ReasonInviteLookup,
 		"ReasonRegisterUser":      store.ReasonRegisterUser,
+		"ReasonPasswordParams":    store.ReasonPasswordParams,
+		"ReasonVerifyPassword":    store.ReasonVerifyPassword,
 	}
 
 	seen := make(map[string]string, len(reasons))

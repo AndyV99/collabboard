@@ -20,6 +20,19 @@ type Querier interface {
 	// visible to this tenant at all, since users_visible_via_membership is derived
 	// from this table.
 	CreateMembership(ctx context.Context, arg CreateMembershipParams) (Membership, error)
+	// Registration creates the tenant it is about to belong to.
+	//
+	// The id is public.current_tenant_id() rather than a parameter, which reads
+	// oddly until you notice it is the same rule as every other write in this file:
+	// the tenant comes from the transaction, never from the caller. An organization
+	// *is* its tenant, so its primary key is that value. The caller generates a
+	// uuid, opens WithTenant against it, and inserts — which is exactly the
+	// sequence 00002_tenancy.sql predicts when it says creating an organization
+	// "works under this policy without an exception".
+	//
+	// The WITH CHECK half of organizations_tenant_isolation is therefore
+	// unreachable in practice here: there is no argument to get wrong.
+	CreateOrganization(ctx context.Context, arg CreateOrganizationParams) (Organization, error)
 	// The tenant comes from the transaction, never from the caller: an INSERT cannot
 	// name a tenant it is not already scoped to, so the WITH CHECK half of the
 	// policy is unreachable in practice rather than merely unviolated.

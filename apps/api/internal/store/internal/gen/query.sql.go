@@ -45,6 +45,42 @@ func (q *Queries) CreateMembership(ctx context.Context, arg CreateMembershipPara
 	return i, err
 }
 
+const createOrganization = `-- name: CreateOrganization :one
+INSERT INTO organizations (id, name, slug)
+VALUES (public.current_tenant_id(), $1, $2)
+RETURNING id, name, slug, created_at, updated_at
+`
+
+type CreateOrganizationParams struct {
+	Name string
+	Slug string
+}
+
+// Registration creates the tenant it is about to belong to.
+//
+// The id is public.current_tenant_id() rather than a parameter, which reads
+// oddly until you notice it is the same rule as every other write in this file:
+// the tenant comes from the transaction, never from the caller. An organization
+// *is* its tenant, so its primary key is that value. The caller generates a
+// uuid, opens WithTenant against it, and inserts — which is exactly the
+// sequence 00002_tenancy.sql predicts when it says creating an organization
+// "works under this policy without an exception".
+//
+// The WITH CHECK half of organizations_tenant_isolation is therefore
+// unreachable in practice here: there is no argument to get wrong.
+func (q *Queries) CreateOrganization(ctx context.Context, arg CreateOrganizationParams) (Organization, error) {
+	row := q.db.QueryRow(ctx, createOrganization, arg.Name, arg.Slug)
+	var i Organization
+	err := row.Scan(
+		&i.ID,
+		&i.Name,
+		&i.Slug,
+		&i.CreatedAt,
+		&i.UpdatedAt,
+	)
+	return i, err
+}
+
 const createProject = `-- name: CreateProject :one
 INSERT INTO projects (tenant_id, name, description)
 VALUES (public.current_tenant_id(), $1, $2)
