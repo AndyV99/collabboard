@@ -57,6 +57,6 @@ func recovery(logger *slog.Logger) gin.HandlerFunc {
 			slog.String("path", c.FullPath()),
 		)
 
-		c.AbortWithStatusJSON(http.StatusInternalServerError, gin.H{"error": "internal server error"})
+		c.AbortWithStatusJSON(http.StatusInternalServerError, errorResponse{Error: messageInternalError})
 	})
 }

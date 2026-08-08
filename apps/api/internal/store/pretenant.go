@@ -63,6 +63,7 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 
 	"github.com/AndyV99/collabboard/apps/api/internal/store/internal/identitygen"
 )
@@ -120,6 +121,22 @@ type (
 // account" from "the database is down", and would end up importing the driver
 // to find out. One alias is cheaper than that exception.
 var ErrNotFound = pgx.ErrNoRows
+
+// uniqueViolation is the SQLSTATE Postgres raises for a duplicate key.
+const uniqueViolation = "23505"
+
+// IsUniqueViolation reports whether err is a duplicate-key failure.
+//
+// It exists so that callers can tell "this email is already registered" from
+// "the database is unreachable" without importing pgx. internal/api is
+// forbidden from importing the driver by depguard, and every other package
+// would only be importing it to read one SQLSTATE — which is exactly the kind
+// of leak store.ErrNotFound already exists to prevent.
+func IsUniqueViolation(err error) bool {
+	var pgErr *pgconn.PgError
+
+	return errors.As(err, &pgErr) && pgErr.Code == uniqueViolation
+}
 
 // ErrNoIdentityReason means the caller passed the zero [IdentityReason].
 //
