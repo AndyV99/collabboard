@@ -25,14 +25,15 @@
 // or rollback, so a connection handed back to the pool carries no tenant state
 // and cannot serve the next request with the previous request's tenant.
 //
-// # What this package deliberately cannot do
+// # The other door
 //
 // Identity operations that happen before a tenant is known — login by email,
-// "which organizations do I belong to", inviting a user who already has an
-// account elsewhere — cannot run through WithTenant, because there is no tenant
-// yet and the users policy is derived from memberships. That path is issue #13
-// and belongs in a separate, named, auditable entry point on [Store]; it is not
-// a reason to widen this one.
+// "which organizations do I belong to", creating the global user an invite
+// points at — cannot run through WithTenant, because there is no tenant yet and
+// the users policy is derived from memberships. They go through
+// [Store.WithoutTenant] instead, which is a separate, named, logged entry point
+// handing out a separate four-method querier. See pretenant.go: it is a second
+// door, not a widening of this one, and the two share no queries.
 package store
 
 import (

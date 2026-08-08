@@ -53,3 +53,55 @@ sql:
           # exact-precision on purpose (midpoint reordering, see
           # 00003_domain.sql) and mapping it to float64 would quietly discard
           # the property the column type was chosen for.
+
+  # The pre-tenant identity path (issue #13), generated as a *second* package
+  # from a second query file rather than as more methods on the querier above.
+  #
+  # That separation is the mechanism, not tidiness. Store.WithTenant hands out
+  # gen.Querier and Store.WithoutTenant hands out identitygen.Querier; the two
+  # interfaces share no methods, so code holding the pre-tenant querier cannot
+  # reach a tenant-scoped query and code holding the tenant querier cannot reach
+  # an identity one. Both live under internal/store/internal, so neither
+  # constructor is importable from outside internal/store.
+  #
+  # Every query in identity_query.sql is a call to a SECURITY DEFINER function
+  # from migration 00004 — the app role holds EXECUTE on exactly those four and
+  # cannot read users, memberships or organizations without a tenant otherwise.
+  # See internal/store/README.md and docs/adr/0002-pre-tenant-identity-path.md.
+  - engine: postgresql
+    schema: migrations
+    queries: internal/store/identity_query.sql
+    gen:
+      go:
+        package: identitygen
+        out: internal/store/internal/identitygen
+        sql_package: pgx/v5
+
+        emit_interface: true
+        emit_empty_slices: true
+        emit_pointers_for_null_types: true
+
+        # Without this, this package would emit a struct for every table in the
+        # schema, cards and boards included. They would be inert — no query here
+        # can reach them — but a package whose whole claim is "this cannot see
+        # tenant-scoped data" should not contain a Card type.
+        omit_unused_structs: true
+
+        overrides:
+          - db_type: uuid
+            go_type: github.com/google/uuid.UUID
+          - db_type: uuid
+            nullable: true
+            go_type:
+              import: github.com/google/uuid
+              type: UUID
+              pointer: true
+
+          - db_type: timestamptz
+            go_type: time.Time
+          - db_type: timestamptz
+            nullable: true
+            go_type:
+              import: time
+              type: Time
+              pointer: true

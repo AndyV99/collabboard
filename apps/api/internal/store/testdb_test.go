@@ -55,6 +55,15 @@ func seedTenants(t *testing.T, owner *pgxpool.Pool) (a, b tenantFixture, sharedE
 	return f.A, f.B, f.SharedEmail
 }
 
+// seedFixture is seedTenants for the tests that need the shared user's id as
+// well as the two tenants — the pre-tenant organization list, whose whole claim
+// is that one user's memberships span both.
+func seedFixture(t *testing.T, owner *pgxpool.Pool) pgtest.Fixture {
+	t.Helper()
+
+	return pgtest.SeedTenants(t, owner)
+}
+
 // inTenantTx runs fn inside a transaction scoped to tenantID, exactly the way
 // store.WithTenant does, and then rolls it back.
 //

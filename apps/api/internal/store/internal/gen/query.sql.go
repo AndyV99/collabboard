@@ -12,6 +12,39 @@ import (
 	"github.com/google/uuid"
 )
 
+const createMembership = `-- name: CreateMembership :one
+INSERT INTO memberships (tenant_id, user_id, role)
+VALUES (public.current_tenant_id(), $1, $2)
+RETURNING id, tenant_id, user_id, role, created_at, updated_at
+`
+
+type CreateMembershipParams struct {
+	UserID uuid.UUID
+	Role   string
+}
+
+// The second half of an invite, and the half that is *not* pre-tenant.
+//
+// Once the pre-tenant path has resolved (or created) the global user, joining
+// them to an organization is ordinary tenant-scoped work: the tenant comes from
+// the transaction, and an admin scoped to their own organization cannot add a
+// member to anyone else's. Adding the membership is also what makes the user
+// visible to this tenant at all, since users_visible_via_membership is derived
+// from this table.
+func (q *Queries) CreateMembership(ctx context.Context, arg CreateMembershipParams) (Membership, error) {
+	row := q.db.QueryRow(ctx, createMembership, arg.UserID, arg.Role)
+	var i Membership
+	err := row.Scan(
+		&i.ID,
+		&i.TenantID,
+		&i.UserID,
+		&i.Role,
+		&i.CreatedAt,
+		&i.UpdatedAt,
+	)
+	return i, err
+}
+
 const createProject = `-- name: CreateProject :one
 INSERT INTO projects (tenant_id, name, description)
 VALUES (public.current_tenant_id(), $1, $2)

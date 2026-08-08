@@ -40,6 +40,19 @@ FROM cards
 WHERE board_id = @board_id
 ORDER BY column_id, position;
 
+-- name: CreateMembership :one
+-- The second half of an invite, and the half that is *not* pre-tenant.
+--
+-- Once the pre-tenant path has resolved (or created) the global user, joining
+-- them to an organization is ordinary tenant-scoped work: the tenant comes from
+-- the transaction, and an admin scoped to their own organization cannot add a
+-- member to anyone else's. Adding the membership is also what makes the user
+-- visible to this tenant at all, since users_visible_via_membership is derived
+-- from this table.
+INSERT INTO memberships (tenant_id, user_id, role)
+VALUES (public.current_tenant_id(), @user_id, @role)
+RETURNING *;
+
 -- name: ListMembers :many
 -- Joins the tenant-scoped memberships table to the global users table. users has
 -- no tenant_id: its policy makes a row visible only when a membership joins it
