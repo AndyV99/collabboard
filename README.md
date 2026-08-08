@@ -28,19 +28,40 @@ apps/web/            Next.js app
 apps/api/            Go service
   cmd/api/           entrypoint — no business logic here
   internal/api/      HTTP handlers
+  internal/migrate/  goose runner behind `api migrate`
   internal/realtime/ WebSocket hub + Redis pub/sub fan-out
   internal/store/    Postgres data layer (tenant-context helpers live here)
+  migrations/        goose SQL, embedded into the binary
 infra/terraform/     VPC, ECS Fargate, RDS, ElastiCache, S3, ALB
 docs/adr/            architecture decision records
 ```
 
 ## Getting started
 
-Toolchain init not yet run. To bring this repo to life:
-
 ```bash
 docker compose up -d                 # Postgres + Redis
-cd apps/api && go mod init github.com/<you>/collabboard/apps/api
+
+cd apps/api
+go run ./cmd/api migrate up          # create the schema, RLS policies and app role
+
+# One-time, local only: migration 00001 creates collabboard_app without a
+# password, because a credential in a versioned migration can never be rotated.
+# Deployed environments set it from the secret store; the laptop sets it here.
+docker compose exec -T postgres psql -U collabboard -d collabboard \
+  < scripts/dev/set-app-role-password.sql
+
+go run ./cmd/api                     # serve on :8080
+```
+
+`api migrate` also takes `down` (one step), `reset` (all the way back) and
+`status`. It connects as `POSTGRES_MIGRATION_USER` — the role that owns the
+schema — while the server connects as `POSTGRES_USER`, which must be
+`collabboard_app`. Those two are deliberately different roles: see
+`docs/adr/0001-tenant-isolation.md`.
+
+The web app is not yet initialised:
+
+```bash
 cd apps/web && npx create-next-app@latest . --typescript
 ```
 

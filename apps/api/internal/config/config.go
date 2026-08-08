@@ -40,6 +40,13 @@ func (h HTTPConfig) Addr() string {
 }
 
 // PostgresConfig configures the pgx connection pool.
+//
+// Two identities, not one. User/Password is the serving role — collabboard_app,
+// which owns nothing and is subject to row-level security. MigrationUser /
+// MigrationPassword is the role that owns the schema and is the only one able
+// to run DDL. Keeping them apart in config is what stops the API from
+// accidentally connecting as the owner, which would defeat the isolation model
+// (docs/adr/0001-tenant-isolation.md).
 type PostgresConfig struct {
 	Host     string
 	Port     int
@@ -48,16 +55,31 @@ type PostgresConfig struct {
 	Database string
 	SSLMode  string
 
+	MigrationUser     string
+	MigrationPassword string
+
 	MaxConns int32
 }
 
-// DSN renders a libpq-style connection URL. The password is URL-escaped rather
+// DSN renders the connection URL used by the API's pgx pool, as the serving
+// role.
+func (p PostgresConfig) DSN() string {
+	return p.dsn(p.User, p.Password)
+}
+
+// MigrationDSN renders the connection URL used by `api migrate`, as the role
+// that owns the schema.
+func (p PostgresConfig) MigrationDSN() string {
+	return p.dsn(p.MigrationUser, p.MigrationPassword)
+}
+
+// dsn renders a libpq-style connection URL. The password is URL-escaped rather
 // than interpolated so that special characters in a real secret cannot corrupt
 // the DSN.
-func (p PostgresConfig) DSN() string {
+func (p PostgresConfig) dsn(user, password string) string {
 	u := &url.URL{
 		Scheme: "postgres",
-		User:   url.UserPassword(p.User, p.Password),
+		User:   url.UserPassword(user, password),
 		Host:   fmt.Sprintf("%s:%d", p.Host, p.Port),
 		Path:   "/" + p.Database,
 	}
@@ -98,13 +120,15 @@ func Load() (Config, error) {
 			ShutdownTimeout:   envDuration("HTTP_SHUTDOWN_TIMEOUT", 15*time.Second, &errs),
 		},
 		Postgres: PostgresConfig{
-			Host:     envString("POSTGRES_HOST", "localhost"),
-			Port:     envInt("POSTGRES_PORT", 5432, &errs),
-			User:     envString("POSTGRES_USER", "collabboard"),
-			Password: envString("POSTGRES_PASSWORD", "dev"),
-			Database: envString("POSTGRES_DB", "collabboard"),
-			SSLMode:  envString("POSTGRES_SSLMODE", "disable"),
-			MaxConns: int32(envInt("POSTGRES_MAX_CONNS", 10, &errs)), //nolint:gosec // bounded small int from config
+			Host:              envString("POSTGRES_HOST", "localhost"),
+			Port:              envInt("POSTGRES_PORT", 5432, &errs),
+			User:              envString("POSTGRES_USER", "collabboard_app"),
+			Password:          envString("POSTGRES_PASSWORD", "dev"),
+			Database:          envString("POSTGRES_DB", "collabboard"),
+			SSLMode:           envString("POSTGRES_SSLMODE", "disable"),
+			MigrationUser:     envString("POSTGRES_MIGRATION_USER", "collabboard"),
+			MigrationPassword: envString("POSTGRES_MIGRATION_PASSWORD", "dev"),
+			MaxConns:          int32(envInt("POSTGRES_MAX_CONNS", 10, &errs)), //nolint:gosec // bounded small int from config
 		},
 		Redis: RedisConfig{
 			Host:     envString("REDIS_HOST", "localhost"),

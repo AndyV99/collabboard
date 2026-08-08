@@ -40,6 +40,35 @@ func TestLoadDefaultsMatchComposeStack(t *testing.T) {
 	}
 }
 
+// The serving role and the migrating role must not be the same identity by
+// default: the API connecting as the schema owner is the specific mistake that
+// would make every RLS policy decorative.
+func TestServingAndMigratingIdentitiesDiffer(t *testing.T) {
+	for _, key := range []string{
+		"POSTGRES_USER", "POSTGRES_PASSWORD",
+		"POSTGRES_MIGRATION_USER", "POSTGRES_MIGRATION_PASSWORD",
+	} {
+		t.Setenv(key, "")
+	}
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load() returned error: %v", err)
+	}
+
+	if got, want := cfg.Postgres.User, "collabboard_app"; got != want {
+		t.Errorf("Postgres.User = %q, want %q — the API must not connect as the owner", got, want)
+	}
+
+	if cfg.Postgres.User == cfg.Postgres.MigrationUser {
+		t.Errorf("serving and migrating roles are both %q", cfg.Postgres.User)
+	}
+
+	if dsn, migrationDSN := cfg.Postgres.DSN(), cfg.Postgres.MigrationDSN(); dsn == migrationDSN {
+		t.Errorf("DSN() and MigrationDSN() are identical: %q", dsn)
+	}
+}
+
 func TestLoadReadsEnvironment(t *testing.T) {
 	t.Setenv("HTTP_PORT", "9999")
 	t.Setenv("POSTGRES_HOST", "db.internal")

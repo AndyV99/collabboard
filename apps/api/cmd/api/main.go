@@ -3,6 +3,15 @@
 // It does wiring only — load config, open the Postgres pool and Redis client,
 // build the router with those dependencies injected, serve, and shut down
 // cleanly. All behaviour lives under internal/.
+//
+// Two modes, one binary:
+//
+//	api                  serve HTTP (the default)
+//	api migrate <cmd>    apply or roll back schema migrations, then exit
+//
+// One binary because it keeps the image and the schema it expects inseparable;
+// two modes because they connect as different database roles — see
+// internal/migrate.
 package main
 
 import (
@@ -23,10 +32,14 @@ import (
 	"github.com/AndyV99/collabboard/apps/api/internal/api"
 	"github.com/AndyV99/collabboard/apps/api/internal/config"
 	"github.com/AndyV99/collabboard/apps/api/internal/logging"
+	"github.com/AndyV99/collabboard/apps/api/internal/migrate"
 )
 
 const (
 	serviceName = "collabboard-api"
+
+	// migrateCommand is the argv[1] that switches the binary out of serve mode.
+	migrateCommand = "migrate"
 
 	// startupPingTimeout bounds the optional connectivity probe at boot. It is
 	// advisory only — a failure is logged, not fatal.
@@ -38,13 +51,13 @@ func main() {
 	// as JSON rather than through slog's default text handler.
 	slog.SetDefault(logging.New(os.Stdout, serviceName, "info"))
 
-	if err := run(); err != nil {
+	if err := run(os.Args[1:]); err != nil {
 		slog.Error("api exited with error", slog.Any("error", err))
 		os.Exit(1)
 	}
 }
 
-func run() error {
+func run(args []string) error {
 	cfg, err := config.Load()
 	if err != nil {
 		return err
@@ -53,6 +66,30 @@ func run() error {
 	logger := logging.New(os.Stdout, serviceName, cfg.LogLevel)
 	slog.SetDefault(logger)
 
+	if len(args) > 0 && args[0] == migrateCommand {
+		return runMigrate(logger, cfg, args[1:])
+	}
+
+	return runServe(logger, cfg)
+}
+
+// runMigrate applies migrations and exits. It connects with the migration DSN,
+// not the pool DSN, because the serving role cannot run DDL by design.
+func runMigrate(logger *slog.Logger, cfg config.Config, args []string) error {
+	if len(args) != 1 {
+		return fmt.Errorf("usage: %s %s <%v>", os.Args[0], migrateCommand, migrate.Commands())
+	}
+
+	// Signal-aware as well: a migration that runs long enough for a deploy to
+	// be cancelled should stop at a statement boundary rather than be killed.
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
+	return migrate.Run(ctx, logger, cfg.Postgres.MigrationDSN(), migrate.Command(args[0]))
+}
+
+// runServe builds the HTTP service and runs it until a shutdown signal arrives.
+func runServe(logger *slog.Logger, cfg config.Config) error {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
