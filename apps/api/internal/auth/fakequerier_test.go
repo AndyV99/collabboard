@@ -122,7 +122,16 @@ func (q fakeIdentityQuerier) CreatePassword(_ context.Context, arg store.CreateP
 }
 
 // fakeTenantQuerier implements store.Querier.
+//
+// The embedded interface is nil and is the "not modelled" case: the auth flows
+// use two of the querier's methods, and the rest belong to the board and card
+// surface. Calling one panics with a nil dereference naming the method, which is
+// as loud as the hand-written panics it replaced and — unlike them — does not
+// have to be extended every time query.sql grows a query the auth package will
+// never call.
 type fakeTenantQuerier struct {
+	store.Querier
+
 	store    *fakeStore
 	tenantID uuid.UUID
 }
@@ -145,32 +154,4 @@ func (q fakeTenantQuerier) CreateMembership(_ context.Context, arg store.CreateM
 	})
 
 	return store.Membership{TenantID: q.tenantID, UserID: arg.UserID, Role: arg.Role}, nil
-}
-
-func (q fakeTenantQuerier) ListMembers(context.Context) ([]store.ListMembersRow, error) {
-	panic("fakeTenantQuerier: ListMembers is not modelled; the auth flows do not use it")
-}
-
-func (q fakeTenantQuerier) ListProjects(context.Context) ([]store.Project, error) {
-	panic("fakeTenantQuerier: ListProjects is not modelled; the auth flows do not use it")
-}
-
-func (q fakeTenantQuerier) CreateProject(context.Context, store.CreateProjectParams) (store.Project, error) {
-	panic("fakeTenantQuerier: CreateProject is not modelled; the auth flows do not use it")
-}
-
-func (q fakeTenantQuerier) GetBoard(context.Context, uuid.UUID) (store.Board, error) {
-	panic("fakeTenantQuerier: GetBoard is not modelled; the auth flows do not use it")
-}
-
-func (q fakeTenantQuerier) GetMembership(context.Context, uuid.UUID) (store.Membership, error) {
-	panic("fakeTenantQuerier: GetMembership is not modelled; the auth flows do not use it")
-}
-
-func (q fakeTenantQuerier) ListColumnsByBoard(context.Context, uuid.UUID) ([]store.Column, error) {
-	panic("fakeTenantQuerier: ListColumnsByBoard is not modelled; the auth flows do not use it")
-}
-
-func (q fakeTenantQuerier) ListCardsByBoard(context.Context, uuid.UUID) ([]store.Card, error) {
-	panic("fakeTenantQuerier: ListCardsByBoard is not modelled; the auth flows do not use it")
 }

@@ -10,7 +10,133 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5/pgtype"
 )
+
+const archiveProject = `-- name: ArchiveProject :one
+UPDATE projects
+SET archived_at = coalesce(archived_at, now())
+WHERE id = $1
+RETURNING id, tenant_id, name, description, archived_at, created_at, updated_at
+`
+
+// Idempotent: archiving an archived project keeps the original timestamp and
+// still returns the row, so a retried request is a success rather than a 404.
+func (q *Queries) ArchiveProject(ctx context.Context, projectID uuid.UUID) (Project, error) {
+	row := q.db.QueryRow(ctx, archiveProject, projectID)
+	var i Project
+	err := row.Scan(
+		&i.ID,
+		&i.TenantID,
+		&i.Name,
+		&i.Description,
+		&i.ArchivedAt,
+		&i.CreatedAt,
+		&i.UpdatedAt,
+	)
+	return i, err
+}
+
+const createBoard = `-- name: CreateBoard :one
+INSERT INTO boards (tenant_id, project_id, name)
+SELECT public.current_tenant_id(), p.id, $1
+FROM projects p
+WHERE p.id = $2
+RETURNING id, tenant_id, project_id, name, archived_at, created_at, updated_at
+`
+
+type CreateBoardParams struct {
+	Name      string
+	ProjectID uuid.UUID
+}
+
+// INSERT ... SELECT rather than VALUES, so that a project id naming a row this
+// tenant cannot see produces *no row* instead of a foreign-key violation. The
+// policy filters the SELECT, the caller gets ErrNoRows, and the handler answers
+// 404 — the same answer as an id that exists nowhere, which is what stops the
+// endpoint from being an existence oracle for other tenants.
+func (q *Queries) CreateBoard(ctx context.Context, arg CreateBoardParams) (Board, error) {
+	row := q.db.QueryRow(ctx, createBoard, arg.Name, arg.ProjectID)
+	var i Board
+	err := row.Scan(
+		&i.ID,
+		&i.TenantID,
+		&i.ProjectID,
+		&i.Name,
+		&i.ArchivedAt,
+		&i.CreatedAt,
+		&i.UpdatedAt,
+	)
+	return i, err
+}
+
+const createCard = `-- name: CreateCard :one
+INSERT INTO cards (tenant_id, board_id, column_id, title, description, position)
+SELECT public.current_tenant_id(), c.board_id, c.id, $1, $2,
+       coalesce((SELECT max(x.position) FROM cards x WHERE x.column_id = c.id), 0) + 1
+FROM columns c
+WHERE c.id = $3
+RETURNING id, tenant_id, board_id, column_id, title, description, position, assignee_id, due_at, created_at, updated_at
+`
+
+type CreateCardParams struct {
+	Title       string
+	Description string
+	ColumnID    uuid.UUID
+}
+
+// Appends to the end of the column, taking board_id from the column rather than
+// from the caller: the composite foreign key would reject a disagreement, but
+// deriving it means there is no argument to disagree with. Run under LockColumn.
+func (q *Queries) CreateCard(ctx context.Context, arg CreateCardParams) (Card, error) {
+	row := q.db.QueryRow(ctx, createCard, arg.Title, arg.Description, arg.ColumnID)
+	var i Card
+	err := row.Scan(
+		&i.ID,
+		&i.TenantID,
+		&i.BoardID,
+		&i.ColumnID,
+		&i.Title,
+		&i.Description,
+		&i.Position,
+		&i.AssigneeID,
+		&i.DueAt,
+		&i.CreatedAt,
+		&i.UpdatedAt,
+	)
+	return i, err
+}
+
+const createColumn = `-- name: CreateColumn :one
+INSERT INTO columns (tenant_id, board_id, name, position)
+SELECT public.current_tenant_id(), b.id, $1,
+       coalesce((SELECT max(c.position) FROM columns c WHERE c.board_id = b.id), 0) + 1
+FROM boards b
+WHERE b.id = $2
+RETURNING id, tenant_id, board_id, name, position, created_at, updated_at
+`
+
+type CreateColumnParams struct {
+	Name    string
+	BoardID uuid.UUID
+}
+
+// Appends: one past the current maximum. Run under LockBoard, so two concurrent
+// creates cannot read the same maximum and both claim it.
+func (q *Queries) CreateColumn(ctx context.Context, arg CreateColumnParams) (Column, error) {
+	row := q.db.QueryRow(ctx, createColumn, arg.Name, arg.BoardID)
+	var i Column
+	err := row.Scan(
+		&i.ID,
+		&i.TenantID,
+		&i.BoardID,
+		&i.Name,
+		&i.Position,
+		&i.CreatedAt,
+		&i.UpdatedAt,
+	)
+	return i, err
+}
 
 const createMembership = `-- name: CreateMembership :one
 INSERT INTO memberships (tenant_id, user_id, role)
@@ -110,6 +236,48 @@ func (q *Queries) CreateProject(ctx context.Context, arg CreateProjectParams) (P
 	return i, err
 }
 
+const deleteBoard = `-- name: DeleteBoard :execrows
+DELETE FROM boards
+WHERE id = $1
+`
+
+// Cascades to columns and cards through the composite foreign keys. :execrows
+// rather than :exec because "0 rows" is the only way this can report that the id
+// named no board the caller can see.
+func (q *Queries) DeleteBoard(ctx context.Context, boardID uuid.UUID) (int64, error) {
+	result, err := q.db.Exec(ctx, deleteBoard, boardID)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
+const deleteCard = `-- name: DeleteCard :execrows
+DELETE FROM cards
+WHERE id = $1
+`
+
+func (q *Queries) DeleteCard(ctx context.Context, cardID uuid.UUID) (int64, error) {
+	result, err := q.db.Exec(ctx, deleteCard, cardID)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
+const deleteColumn = `-- name: DeleteColumn :execrows
+DELETE FROM columns
+WHERE id = $1
+`
+
+func (q *Queries) DeleteColumn(ctx context.Context, columnID uuid.UUID) (int64, error) {
+	result, err := q.db.Exec(ctx, deleteColumn, columnID)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
 const getBoard = `-- name: GetBoard :one
 SELECT id, tenant_id, project_id, name, archived_at, created_at, updated_at
 FROM boards
@@ -127,6 +295,52 @@ func (q *Queries) GetBoard(ctx context.Context, boardID uuid.UUID) (Board, error
 		&i.ProjectID,
 		&i.Name,
 		&i.ArchivedAt,
+		&i.CreatedAt,
+		&i.UpdatedAt,
+	)
+	return i, err
+}
+
+const getCard = `-- name: GetCard :one
+SELECT id, tenant_id, board_id, column_id, title, description, position, assignee_id, due_at, created_at, updated_at
+FROM cards
+WHERE id = $1
+`
+
+func (q *Queries) GetCard(ctx context.Context, cardID uuid.UUID) (Card, error) {
+	row := q.db.QueryRow(ctx, getCard, cardID)
+	var i Card
+	err := row.Scan(
+		&i.ID,
+		&i.TenantID,
+		&i.BoardID,
+		&i.ColumnID,
+		&i.Title,
+		&i.Description,
+		&i.Position,
+		&i.AssigneeID,
+		&i.DueAt,
+		&i.CreatedAt,
+		&i.UpdatedAt,
+	)
+	return i, err
+}
+
+const getColumn = `-- name: GetColumn :one
+SELECT id, tenant_id, board_id, name, position, created_at, updated_at
+FROM columns
+WHERE id = $1
+`
+
+func (q *Queries) GetColumn(ctx context.Context, columnID uuid.UUID) (Column, error) {
+	row := q.db.QueryRow(ctx, getColumn, columnID)
+	var i Column
+	err := row.Scan(
+		&i.ID,
+		&i.TenantID,
+		&i.BoardID,
+		&i.Name,
+		&i.Position,
 		&i.CreatedAt,
 		&i.UpdatedAt,
 	)
@@ -166,11 +380,67 @@ func (q *Queries) GetMembership(ctx context.Context, userID uuid.UUID) (Membersh
 	return i, err
 }
 
+const getProject = `-- name: GetProject :one
+SELECT id, tenant_id, name, description, archived_at, created_at, updated_at
+FROM projects
+WHERE id = $1
+`
+
+func (q *Queries) GetProject(ctx context.Context, projectID uuid.UUID) (Project, error) {
+	row := q.db.QueryRow(ctx, getProject, projectID)
+	var i Project
+	err := row.Scan(
+		&i.ID,
+		&i.TenantID,
+		&i.Name,
+		&i.Description,
+		&i.ArchivedAt,
+		&i.CreatedAt,
+		&i.UpdatedAt,
+	)
+	return i, err
+}
+
+const listBoardsByProject = `-- name: ListBoardsByProject :many
+SELECT id, tenant_id, project_id, name, archived_at, created_at, updated_at
+FROM boards
+WHERE project_id = $1
+ORDER BY name, id
+`
+
+func (q *Queries) ListBoardsByProject(ctx context.Context, projectID uuid.UUID) ([]Board, error) {
+	rows, err := q.db.Query(ctx, listBoardsByProject, projectID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []Board{}
+	for rows.Next() {
+		var i Board
+		if err := rows.Scan(
+			&i.ID,
+			&i.TenantID,
+			&i.ProjectID,
+			&i.Name,
+			&i.ArchivedAt,
+			&i.CreatedAt,
+			&i.UpdatedAt,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const listCardsByBoard = `-- name: ListCardsByBoard :many
 SELECT id, tenant_id, board_id, column_id, title, description, position, assignee_id, due_at, created_at, updated_at
 FROM cards
 WHERE board_id = $1
-ORDER BY column_id, position
+ORDER BY column_id, position, id
 `
 
 // The board view loads every card for the board in one round trip and groups by
@@ -207,13 +477,56 @@ func (q *Queries) ListCardsByBoard(ctx context.Context, boardID uuid.UUID) ([]Ca
 	return items, nil
 }
 
+const listCardsByColumn = `-- name: ListCardsByColumn :many
+SELECT id, tenant_id, board_id, column_id, title, description, position, assignee_id, due_at, created_at, updated_at
+FROM cards
+WHERE column_id = $1
+ORDER BY position, id
+`
+
+func (q *Queries) ListCardsByColumn(ctx context.Context, columnID uuid.UUID) ([]Card, error) {
+	rows, err := q.db.Query(ctx, listCardsByColumn, columnID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []Card{}
+	for rows.Next() {
+		var i Card
+		if err := rows.Scan(
+			&i.ID,
+			&i.TenantID,
+			&i.BoardID,
+			&i.ColumnID,
+			&i.Title,
+			&i.Description,
+			&i.Position,
+			&i.AssigneeID,
+			&i.DueAt,
+			&i.CreatedAt,
+			&i.UpdatedAt,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const listColumnsByBoard = `-- name: ListColumnsByBoard :many
 SELECT id, tenant_id, board_id, name, position, created_at, updated_at
 FROM columns
 WHERE board_id = $1
-ORDER BY position
+ORDER BY position, id
 `
 
+// id is the tiebreaker, not decoration. Positions are unique within a board by
+// construction (see MoveColumn), but "by construction" is an argument about the
+// write path, and a list whose order depends on that argument holding would
+// return rows in an unspecified order the day it stops. See ADR 0004.
 func (q *Queries) ListColumnsByBoard(ctx context.Context, boardID uuid.UUID) ([]Column, error) {
 	rows, err := q.db.Query(ctx, listColumnsByBoard, boardID)
 	if err != nil {
@@ -335,4 +648,405 @@ func (q *Queries) ListProjects(ctx context.Context) ([]Project, error) {
 		return nil, err
 	}
 	return items, nil
+}
+
+const lockBoard = `-- name: LockBoard :one
+SELECT id, tenant_id, project_id, name, archived_at, created_at, updated_at
+FROM boards
+WHERE id = $1
+FOR UPDATE
+`
+
+// Serialises column reordering within one board.
+//
+// FOR UPDATE on the *parent* rather than on the sibling rows being reordered is
+// deliberate: it is one lock per move, so two moves can never hold one lock each
+// and wait for the other's. Locking the siblings instead would deadlock as soon
+// as two moves crossed between the same pair of parents.
+func (q *Queries) LockBoard(ctx context.Context, boardID uuid.UUID) (Board, error) {
+	row := q.db.QueryRow(ctx, lockBoard, boardID)
+	var i Board
+	err := row.Scan(
+		&i.ID,
+		&i.TenantID,
+		&i.ProjectID,
+		&i.Name,
+		&i.ArchivedAt,
+		&i.CreatedAt,
+		&i.UpdatedAt,
+	)
+	return i, err
+}
+
+const lockColumn = `-- name: LockColumn :one
+SELECT id, tenant_id, board_id, name, position, created_at, updated_at
+FROM columns
+WHERE id = $1
+FOR UPDATE
+`
+
+// Serialises card creation and card moves *into* this column. See LockBoard for
+// why the lock is taken on the parent row.
+func (q *Queries) LockColumn(ctx context.Context, columnID uuid.UUID) (Column, error) {
+	row := q.db.QueryRow(ctx, lockColumn, columnID)
+	var i Column
+	err := row.Scan(
+		&i.ID,
+		&i.TenantID,
+		&i.BoardID,
+		&i.Name,
+		&i.Position,
+		&i.CreatedAt,
+		&i.UpdatedAt,
+	)
+	return i, err
+}
+
+const moveCard = `-- name: MoveCard :one
+WITH anchor AS (
+    SELECT position
+    FROM cards
+    WHERE id = $3::uuid
+      AND column_id = $1
+      AND id <> $2
+),
+gap AS (
+    SELECT
+        (SELECT position FROM anchor) AS lower_bound,
+        (SELECT min(position)
+         FROM cards
+         WHERE column_id = $1
+           AND id <> $2
+           AND (NOT EXISTS (SELECT 1 FROM anchor)
+                OR position > (SELECT position FROM anchor))) AS upper_bound
+)
+UPDATE cards
+SET column_id = $1,
+    position = (
+        SELECT CASE
+                   WHEN g.lower_bound IS NULL AND g.upper_bound IS NULL THEN 1
+                   WHEN g.lower_bound IS NULL THEN g.upper_bound - 1
+                   WHEN g.upper_bound IS NULL THEN g.lower_bound + 1
+                   ELSE (g.lower_bound + g.upper_bound) * 0.5
+               END
+        FROM gap g
+    )
+WHERE cards.id = $2
+  AND EXISTS (
+      SELECT 1
+      FROM columns tgt
+      WHERE tgt.id = $1
+        AND tgt.board_id = cards.board_id
+  )
+  AND ($3::uuid IS NULL OR EXISTS (SELECT 1 FROM anchor))
+RETURNING id, tenant_id, board_id, column_id, title, description, position, assignee_id, due_at, created_at, updated_at, scale(cards.position) > 100 AS needs_rebalance
+`
+
+type MoveCardParams struct {
+	ColumnID    uuid.UUID
+	CardID      uuid.UUID
+	AfterCardID *uuid.UUID
+}
+
+type MoveCardRow struct {
+	ID             uuid.UUID
+	TenantID       uuid.UUID
+	BoardID        uuid.UUID
+	ColumnID       uuid.UUID
+	Title          string
+	Description    string
+	Position       pgtype.Numeric
+	AssigneeID     *uuid.UUID
+	DueAt          *time.Time
+	CreatedAt      time.Time
+	UpdatedAt      time.Time
+	NeedsRebalance bool
+}
+
+// The headline operation: put this card in @column_id, immediately after
+// @after_card_id, or first in that column when @after_card_id is null.
+//
+// One row is written. Neither the source column nor the destination is
+// renumbered, so a concurrent move of a *different* card is unaffected, and a
+// concurrent move of the *same* card is resolved by the row lock on the card
+// itself: the second transaction's UPDATE waits, then re-evaluates the CASE
+// against the order the first one left behind. The result is one of the two
+// requested orders, never a blend of both and never two cards sharing a rank.
+//
+// Two things this refuses, both by returning no row rather than by raising:
+//
+//   - an @after_card_id that is not currently a card in @column_id — including
+//     one from another tenant, which the policy has already hidden. Silently
+//     treating it as "move to the front" would turn a stale client into a
+//     wrong-but-successful write.
+//   - a @column_id on a different board from the card. Cards do not change
+//     board: the composite foreign key would reject it anyway, and #45 fans
+//     events out per board, so a move that changed board would have to announce
+//     itself in two rooms at once.
+//
+// The midpoint is (lower + upper) * 0.5 and never (lower + upper) / 2. Postgres
+// numeric multiplication is exact — the result's scale is the sum of the
+// operands' — while division picks a result scale of at most max(the inputs'
+// scales, ~16 significant digits) and *rounds* to it. Under division, halving
+// stops making progress after roughly 53 nested inserts into one gap and starts
+// returning a value equal to one of the bounds, which is two cards with the same
+// rank. Under multiplication the midpoint is always strictly between them.
+// See docs/adr/0004-card-ordering.md.
+func (q *Queries) MoveCard(ctx context.Context, arg MoveCardParams) (MoveCardRow, error) {
+	row := q.db.QueryRow(ctx, moveCard, arg.ColumnID, arg.CardID, arg.AfterCardID)
+	var i MoveCardRow
+	err := row.Scan(
+		&i.ID,
+		&i.TenantID,
+		&i.BoardID,
+		&i.ColumnID,
+		&i.Title,
+		&i.Description,
+		&i.Position,
+		&i.AssigneeID,
+		&i.DueAt,
+		&i.CreatedAt,
+		&i.UpdatedAt,
+		&i.NeedsRebalance,
+	)
+	return i, err
+}
+
+const moveColumn = `-- name: MoveColumn :one
+WITH anchor AS (
+    -- Empty when @after_column_id is null (move to the front), and *also* empty
+    -- when it names a column that is not a sibling — including one in another
+    -- tenant, which the policy has already made invisible. The WHERE clause
+    -- below tells those two cases apart.
+    SELECT position
+    FROM columns
+    WHERE id = $3::uuid
+      AND board_id = $2
+      AND id <> $1
+),
+gap AS (
+    SELECT
+        (SELECT position FROM anchor) AS lower_bound,
+        (SELECT min(position)
+         FROM columns
+         WHERE board_id = $2
+           AND id <> $1
+           AND (NOT EXISTS (SELECT 1 FROM anchor)
+                OR position > (SELECT position FROM anchor))) AS upper_bound
+)
+UPDATE columns
+SET position = (
+        SELECT CASE
+                   WHEN g.lower_bound IS NULL AND g.upper_bound IS NULL THEN 1
+                   WHEN g.lower_bound IS NULL THEN g.upper_bound - 1
+                   WHEN g.upper_bound IS NULL THEN g.lower_bound + 1
+                   -- Exact. See the header comment: * 0.5, never / 2.
+                   ELSE (g.lower_bound + g.upper_bound) * 0.5
+               END
+        FROM gap g
+    )
+WHERE columns.id = $1
+  AND columns.board_id = $2
+  AND ($3::uuid IS NULL OR EXISTS (SELECT 1 FROM anchor))
+RETURNING id, tenant_id, board_id, name, position, created_at, updated_at, scale(columns.position) > 100 AS needs_rebalance
+`
+
+type MoveColumnParams struct {
+	ColumnID      uuid.UUID
+	BoardID       uuid.UUID
+	AfterColumnID *uuid.UUID
+}
+
+type MoveColumnRow struct {
+	ID             uuid.UUID
+	TenantID       uuid.UUID
+	BoardID        uuid.UUID
+	Name           string
+	Position       pgtype.Numeric
+	CreatedAt      time.Time
+	UpdatedAt      time.Time
+	NeedsRebalance bool
+}
+
+// Reorder: place this column immediately after @after_column_id, or first when
+// that argument is null.
+//
+// "After this neighbour" rather than "at index 4" is the point. An index is a
+// claim about a list the client last saw, and two clients holding the same stale
+// list produce two writes that disagree about what index 4 means. A neighbour is
+// a claim about one row, which the database can still evaluate after someone
+// else has changed the list.
+func (q *Queries) MoveColumn(ctx context.Context, arg MoveColumnParams) (MoveColumnRow, error) {
+	row := q.db.QueryRow(ctx, moveColumn, arg.ColumnID, arg.BoardID, arg.AfterColumnID)
+	var i MoveColumnRow
+	err := row.Scan(
+		&i.ID,
+		&i.TenantID,
+		&i.BoardID,
+		&i.Name,
+		&i.Position,
+		&i.CreatedAt,
+		&i.UpdatedAt,
+		&i.NeedsRebalance,
+	)
+	return i, err
+}
+
+const rebalanceBoardColumns = `-- name: RebalanceBoardColumns :exec
+UPDATE columns c
+SET position = ranked.rank
+FROM (
+    SELECT sib.id, row_number() OVER (ORDER BY sib.position, sib.id) AS rank
+    FROM columns sib
+    WHERE sib.board_id = $1
+) ranked
+WHERE c.id = ranked.id
+`
+
+// Renumbers a board's columns to 1..n, collapsing accumulated fractional scale
+// without changing the order. Called only when MoveColumn reports pressure, and
+// only while LockBoard is held, so no concurrent move can be computing a
+// midpoint against a position this is about to rewrite.
+func (q *Queries) RebalanceBoardColumns(ctx context.Context, boardID uuid.UUID) error {
+	_, err := q.db.Exec(ctx, rebalanceBoardColumns, boardID)
+	return err
+}
+
+const rebalanceColumnCards = `-- name: RebalanceColumnCards :exec
+UPDATE cards c
+SET position = ranked.rank
+FROM (
+    SELECT sib.id, row_number() OVER (ORDER BY sib.position, sib.id) AS rank
+    FROM cards sib
+    WHERE sib.column_id = $1
+) ranked
+WHERE c.id = ranked.id
+`
+
+// The cost fractional ranking is chosen with, made explicit: nesting a move into
+// the same gap n times leaves a rank with n decimal places, and numeric tops out
+// at 16383 of them. Renumbering to 1..n collapses that, preserves the order, and
+// is the only statement here that writes every row in a column.
+func (q *Queries) RebalanceColumnCards(ctx context.Context, columnID uuid.UUID) error {
+	_, err := q.db.Exec(ctx, rebalanceColumnCards, columnID)
+	return err
+}
+
+const updateBoard = `-- name: UpdateBoard :one
+UPDATE boards
+SET name = $1
+WHERE id = $2
+RETURNING id, tenant_id, project_id, name, archived_at, created_at, updated_at
+`
+
+type UpdateBoardParams struct {
+	Name    string
+	BoardID uuid.UUID
+}
+
+func (q *Queries) UpdateBoard(ctx context.Context, arg UpdateBoardParams) (Board, error) {
+	row := q.db.QueryRow(ctx, updateBoard, arg.Name, arg.BoardID)
+	var i Board
+	err := row.Scan(
+		&i.ID,
+		&i.TenantID,
+		&i.ProjectID,
+		&i.Name,
+		&i.ArchivedAt,
+		&i.CreatedAt,
+		&i.UpdatedAt,
+	)
+	return i, err
+}
+
+const updateCard = `-- name: UpdateCard :one
+UPDATE cards
+SET title       = coalesce($1, title),
+    description = coalesce($2, description)
+WHERE id = $3
+RETURNING id, tenant_id, board_id, column_id, title, description, position, assignee_id, due_at, created_at, updated_at
+`
+
+type UpdateCardParams struct {
+	Title       *string
+	Description *string
+	CardID      uuid.UUID
+}
+
+func (q *Queries) UpdateCard(ctx context.Context, arg UpdateCardParams) (Card, error) {
+	row := q.db.QueryRow(ctx, updateCard, arg.Title, arg.Description, arg.CardID)
+	var i Card
+	err := row.Scan(
+		&i.ID,
+		&i.TenantID,
+		&i.BoardID,
+		&i.ColumnID,
+		&i.Title,
+		&i.Description,
+		&i.Position,
+		&i.AssigneeID,
+		&i.DueAt,
+		&i.CreatedAt,
+		&i.UpdatedAt,
+	)
+	return i, err
+}
+
+const updateColumn = `-- name: UpdateColumn :one
+UPDATE columns
+SET name = $1
+WHERE id = $2
+RETURNING id, tenant_id, board_id, name, position, created_at, updated_at
+`
+
+type UpdateColumnParams struct {
+	Name     string
+	ColumnID uuid.UUID
+}
+
+func (q *Queries) UpdateColumn(ctx context.Context, arg UpdateColumnParams) (Column, error) {
+	row := q.db.QueryRow(ctx, updateColumn, arg.Name, arg.ColumnID)
+	var i Column
+	err := row.Scan(
+		&i.ID,
+		&i.TenantID,
+		&i.BoardID,
+		&i.Name,
+		&i.Position,
+		&i.CreatedAt,
+		&i.UpdatedAt,
+	)
+	return i, err
+}
+
+const updateProject = `-- name: UpdateProject :one
+UPDATE projects
+SET name        = coalesce($1, name),
+    description = coalesce($2, description)
+WHERE id = $3
+RETURNING id, tenant_id, name, description, archived_at, created_at, updated_at
+`
+
+type UpdateProjectParams struct {
+	Name        *string
+	Description *string
+	ProjectID   uuid.UUID
+}
+
+// A PATCH: sqlc.narg makes "absent" a distinguishable value, so omitting a field
+// leaves the column alone instead of blanking it. The alternative — read, merge
+// in Go, write back — would be a lost update between the two statements.
+func (q *Queries) UpdateProject(ctx context.Context, arg UpdateProjectParams) (Project, error) {
+	row := q.db.QueryRow(ctx, updateProject, arg.Name, arg.Description, arg.ProjectID)
+	var i Project
+	err := row.Scan(
+		&i.ID,
+		&i.TenantID,
+		&i.Name,
+		&i.Description,
+		&i.ArchivedAt,
+		&i.CreatedAt,
+		&i.UpdatedAt,
+	)
+	return i, err
 }

@@ -159,7 +159,16 @@ func (r *recordingStore) openedTenants() []uuid.UUID {
 	return append([]uuid.UUID(nil), r.opened...)
 }
 
+// recordingQuerier models the two queries the hub re-checks with, and nothing
+// else.
+//
+// The embedded interface is nil: calling any other query panics with a nil
+// dereference naming the method. That is the same hard failure the hand-written
+// panics gave, without having to grow by one stub every time query.sql grows a
+// query the hub will never call.
 type recordingQuerier struct {
+	store.Querier
+
 	store    *recordingStore
 	tenantID uuid.UUID
 }
@@ -184,34 +193,6 @@ func (q recordingQuerier) GetBoard(_ context.Context, boardID uuid.UUID) (store.
 	}
 
 	return store.Board{ID: boardID, TenantID: q.tenantID, Name: "board"}, nil
-}
-
-func (q recordingQuerier) CreateOrganization(context.Context, store.CreateOrganizationParams) (store.Organization, error) {
-	panic("recordingQuerier: not modelled")
-}
-
-func (q recordingQuerier) CreateMembership(context.Context, store.CreateMembershipParams) (store.Membership, error) {
-	panic("recordingQuerier: not modelled")
-}
-
-func (q recordingQuerier) ListMembers(context.Context) ([]store.ListMembersRow, error) {
-	panic("recordingQuerier: not modelled")
-}
-
-func (q recordingQuerier) ListProjects(context.Context) ([]store.Project, error) {
-	panic("recordingQuerier: not modelled")
-}
-
-func (q recordingQuerier) CreateProject(context.Context, store.CreateProjectParams) (store.Project, error) {
-	panic("recordingQuerier: not modelled")
-}
-
-func (q recordingQuerier) ListColumnsByBoard(context.Context, uuid.UUID) ([]store.Column, error) {
-	panic("recordingQuerier: not modelled")
-}
-
-func (q recordingQuerier) ListCardsByBoard(context.Context, uuid.UUID) ([]store.Card, error) {
-	panic("recordingQuerier: not modelled")
 }
 
 // instance is one API process: a hub, its broker, and an HTTP server in front
