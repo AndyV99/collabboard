@@ -129,6 +129,16 @@ Both moves return `NeedsRebalance`, which is the query saying the new rank's
 scale has passed 100 decimal places. The caller renumbers the column with
 `RebalanceColumnCards` / `RebalanceBoardColumns` while it still holds the lock.
 
+### The deletes that return a row
+
+`DeleteCard` and `DeleteColumn` are `DELETE ... RETURNING *` rather than
+`:execrows`, and `DeleteBoard` is not. The asymmetry is deliberate: issue #45
+addresses realtime events to a *board*, and after a card or column has been
+deleted its board id exists nowhere else — whereas a board's own id is in the
+request path. "No row" still means the same thing it meant as a zero count, and
+`internal/api` still turns it into the same 404 for an id that never existed and
+for one belonging to another tenant.
+
 ## Adding a query
 
 1. Add it to `query.sql` with a `-- name:` annotation.
