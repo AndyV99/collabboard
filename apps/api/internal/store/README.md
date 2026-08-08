@@ -100,11 +100,34 @@ transaction's tenant". The WebSocket hub asks it on an interval for every live
 connection, because a connection authorized once outlives the check that
 authorized it — see `internal/realtime/README.md`.
 
-The query set is deliberately representative, not exhaustive — enough to
-exercise the mechanism across the interesting boundaries (a plain tenant-scoped
-list, a child collection reached by parent id, a join from tenant-scoped
-`memberships` to global `users`, and a write). Later work adds queries next to
-the feature that needs them.
+The query set started out deliberately representative rather than exhaustive —
+enough to exercise the mechanism across the interesting boundaries (a plain
+tenant-scoped list, a child collection reached by parent id, a join from
+tenant-scoped `memberships` to global `users`, and a write). Issue #47 added the
+rest of the board hierarchy next to the feature that needed it, which is the
+pattern for everything after it.
+
+### The ordering queries
+
+`MoveCard` and `MoveColumn` are the only queries here that are not
+straightforward, and two things about them are worth knowing before editing
+either. Both are argued in [ADR 0004](../../../../docs/adr/0004-card-ordering.md).
+
+- **`(lower + upper) * 0.5`, never `(lower + upper) / 2`.** `numeric`
+  multiplication is exact; division picks a bounded result scale and rounds to
+  it, so halving with `/` stops making progress after ~53 nested subdivisions of
+  one gap and starts returning a value equal to one of the bounds — two cards
+  with the same rank.
+- **The caller holds `LockColumn` (for cards) or `LockBoard` (for columns)**
+  before any statement that allocates a position, including `CreateCard` and
+  `CreateColumn`. The lock is on the *parent*, never on the siblings: one lock
+  per operation means two concurrent moves cannot each hold one and wait for the
+  other's. It is what makes ranks within a column distinct by construction.
+  `internal/api/cards.go` documents the statement order and why it is that order.
+
+Both moves return `NeedsRebalance`, which is the query saying the new rank's
+scale has passed 100 decimal places. The caller renumbers the column with
+`RebalanceColumnCards` / `RebalanceBoardColumns` while it still holds the lock.
 
 ## Adding a query
 

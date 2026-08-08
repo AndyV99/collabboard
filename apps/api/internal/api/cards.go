@@ -1,0 +1,390 @@
+package api
+
+// Cards, and the move operation the realtime layer exists to broadcast.
+//
+// # Why the API never mentions a position
+//
+// A card's rank is a `numeric` the server allocates, and it is not in any
+// response. Two reasons, and the first is the important one.
+//
+// A client that could send a position would be sending a claim about a list it
+// last saw. Two clients holding the same slightly-stale list send two positions
+// that disagree about where "third from the top" is, and the server has no way
+// to tell a deliberate placement from a stale one. `after_card_id` is a claim
+// about a single row, which the database can still evaluate after someone else
+// has reordered everything around it — and if that row is no longer in the
+// target column, the move is refused instead of silently landing somewhere else.
+//
+// The second: the rank is renumbered from time to time (see
+// RebalanceColumnCards). A client holding a rank it read a minute ago would be
+// holding a number that no longer means what it meant. Never publishing it means
+// no client can come to depend on it.
+//
+// The cost is that a client cannot compute "insert at index 4" without the list;
+// it has the list, because it just rendered the board.
+//
+// See docs/adr/0004-card-ordering.md.
+
+import (
+	"context"
+	"errors"
+	"log/slog"
+	"net/http"
+
+	"github.com/gin-gonic/gin"
+	"github.com/google/uuid"
+
+	"github.com/AndyV99/collabboard/apps/api/internal/store"
+)
+
+type cardBody struct {
+	ID          string `json:"id"`
+	BoardID     string `json:"board_id"`
+	ColumnID    string `json:"column_id"`
+	Title       string `json:"title"`
+	Description string `json:"description"`
+	CreatedAt   string `json:"created_at"`
+	UpdatedAt   string `json:"updated_at"`
+}
+
+type createCardRequest struct {
+	Title       string `json:"title" binding:"required"`
+	Description string `json:"description"`
+}
+
+type patchCardRequest struct {
+	Title       *string `json:"title"`
+	Description *string `json:"description"`
+}
+
+// moveCardRequest is the whole move: which column, and which card to sit behind.
+// A null or absent after_card_id means "first in that column".
+type moveCardRequest struct {
+	ColumnID    string  `json:"column_id" binding:"required"`
+	AfterCardID *string `json:"after_card_id"`
+}
+
+func newCardBody(card store.Card) cardBody {
+	return cardBody{
+		ID:          card.ID.String(),
+		BoardID:     card.BoardID.String(),
+		ColumnID:    card.ColumnID.String(),
+		Title:       card.Title,
+		Description: card.Description,
+		CreatedAt:   timestamp(card.CreatedAt),
+		UpdatedAt:   timestamp(card.UpdatedAt),
+	}
+}
+
+// createCardHandler appends a card to a column.
+//
+// LockColumn is the 404 for a column this tenant cannot see *and* the serialiser
+// for the "one past the current maximum" read inside CreateCard.
+func createCardHandler(logger *slog.Logger, tenantStore TenantStore) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		columnID, ok := pathUUID(c, "column_id")
+		if !ok {
+			return
+		}
+
+		var req createCardRequest
+		if !bindJSON(c, &req) {
+			return
+		}
+
+		title, ok := requiredText(c, "title", req.Title, maxNameLength)
+		if !ok {
+			return
+		}
+
+		description, ok := boundedText(c, "description", req.Description, maxDescriptionLength)
+		if !ok {
+			return
+		}
+
+		card, ok := tenantScoped(c, logger, tenantStore, "card.create.failed",
+			func(ctx context.Context, q store.Querier) (store.Card, error) {
+				column, err := q.LockColumn(ctx, columnID)
+				if _, err := asNotFound(subjectColumn, column, err); err != nil {
+					return store.Card{}, err
+				}
+
+				card, err := q.CreateCard(ctx, store.CreateCardParams{
+					ColumnID:    columnID,
+					Title:       title,
+					Description: description,
+				})
+
+				return asNotFound(subjectColumn, card, err)
+			})
+		if !ok {
+			return
+		}
+
+		c.JSON(http.StatusCreated, gin.H{subjectCard: newCardBody(card)})
+	}
+}
+
+func listCardsByColumnHandler(logger *slog.Logger, tenantStore TenantStore) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		columnID, ok := pathUUID(c, "column_id")
+		if !ok {
+			return
+		}
+
+		cards, ok := tenantScoped(c, logger, tenantStore, "card.list.failed",
+			func(ctx context.Context, q store.Querier) ([]store.Card, error) {
+				return q.ListCardsByColumn(ctx, columnID)
+			})
+		if !ok {
+			return
+		}
+
+		c.JSON(http.StatusOK, gin.H{"cards": cardBodies(cards)})
+	}
+}
+
+// listCardsByBoardHandler is the board view's one round trip: every card on the
+// board, ordered by column and then by rank, for the client to group.
+func listCardsByBoardHandler(logger *slog.Logger, tenantStore TenantStore) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		boardID, ok := pathUUID(c, "board_id")
+		if !ok {
+			return
+		}
+
+		cards, ok := tenantScoped(c, logger, tenantStore, "card.list.failed",
+			func(ctx context.Context, q store.Querier) ([]store.Card, error) {
+				return q.ListCardsByBoard(ctx, boardID)
+			})
+		if !ok {
+			return
+		}
+
+		c.JSON(http.StatusOK, gin.H{"cards": cardBodies(cards)})
+	}
+}
+
+func getCardHandler(logger *slog.Logger, tenantStore TenantStore) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		cardID, ok := pathUUID(c, "card_id")
+		if !ok {
+			return
+		}
+
+		card, ok := tenantScoped(c, logger, tenantStore, "card.get.failed",
+			func(ctx context.Context, q store.Querier) (store.Card, error) {
+				card, err := q.GetCard(ctx, cardID)
+
+				return asNotFound(subjectCard, card, err)
+			})
+		if !ok {
+			return
+		}
+
+		c.JSON(http.StatusOK, gin.H{subjectCard: newCardBody(card)})
+	}
+}
+
+func patchCardHandler(logger *slog.Logger, tenantStore TenantStore) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		cardID, ok := pathUUID(c, "card_id")
+		if !ok {
+			return
+		}
+
+		var req patchCardRequest
+		if !bindJSON(c, &req) {
+			return
+		}
+
+		title, ok := optionalText(c, "title", req.Title, maxNameLength, false)
+		if !ok {
+			return
+		}
+
+		description, ok := optionalText(c, "description", req.Description, maxDescriptionLength, true)
+		if !ok {
+			return
+		}
+
+		if title == nil && description == nil {
+			c.AbortWithStatusJSON(http.StatusBadRequest,
+				errorResponse{Error: "at least one of title or description is required"})
+
+			return
+		}
+
+		card, ok := tenantScoped(c, logger, tenantStore, "card.update.failed",
+			func(ctx context.Context, q store.Querier) (store.Card, error) {
+				card, err := q.UpdateCard(ctx, store.UpdateCardParams{
+					CardID:      cardID,
+					Title:       title,
+					Description: description,
+				})
+
+				return asNotFound(subjectCard, card, err)
+			})
+		if !ok {
+			return
+		}
+
+		c.JSON(http.StatusOK, gin.H{subjectCard: newCardBody(card)})
+	}
+}
+
+// moveCardHandler is the headline operation.
+//
+// Both ids in the request — the target column and the anchor card — are
+// resolved inside the caller's own tenant context, so neither can name anything
+// belonging to another organization. Neither is checked against an owner: a
+// foreign column simply does not exist to this transaction.
+func moveCardHandler(logger *slog.Logger, tenantStore TenantStore) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		cardID, ok := pathUUID(c, "card_id")
+		if !ok {
+			return
+		}
+
+		var req moveCardRequest
+		if !bindJSON(c, &req) {
+			return
+		}
+
+		columnID, err := uuid.Parse(req.ColumnID)
+		if err != nil {
+			c.AbortWithStatusJSON(http.StatusBadRequest, errorResponse{Error: "column_id must be a uuid"})
+
+			return
+		}
+
+		afterCardID, ok := optionalUUID(c, "after_card_id", req.AfterCardID)
+		if !ok {
+			return
+		}
+
+		card, ok := tenantScoped(c, logger, tenantStore, "card.move.failed",
+			func(ctx context.Context, q store.Querier) (store.Card, error) {
+				return moveCard(ctx, q, cardID, columnID, afterCardID)
+			})
+		if !ok {
+			return
+		}
+
+		c.JSON(http.StatusOK, gin.H{subjectCard: newCardBody(card)})
+	}
+}
+
+// moveCard is the body of the move, inside the tenant transaction.
+//
+// The order of the three statements is the concurrency design:
+//
+//  1. lock the destination column, which serialises every other move or create
+//     targeting it — so the midpoint is computed against an order nobody else is
+//     changing, and two cards can never be handed the same rank;
+//  2. read the card, which is the 404 and the source of the board check;
+//  3. update the card, which additionally takes the card's own row lock — so two
+//     clients moving the *same* card serialise there, and the second one
+//     recomputes its midpoint against the order the first one left behind.
+//
+// Only one lock is ever waited for while another is held, so there is no cycle
+// and no deadlock between two concurrent moves.
+func moveCard(ctx context.Context, q store.Querier, cardID, columnID uuid.UUID, afterCardID *uuid.UUID) (store.Card, error) {
+	column, err := q.LockColumn(ctx, columnID)
+
+	target, err := asNotFound(subjectColumn, column, err)
+	if err != nil {
+		return store.Card{}, err
+	}
+
+	card, err := q.GetCard(ctx, cardID)
+
+	current, err := asNotFound(subjectCard, card, err)
+	if err != nil {
+		return store.Card{}, err
+	}
+
+	// Cards do not change board. The composite foreign key would reject it
+	// anyway; checking here is what turns that into a 409 with a sentence rather
+	// than a 500 with a constraint name in the log.
+	if current.BoardID != target.BoardID {
+		return store.Card{}, conflict("column_id names a column on a different board")
+	}
+
+	moved, err := q.MoveCard(ctx, store.MoveCardParams{
+		CardID:      cardID,
+		ColumnID:    columnID,
+		AfterCardID: afterCardID,
+	})
+
+	if errors.Is(err, store.ErrNoRows) {
+		// The card exists, the column exists, and they share a board — so the
+		// only remaining reason for no row is the anchor. A client that dragged
+		// past a card someone else has just moved or deleted gets this.
+		return store.Card{}, conflict("after_card_id is not a card in that column")
+	}
+
+	if err != nil {
+		return store.Card{}, err
+	}
+
+	if moved.NeedsRebalance {
+		// Still under the column lock. Renumbering is the only statement that
+		// writes every row in a column, and it must not run while another move
+		// is comparing against a rank it is about to rewrite.
+		if err := q.RebalanceColumnCards(ctx, columnID); err != nil {
+			return store.Card{}, err
+		}
+	}
+
+	return store.Card{
+		ID:          moved.ID,
+		TenantID:    moved.TenantID,
+		BoardID:     moved.BoardID,
+		ColumnID:    moved.ColumnID,
+		Title:       moved.Title,
+		Description: moved.Description,
+		Position:    moved.Position,
+		AssigneeID:  moved.AssigneeID,
+		DueAt:       moved.DueAt,
+		CreatedAt:   moved.CreatedAt,
+		UpdatedAt:   moved.UpdatedAt,
+	}, nil
+}
+
+func deleteCardHandler(logger *slog.Logger, tenantStore TenantStore) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		cardID, ok := pathUUID(c, "card_id")
+		if !ok {
+			return
+		}
+
+		_, ok = tenantScoped(c, logger, tenantStore, "card.delete.failed",
+			func(ctx context.Context, q store.Querier) (struct{}, error) {
+				rows, err := q.DeleteCard(ctx, cardID)
+				if err != nil {
+					return struct{}{}, err
+				}
+
+				if rows == 0 {
+					return struct{}{}, notFound(subjectCard)
+				}
+
+				return struct{}{}, nil
+			})
+		if !ok {
+			return
+		}
+
+		c.Status(http.StatusNoContent)
+	}
+}
+
+func cardBodies(cards []store.Card) []cardBody {
+	bodies := make([]cardBody, 0, len(cards))
+	for _, card := range cards {
+		bodies = append(bodies, newCardBody(card))
+	}
+
+	return bodies
+}

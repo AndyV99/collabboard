@@ -11,6 +11,22 @@ import (
 )
 
 type Querier interface {
+	// Idempotent: archiving an archived project keeps the original timestamp and
+	// still returns the row, so a retried request is a success rather than a 404.
+	ArchiveProject(ctx context.Context, projectID uuid.UUID) (Project, error)
+	// INSERT ... SELECT rather than VALUES, so that a project id naming a row this
+	// tenant cannot see produces *no row* instead of a foreign-key violation. The
+	// policy filters the SELECT, the caller gets ErrNoRows, and the handler answers
+	// 404 — the same answer as an id that exists nowhere, which is what stops the
+	// endpoint from being an existence oracle for other tenants.
+	CreateBoard(ctx context.Context, arg CreateBoardParams) (Board, error)
+	// Appends to the end of the column, taking board_id from the column rather than
+	// from the caller: the composite foreign key would reject a disagreement, but
+	// deriving it means there is no argument to disagree with. Run under LockColumn.
+	CreateCard(ctx context.Context, arg CreateCardParams) (Card, error)
+	// Appends: one past the current maximum. Run under LockBoard, so two concurrent
+	// creates cannot read the same maximum and both claim it.
+	CreateColumn(ctx context.Context, arg CreateColumnParams) (Column, error)
 	// The second half of an invite, and the half that is *not* pre-tenant.
 	//
 	// Once the pre-tenant path has resolved (or created) the global user, joining
@@ -37,9 +53,17 @@ type Querier interface {
 	// name a tenant it is not already scoped to, so the WITH CHECK half of the
 	// policy is unreachable in practice rather than merely unviolated.
 	CreateProject(ctx context.Context, arg CreateProjectParams) (Project, error)
+	// Cascades to columns and cards through the composite foreign keys. :execrows
+	// rather than :exec because "0 rows" is the only way this can report that the id
+	// named no board the caller can see.
+	DeleteBoard(ctx context.Context, boardID uuid.UUID) (int64, error)
+	DeleteCard(ctx context.Context, cardID uuid.UUID) (int64, error)
+	DeleteColumn(ctx context.Context, columnID uuid.UUID) (int64, error)
 	// Returns no row rather than another tenant's board when the id belongs to
 	// someone else, which is the behaviour the isolation model is chosen for.
 	GetBoard(ctx context.Context, boardID uuid.UUID) (Board, error)
+	GetCard(ctx context.Context, cardID uuid.UUID) (Card, error)
+	GetColumn(ctx context.Context, columnID uuid.UUID) (Column, error)
 	// The row joining one user to the *current* tenant, or no row at all.
 	//
 	// Added for the WebSocket hub (issue #9), which has to answer "is this subject
@@ -54,9 +78,16 @@ type Querier interface {
 	// user whose membership was revoked are the same answer — no row — which is the
 	// answer the caller wants for both.
 	GetMembership(ctx context.Context, userID uuid.UUID) (Membership, error)
+	GetProject(ctx context.Context, projectID uuid.UUID) (Project, error)
+	ListBoardsByProject(ctx context.Context, projectID uuid.UUID) ([]Board, error)
 	// The board view loads every card for the board in one round trip and groups by
 	// column client-side; cards_tenant_board_idx serves this.
 	ListCardsByBoard(ctx context.Context, boardID uuid.UUID) ([]Card, error)
+	ListCardsByColumn(ctx context.Context, columnID uuid.UUID) ([]Card, error)
+	// id is the tiebreaker, not decoration. Positions are unique within a board by
+	// construction (see MoveColumn), but "by construction" is an argument about the
+	// write path, and a list whose order depends on that argument holding would
+	// return rows in an unspecified order the day it stops. See ADR 0004.
 	ListColumnsByBoard(ctx context.Context, boardID uuid.UUID) ([]Column, error)
 	// Joins the tenant-scoped memberships table to the global users table. users has
 	// no tenant_id: its policy makes a row visible only when a membership joins it
@@ -71,6 +102,72 @@ type Querier interface {
 	// the predicate by hand would buy nothing and would invite a caller to pass a
 	// tenant that disagrees with the transaction's. See internal/store/README.md.
 	ListProjects(ctx context.Context) ([]Project, error)
+	// Serialises column reordering within one board.
+	//
+	// FOR UPDATE on the *parent* rather than on the sibling rows being reordered is
+	// deliberate: it is one lock per move, so two moves can never hold one lock each
+	// and wait for the other's. Locking the siblings instead would deadlock as soon
+	// as two moves crossed between the same pair of parents.
+	LockBoard(ctx context.Context, boardID uuid.UUID) (Board, error)
+	// Serialises card creation and card moves *into* this column. See LockBoard for
+	// why the lock is taken on the parent row.
+	LockColumn(ctx context.Context, columnID uuid.UUID) (Column, error)
+	// The headline operation: put this card in @column_id, immediately after
+	// @after_card_id, or first in that column when @after_card_id is null.
+	//
+	// One row is written. Neither the source column nor the destination is
+	// renumbered, so a concurrent move of a *different* card is unaffected, and a
+	// concurrent move of the *same* card is resolved by the row lock on the card
+	// itself: the second transaction's UPDATE waits, then re-evaluates the CASE
+	// against the order the first one left behind. The result is one of the two
+	// requested orders, never a blend of both and never two cards sharing a rank.
+	//
+	// Two things this refuses, both by returning no row rather than by raising:
+	//
+	//   * an @after_card_id that is not currently a card in @column_id — including
+	//     one from another tenant, which the policy has already hidden. Silently
+	//     treating it as "move to the front" would turn a stale client into a
+	//     wrong-but-successful write.
+	//   * a @column_id on a different board from the card. Cards do not change
+	//     board: the composite foreign key would reject it anyway, and #45 fans
+	//     events out per board, so a move that changed board would have to announce
+	//     itself in two rooms at once.
+	//
+	// The midpoint is (lower + upper) * 0.5 and never (lower + upper) / 2. Postgres
+	// numeric multiplication is exact — the result's scale is the sum of the
+	// operands' — while division picks a result scale of at most max(the inputs'
+	// scales, ~16 significant digits) and *rounds* to it. Under division, halving
+	// stops making progress after roughly 53 nested inserts into one gap and starts
+	// returning a value equal to one of the bounds, which is two cards with the same
+	// rank. Under multiplication the midpoint is always strictly between them.
+	// See docs/adr/0004-card-ordering.md.
+	MoveCard(ctx context.Context, arg MoveCardParams) (MoveCardRow, error)
+	// Reorder: place this column immediately after @after_column_id, or first when
+	// that argument is null.
+	//
+	// "After this neighbour" rather than "at index 4" is the point. An index is a
+	// claim about a list the client last saw, and two clients holding the same stale
+	// list produce two writes that disagree about what index 4 means. A neighbour is
+	// a claim about one row, which the database can still evaluate after someone
+	// else has changed the list.
+	MoveColumn(ctx context.Context, arg MoveColumnParams) (MoveColumnRow, error)
+	// Renumbers a board's columns to 1..n, collapsing accumulated fractional scale
+	// without changing the order. Called only when MoveColumn reports pressure, and
+	// only while LockBoard is held, so no concurrent move can be computing a
+	// midpoint against a position this is about to rewrite.
+	RebalanceBoardColumns(ctx context.Context, boardID uuid.UUID) error
+	// The cost fractional ranking is chosen with, made explicit: nesting a move into
+	// the same gap n times leaves a rank with n decimal places, and numeric tops out
+	// at 16383 of them. Renumbering to 1..n collapses that, preserves the order, and
+	// is the only statement here that writes every row in a column.
+	RebalanceColumnCards(ctx context.Context, columnID uuid.UUID) error
+	UpdateBoard(ctx context.Context, arg UpdateBoardParams) (Board, error)
+	UpdateCard(ctx context.Context, arg UpdateCardParams) (Card, error)
+	UpdateColumn(ctx context.Context, arg UpdateColumnParams) (Column, error)
+	// A PATCH: sqlc.narg makes "absent" a distinguishable value, so omitting a field
+	// leaves the column alone instead of blanking it. The alternative — read, merge
+	// in Go, write back — would be a lost update between the two statements.
+	UpdateProject(ctx context.Context, arg UpdateProjectParams) (Project, error)
 }
 
 var _ Querier = (*Queries)(nil)

@@ -102,7 +102,15 @@ func (r *recordingStore) seed(tenantID uuid.UUID, email string) {
 	}}
 }
 
+// recordingQuerier models the one query this fixture needs and nothing else.
+//
+// The embedded interface is nil: calling any other query panics with a nil
+// dereference naming the method. That is the same hard failure the hand-written
+// panics gave, without having to grow by one stub every time query.sql grows a
+// query — which, since #47, it does often.
 type recordingQuerier struct {
+	store.Querier
+
 	store    *recordingStore
 	tenantID uuid.UUID
 }
@@ -115,38 +123,6 @@ func (q recordingQuerier) ListMembers(context.Context) ([]store.ListMembersRow, 
 	defer q.store.mu.Unlock()
 
 	return q.store.members[q.tenantID], nil
-}
-
-func (q recordingQuerier) CreateOrganization(context.Context, store.CreateOrganizationParams) (store.Organization, error) {
-	panic("recordingQuerier: not modelled")
-}
-
-func (q recordingQuerier) CreateMembership(context.Context, store.CreateMembershipParams) (store.Membership, error) {
-	panic("recordingQuerier: not modelled")
-}
-
-func (q recordingQuerier) ListProjects(context.Context) ([]store.Project, error) {
-	panic("recordingQuerier: not modelled")
-}
-
-func (q recordingQuerier) CreateProject(context.Context, store.CreateProjectParams) (store.Project, error) {
-	panic("recordingQuerier: not modelled")
-}
-
-func (q recordingQuerier) GetBoard(context.Context, uuid.UUID) (store.Board, error) {
-	panic("recordingQuerier: not modelled")
-}
-
-func (q recordingQuerier) GetMembership(context.Context, uuid.UUID) (store.Membership, error) {
-	panic("recordingQuerier: not modelled")
-}
-
-func (q recordingQuerier) ListColumnsByBoard(context.Context, uuid.UUID) ([]store.Column, error) {
-	panic("recordingQuerier: not modelled")
-}
-
-func (q recordingQuerier) ListCardsByBoard(context.Context, uuid.UUID) ([]store.Card, error) {
-	panic("recordingQuerier: not modelled")
 }
 
 // membershipService is an AuthService whose only real behaviour is membership:

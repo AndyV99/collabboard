@@ -352,7 +352,10 @@ func membersHandler(logger *slog.Logger, tenantStore TenantStore) gin.HandlerFun
 		var rows []store.ListMembersRow
 
 		// principal.TenantID, and there is no other expression in this package
-		// that could appear here. Grep for WithTenant: this is the only call.
+		// that could appear here. `grep -n 'principal.TenantID' internal/api`
+		// returns this line and the one inside tenantScoped in crud.go, which is
+		// where every project, board, column and card handler gets its tenant
+		// from. Two call sites, both reading the same verified claim.
 		err := tenantStore.WithTenant(c.Request.Context(), principal.TenantID,
 			func(ctx context.Context, q store.Querier) error {
 				var qerr error

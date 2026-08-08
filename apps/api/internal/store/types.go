@@ -64,4 +64,48 @@ type (
 	// ListMembersRow is one row of Querier.ListMembers — a membership joined to
 	// the user it refers to.
 	ListMembersRow = gen.ListMembersRow
+
+	// UpdateProjectParams are the arguments to Querier.UpdateProject. The two
+	// nullable fields are a PATCH, not an oversight: nil means "leave this
+	// column alone", which is what lets one endpoint rename a project without
+	// blanking its description.
+	UpdateProjectParams = gen.UpdateProjectParams
+
+	// CreateBoardParams are the arguments to Querier.CreateBoard.
+	CreateBoardParams = gen.CreateBoardParams
+
+	// UpdateBoardParams are the arguments to Querier.UpdateBoard.
+	UpdateBoardParams = gen.UpdateBoardParams
+
+	// CreateColumnParams are the arguments to Querier.CreateColumn.
+	CreateColumnParams = gen.CreateColumnParams
+
+	// UpdateColumnParams are the arguments to Querier.UpdateColumn.
+	UpdateColumnParams = gen.UpdateColumnParams
+
+	// MoveColumnParams are the arguments to Querier.MoveColumn. AfterColumnID
+	// is nil for "make this the first column", which is a position no sibling's
+	// id can name.
+	MoveColumnParams = gen.MoveColumnParams
+
+	// MoveColumnRow is the reordered column plus NeedsRebalance, which is the
+	// query telling the caller that this column's rank has accumulated enough
+	// fractional scale to be worth collapsing. See
+	// docs/adr/0004-card-ordering.md.
+	MoveColumnRow = gen.MoveColumnRow
+
+	// CreateCardParams are the arguments to Querier.CreateCard. There is no
+	// board_id: it is derived from the column, so the two cannot disagree.
+	CreateCardParams = gen.CreateCardParams
+
+	// UpdateCardParams are the arguments to Querier.UpdateCard, with the same
+	// nil-means-leave-alone convention as UpdateProjectParams.
+	UpdateCardParams = gen.UpdateCardParams
+
+	// MoveCardParams are the arguments to Querier.MoveCard. AfterCardID is nil
+	// for "put this card first in the column".
+	MoveCardParams = gen.MoveCardParams
+
+	// MoveCardRow is the moved card plus NeedsRebalance. See MoveColumnRow.
+	MoveCardRow = gen.MoveCardRow
 )
