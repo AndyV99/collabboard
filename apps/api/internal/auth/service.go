@@ -119,10 +119,8 @@ type Service struct {
 
 	// absentSalt is the salt used to derive against when no account exists.
 	// Derived once from the signing secret, so it is stable across the process
-	// and unguessable from outside. See loginDerive.
+	// and unguessable from outside. See loginSubject.
 	absentSalt []byte
-
-	now func() time.Time
 }
 
 // ServiceDeps are the collaborators [NewService] needs.
@@ -178,7 +176,6 @@ func NewService(deps ServiceDeps) (*Service, error) {
 		logger:     deps.Logger,
 		params:     deps.Params,
 		absentSalt: deps.AbsentSalt,
-		now:        time.Now,
 	}, nil
 }
 

@@ -192,12 +192,3 @@ func (l *Limiter) accountHash(email string) string {
 func NormalizeEmail(email string) string {
 	return strings.ToLower(strings.TrimSpace(email))
 }
-
-// String renders a decision for a log line.
-func (d Decision) String() string {
-	if d.Allowed {
-		return "allowed"
-	}
-
-	return fmt.Sprintf("limited on %s for %s", d.Scope, d.RetryAfter.Round(time.Second))
-}
