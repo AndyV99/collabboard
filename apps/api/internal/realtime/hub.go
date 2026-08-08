@@ -256,6 +256,33 @@ func (h *Hub) Publish(ctx context.Context, room Room, event Event) error {
 	return h.cfg.Broker.Publish(ctx, room, payload)
 }
 
+// register admits a connection to the hub, before it has subscribed to
+// anything.
+//
+// Registration is deliberately separate from joining a room. A client that has
+// connected but not yet named a board is still a socket this process is holding
+// open: it has to be counted, it has to receive a shutdown frame on a drain, and
+// it has to be closed rather than left for the process exit to reset. Doing this
+// only on the first subscribe — which is where it started — made an idle
+// connection invisible to [Hub.Rooms] and to [Hub.Shutdown] alike.
+//
+// It refuses on a draining hub, which is the second of the two checks on that
+// path: the handler looks before upgrading, and this looks after, so a client
+// that won the race with Shutdown by microseconds is turned away here instead of
+// being accepted by an instance that is going down.
+func (h *Hub) register(conn *Conn) error {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+
+	if h.closing {
+		return ErrHubClosed
+	}
+
+	h.conns[conn] = struct{}{}
+
+	return nil
+}
+
 // join adds conn to room, subscribing at the broker if this is the room's first
 // local member.
 //
@@ -295,7 +322,6 @@ func (h *Hub) join(ctx context.Context, room Room, conn *Conn) error {
 	}
 
 	h.rooms[room][conn] = struct{}{}
-	h.conns[conn] = struct{}{}
 	h.mu.Unlock()
 
 	return nil

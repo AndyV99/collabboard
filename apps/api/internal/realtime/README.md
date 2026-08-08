@@ -116,6 +116,22 @@ asserting it: a real connection that never reads is dropped after ~2,000 frames
 (~34 MB) while another client on the same board receives every one of them and
 keeps receiving after the drop.
 
+One thing worth knowing about the `4002` frame itself. The write pump owns
+*every* write on a socket, the close frame included, because coder/websocket
+serialises writes behind one lock: a close attempted from another goroutine
+waits for whatever data frame is in flight, and the library's own five-second
+budget for a close frame then races our write timeout. The loser is the close
+frame, and the client gets a reset connection instead of the code that tells it
+to re-fetch — precisely when the code matters most. Cancelling the in-flight
+write to free the lock is worse, not better: coder treats a cancelled write
+context as unrecoverable and closes the connection, destroying the frame we were
+making room for. So the close is simply the next thing the write pump does.
+
+The honest limit: **a peer that never reads again cannot be told anything**, on
+this socket or any other. It gets a reset once `REALTIME_WRITE_TIMEOUT` expires,
+and the ping reaper is what notices it. A client that was merely slow — the
+common case — resumes reading, the queued frame drains, and `4002` follows it.
+
 ## Instance restart
 
 `http.Server.Shutdown` does not close or wait for hijacked connections, and every

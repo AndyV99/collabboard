@@ -280,9 +280,23 @@ func TestASlowClientIsDroppedWithoutStallingOthers(t *testing.T) {
 	)
 
 	inst := newInstance(t, instanceOptions{
-		authorizer:   allowAll{},
-		sendBuffer:   8,
-		writeTimeout: 5 * time.Second,
+		authorizer: allowAll{},
+		sendBuffer: 8,
+
+		// Generous on purpose, and the reason is the thing under test. Once the
+		// peer's buffers are full the write pump is parked inside one frame
+		// write; the close frame goes out behind it, when that frame completes.
+		// This test's slow client starts reading again the moment the drop is
+		// detected, so the write completes and 4002 is delivered — which is the
+		// realistic case, a client that was slow rather than gone. A shorter
+		// timeout here would expire mid-fill and end the connection as a write
+		// failure, testing the timeout instead of the buffer.
+		//
+		// The case this deliberately does not cover: a peer that never reads
+		// again cannot be told anything at all, on this socket or any other. It
+		// gets a reset after WriteTimeout, and TestADeadConnectionIsReaped
+		// covers how it is noticed.
+		writeTimeout: 60 * time.Second,
 	})
 
 	tenantID := uuid.New()
@@ -446,6 +460,15 @@ func TestADeadConnectionIsReaped(t *testing.T) {
 	tenantID := uuid.New()
 
 	inst.dialRaw(ctx, t, inst.token(t, principalFor(tenantID, 15*time.Minute)))
+
+	// The connection is counted before it subscribes to anything, so this
+	// assertion is about the reaper rather than about a number that was zero
+	// all along.
+	eventually(t, 5*time.Second, "the connection to be registered", func() bool {
+		_, conns := inst.hub.Rooms()
+
+		return conns == 1
+	})
 
 	eventually(t, 10*time.Second, "the unresponsive connection to be reaped", func() bool {
 		_, conns := inst.hub.Rooms()
@@ -630,12 +653,32 @@ func TestShutdownWarnsClientsThenClosesThem(t *testing.T) {
 	c := inst.dial(ctx, t, inst.token(t, principalFor(tenantID, 15*time.Minute)))
 	c.subscribe(t, ctx, boardID)
 
+	// A second connection that never subscribes. It is the one a hub that only
+	// tracked room members would forget about, leaving a socket for the process
+	// exit to reset.
+	idle := inst.dial(ctx, t, inst.token(t, principalFor(tenantID, 15*time.Minute)))
+
+	eventually(t, 5*time.Second, "both connections to be registered", func() bool {
+		_, conns := inst.hub.Rooms()
+
+		return conns == 2
+	})
+
 	shutdownCtx, shutdownCancel := context.WithTimeout(ctx, 10*time.Second)
 	defer shutdownCancel()
 
 	done := make(chan error, 1)
 
 	go func() { done <- inst.hub.Shutdown(shutdownCtx) }()
+
+	idleFrame := idle.expect(FrameShutdown, 10*time.Second)
+	if idleFrame.ReconnectAfterMs <= 0 {
+		t.Error("the idle connection got no reconnect delay")
+	}
+
+	if got := idle.closeStatus(10 * time.Second); got != closeGoingAway {
+		t.Errorf("the idle connection saw close status %d, want %d (going away)", got, closeGoingAway)
+	}
 
 	frame := c.expect(FrameShutdown, 10*time.Second)
 

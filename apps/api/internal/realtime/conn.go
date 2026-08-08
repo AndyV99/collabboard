@@ -1,18 +1,17 @@
 package realtime
 
 // One connection: three goroutines, one buffer, and a close that can be
-// triggered from any of them.
+// triggered from any of them — or from the hub, which is the case the design
+// turns on.
 //
 // # The goroutines
 //
 //	readPump    decodes client frames. Owns the socket's read side entirely,
 //	            because coder/websocket forbids concurrent reads.
-//	writePump   drains the send buffer onto the socket. The only writer of
-//	            data frames.
+//	writePump   drains the send buffer onto the socket, and sends the close
+//	            frame on its way out. The only writer, full stop — see its
+//	            comment for why the close handshake cannot live anywhere else.
 //	maintain    pings, reaps, re-authorizes, and enforces the token deadline.
-//	closer      parked on c.closed; performs the close handshake so that a
-//	            close triggered from the hub's fan-out goroutine never blocks
-//	            that goroutine on a slow peer's TCP buffer.
 //
 // # Why a connection outlives its authorization check, and what is done about it
 //
@@ -126,6 +125,14 @@ func newConn(hub *Hub, ws *websocket.Conn, principal auth.Principal) *Conn {
 func (c *Conn) serve(ctx context.Context) {
 	defer close(c.finished)
 
+	// Before anything else, so that an idle connection — one that has not named
+	// a board yet — is still counted, still drained and still closed.
+	if err := c.hub.register(c); err != nil {
+		_ = c.ws.Close(closeGoingAway, "server is restarting")
+
+		return
+	}
+
 	// Detached from ctx on purpose, and bounded. By the time this runs the
 	// request context is usually already cancelled — that is one of the ways a
 	// connection ends — and unsubscribing from Redis with a cancelled context
@@ -145,11 +152,10 @@ func (c *Conn) serve(ctx context.Context) {
 
 	var wg sync.WaitGroup
 
-	wg.Add(3)
+	wg.Add(2)
 
 	go func() { defer wg.Done(); c.writePump(ctx) }()
 	go func() { defer wg.Done(); c.maintain(ctx) }()
-	go func() { defer wg.Done(); c.closer(ctx) }()
 
 	c.logger.Info("realtime connection opened",
 		slog.String("event", "realtime.connection.opened"),
@@ -166,7 +172,7 @@ func (c *Conn) serve(ctx context.Context) {
 	cancel()
 	wg.Wait()
 
-	// Backstop. If the handshake in closer completed this is a no-op; if it
+	// Backstop. If the write pump's handshake completed this is a no-op; if it
 	// did not, this is what actually releases the file descriptor.
 	_ = c.ws.CloseNow()
 
@@ -368,8 +374,35 @@ func (c *Conn) handleUnsubscribe(ctx context.Context, frame clientFrame) {
 	c.sendFrame(Frame{Type: FrameUnsubscribed, BoardID: &boardID})
 }
 
-// writePump is the only writer of data frames.
+// writePump owns every write on this socket, data frames and the close frame
+// alike.
+//
+// # Why the close handshake belongs here and not in a goroutine of its own
+//
+// coder/websocket serialises writes behind one internal lock, and a data frame
+// bound for a peer that has stopped reading holds that lock until it completes
+// or hits WriteTimeout. A close handshake attempted from any other goroutine
+// therefore has to wait for that frame — and the library's own five-second
+// budget for sending a close frame runs concurrently with our write timeout, so
+// the two race. The loser is the close frame, and the client gets a reset
+// connection instead of the status code that tells it what to do about it. That
+// is exactly the case where the status matters most: 4002 is how a dropped slow
+// client learns it has missed events and must re-fetch the board.
+//
+// Cancelling the in-flight write to free the lock does not help and actively
+// hurts: coder/websocket treats a cancelled write context as unrecoverable —
+// a half-written frame cannot be un-sent — and closes the connection, which
+// destroys the very close frame we were trying to make room for.
+//
+// Doing both here removes the race rather than tuning it. The close is simply
+// the next thing this goroutine does after the frame in flight finishes.
+//
+// The honest limit: a peer that never reads again cannot be told anything, on
+// this socket or any other. It gets a reset after WriteTimeout, and the ping
+// reaper is what notices it.
 func (c *Conn) writePump(ctx context.Context) {
+	defer c.finishHandshake()
+
 	for {
 		select {
 		case <-ctx.Done():
@@ -388,6 +421,10 @@ func (c *Conn) write(ctx context.Context, payload []byte) bool {
 	// Bounded, so a peer whose receive window is full stalls this connection's
 	// writer for at most WriteTimeout rather than forever. Its own send buffer
 	// fills meanwhile, and the hub drops it — which is the designed outcome.
+	//
+	// Parented on the serve context and deliberately not cancelled by close:
+	// coder/websocket kills the connection when a write context is cancelled,
+	// which would take the close frame with it. See writePump.
 	writeCtx, cancel := context.WithTimeout(ctx, c.hub.cfg.WriteTimeout)
 	defer cancel()
 
@@ -513,29 +550,16 @@ func (c *Conn) reauthorize(ctx context.Context) bool {
 	return true
 }
 
-// closer performs the close handshake once something decides the connection is
-// over.
+// finishHandshake sends the close frame and waits for the peer's answer.
 //
-// It exists so that close itself does no I/O: close is called from the hub's
-// fan-out goroutine when a client is too slow, and that goroutine must never
-// wait on a socket. It also unblocks readPump, which is otherwise parked in
-// Read until the peer says something.
-//
-// It also has to be a separate goroutine because coder/websocket's Close writes
-// the close frame and then waits for the peer's — which needs the read lock
-// readPump is holding. The close frame is on the wire before that wait starts,
-// so the peer always learns the reason promptly; the wait resolves as soon as
-// readPump sees the peer's answering close and lets the lock go, and is capped
-// by the library at five seconds if the peer never answers.
-func (c *Conn) closer(ctx context.Context) {
-	select {
-	case <-c.closed:
-	case <-ctx.Done():
-		// The server is going down or the request context died. Still a
-		// graceful close: whatever reason was recorded is more useful to the
-		// client than a reset connection.
-	}
-
+// Called from the write pump's defer, so it runs exactly once and never
+// concurrently with a data frame. It is also what unblocks readPump: coder's
+// Close writes the close frame first and only then waits for the peer's, which
+// needs the read lock readPump is holding — so the client learns the reason
+// immediately, and the wait resolves as soon as readPump sees the answering
+// close and lets the lock go. The library caps that wait at five seconds if the
+// peer never answers.
+func (c *Conn) finishHandshake() {
 	status, reason := c.closeInfo()
 
 	_ = c.ws.Close(status, reason)
