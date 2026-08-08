@@ -25,10 +25,18 @@ func TestSqlcGeneratesIntoAnUnimportablePackage(t *testing.T) {
 
 	cfg := string(raw)
 
-	const wantOut = "out: internal/store/internal/gen"
-	if !strings.Contains(cfg, wantOut) {
-		t.Errorf("sqlc.yaml no longer contains %q; generated queriers would become importable outside internal/store, "+
-			"and WithTenant would stop being the only way to reach the database", wantOut)
+	// Both generated packages, for the same reason. The pre-tenant one matters
+	// at least as much: it is the querier that can reach identity data without
+	// a tenant, so a package outside internal/store being able to construct one
+	// would hand every handler the door WithoutTenant exists to meter.
+	for _, wantOut := range []string{
+		"out: internal/store/internal/gen",
+		"out: internal/store/internal/identitygen",
+	} {
+		if !strings.Contains(cfg, wantOut) {
+			t.Errorf("sqlc.yaml no longer contains %q; generated queriers would become importable outside internal/store, "+
+				"and WithTenant/WithoutTenant would stop being the only ways to reach the database", wantOut)
+		}
 	}
 
 	// package: store would put gen.New — a constructor that binds a querier to
