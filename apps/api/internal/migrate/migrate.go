@@ -53,6 +53,10 @@ const (
 // ErrUnknownCommand is returned for an unrecognised subcommand argument.
 var ErrUnknownCommand = errors.New("unknown migrate command")
 
+// ErrExemptMigrationRole is returned when the connected role is one that
+// row-level security is not enforced against. See [preflight].
+var ErrExemptMigrationRole = errors.New("migration role is exempt from row-level security")
+
 // Commands lists the supported commands, for usage messages.
 func Commands() []Command {
 	return []Command{CommandUp, CommandDown, CommandReset, CommandStatus}
@@ -97,6 +101,10 @@ func Run(ctx context.Context, logger *slog.Logger, dsn string, cmd Command) erro
 		return fmt.Errorf("creating migration session locker: %w", err)
 	}
 
+	if err := preflight(ctx, logger, db); err != nil {
+		return err
+	}
+
 	provider, err := goose.NewProvider(
 		goose.DialectPostgres,
 		db,
@@ -109,6 +117,85 @@ func Run(ctx context.Context, logger *slog.Logger, dsn string, cmd Command) erro
 	}
 
 	return dispatch(ctx, logger, provider, cmd)
+}
+
+// preflightSQL asks whether row-level security is enforced against the role
+// this connection authenticated as.
+//
+// to_regclass returns NULL rather than raising for a relation that does not
+// exist, so this is also the "is there a schema yet" probe: on an empty database
+// there is no users table to ask about, and the attribute columns are all the
+// answer available.
+const preflightSQL = `
+SELECT r.rolname,
+       r.rolsuper,
+       r.rolbypassrls,
+       to_regclass('public.users') IS NOT NULL AS schema_present,
+       CASE
+           WHEN to_regclass('public.users') IS NOT NULL
+           THEN pg_catalog.row_security_active('public.users')
+           ELSE true
+       END AS rls_enforced
+FROM pg_catalog.pg_roles r
+WHERE r.rolname = CURRENT_USER`
+
+// preflight refuses to migrate as a role that row-level security is not
+// enforced against, before any migration runs.
+//
+// # Why this is in Go as well as in SQL
+//
+// Migration 00006 makes the same check, and it has to: it is what travels with
+// the schema, and it is what catches a chain applied by anything other than
+// this binary. But goose applies each migration in its own transaction, so a
+// check that lives in the last file only fires after the first five have
+// already been applied — by the wrong role, leaving every table owned by it.
+// Recovering means reassigning ownership, which is a documented step
+// (apps/api/scripts/provision/bootstrap-owner.sql takes -v previous_owner) but
+// not one anybody should be walked into by a stale environment variable.
+//
+// Checking here costs one round trip and means the answer to "I ran it as the
+// wrong role" is "nothing happened".
+//
+// # What it checks
+//
+// The same thing 00006 checks, for the same reasons — see that file's header.
+// The short version: attributes alone would miss the RDS master user, which is
+// neither a superuser nor BYPASSRLS and is exactly the identity this is meant
+// to stop. row_security_active answers the question directly, and the attribute
+// columns are read anyway so the error can say which of them is the problem.
+//
+// On an empty database there is no table to ask about, so only the attributes
+// are available. That is enough for the case that matters there: a fresh
+// database migrated by the compose stack's bootstrap superuser.
+func preflight(ctx context.Context, logger *slog.Logger, db *sql.DB) error {
+	var (
+		role          string
+		isSuper       bool
+		bypassesRLS   bool
+		schemaPresent bool
+		rlsEnforced   bool
+	)
+
+	err := db.QueryRowContext(ctx, preflightSQL).
+		Scan(&role, &isSuper, &bypassesRLS, &schemaPresent, &rlsEnforced)
+	if err != nil {
+		return fmt.Errorf("checking the migration role: %w", err)
+	}
+
+	if !isSuper && !bypassesRLS && rlsEnforced {
+		logger.Info("migration role checked",
+			slog.String("role", role),
+			slog.Bool("schema_present", schemaPresent),
+		)
+
+		return nil
+	}
+
+	return fmt.Errorf(
+		"%w: connected as %q (rolsuper=%t, rolbypassrls=%t, row-level security enforced=%t). "+
+			"Migrations must run as a dedicated non-superuser owner, or every policy in the schema is decorative for the role that installed it. "+
+			"Provision one with apps/api/scripts/provision/bootstrap-owner.sql and point POSTGRES_MIGRATION_USER at it; see docs/adr/0005-database-role-provisioning.md",
+		ErrExemptMigrationRole, role, isSuper, bypassesRLS, rlsEnforced)
 }
 
 func dispatch(ctx context.Context, logger *slog.Logger, provider *goose.Provider, cmd Command) error {

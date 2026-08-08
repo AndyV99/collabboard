@@ -2,13 +2,26 @@ services:
   postgres:
     image: postgres:16-alpine
     environment:
+      # The cluster's bootstrap superuser. Nothing in the application connects
+      # as it: it exists to create collabboard_owner on first start, which is
+      # the one thing a migration cannot do for itself. See
+      # docs/adr/0005-database-role-provisioning.md.
       POSTGRES_USER: collabboard
       POSTGRES_PASSWORD: dev
       POSTGRES_DB: collabboard
+      # Password for the schema owner the init hook creates. Local only, and
+      # local by construction — a role inside a container on a laptop.
+      COLLABBOARD_OWNER_PASSWORD: dev
     ports:
       - "5432:5432"
     volumes:
       - pgdata:/var/lib/postgresql/data
+      # Runs once, on an empty data directory, as POSTGRES_USER. Recreating the
+      # volume (`docker compose down -v`) is what re-runs it.
+      - ./apps/api/scripts/dev/initdb:/docker-entrypoint-initdb.d:ro
+      # The same file a deployed environment runs, mounted rather than copied so
+      # that dev and prod cannot drift into two different role models.
+      - ./apps/api/scripts/provision:/opt/collabboard/provision:ro
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U collabboard"]
       interval: 5s
