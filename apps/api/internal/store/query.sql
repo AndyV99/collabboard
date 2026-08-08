@@ -70,6 +70,24 @@ INSERT INTO memberships (tenant_id, user_id, role)
 VALUES (public.current_tenant_id(), @user_id, @role)
 RETURNING *;
 
+-- name: GetMembership :one
+-- The row joining one user to the *current* tenant, or no row at all.
+--
+-- Added for the WebSocket hub (issue #9), which has to answer "is this subject
+-- still a member of this organization?" repeatedly over a connection that
+-- outlives the request that opened it. ListMembers would answer it too, at the
+-- cost of transferring every colleague to check one; this reads one row from
+-- memberships_tenant_id_user_id_key.
+--
+-- No tenant_id parameter, per the convention in this file: the policy supplies
+-- it. The (tenant_id, user_id) unique key means at most one row can come back,
+-- so :one is safe rather than optimistic. A user who was never a member and a
+-- user whose membership was revoked are the same answer — no row — which is the
+-- answer the caller wants for both.
+SELECT *
+FROM memberships
+WHERE user_id = @user_id;
+
 -- name: ListMembers :many
 -- Joins the tenant-scoped memberships table to the global users table. users has
 -- no tenant_id: its policy makes a row visible only when a membership joins it

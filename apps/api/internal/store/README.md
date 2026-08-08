@@ -94,6 +94,12 @@ No query in `query.sql` takes a `tenant_id` parameter.
   There is no argument to get wrong, which makes the `WITH CHECK` half of the
   policy unreachable in practice rather than merely unviolated.
 
+`GetMembership` is the one query whose *shape* is worth a note: it takes a user
+id and no tenant, so the policy answers "is this user a member of the
+transaction's tenant". The WebSocket hub asks it on an interval for every live
+connection, because a connection authorized once outlives the check that
+authorized it — see `internal/realtime/README.md`.
+
 The query set is deliberately representative, not exhaustive — enough to
 exercise the mechanism across the interesting boundaries (a plain tenant-scoped
 list, a child collection reached by parent id, a join from tenant-scoped

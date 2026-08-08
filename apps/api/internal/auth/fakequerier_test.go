@@ -163,6 +163,10 @@ func (q fakeTenantQuerier) GetBoard(context.Context, uuid.UUID) (store.Board, er
 	panic("fakeTenantQuerier: GetBoard is not modelled; the auth flows do not use it")
 }
 
+func (q fakeTenantQuerier) GetMembership(context.Context, uuid.UUID) (store.Membership, error) {
+	panic("fakeTenantQuerier: GetMembership is not modelled; the auth flows do not use it")
+}
+
 func (q fakeTenantQuerier) ListColumnsByBoard(context.Context, uuid.UUID) ([]store.Column, error) {
 	panic("fakeTenantQuerier: ListColumnsByBoard is not modelled; the auth flows do not use it")
 }
