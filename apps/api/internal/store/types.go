@@ -50,6 +50,11 @@ type (
 	// no tenant_id field: the tenant comes from the transaction.
 	CreateProjectParams = gen.CreateProjectParams
 
+	// CreateMembershipParams are the arguments to Querier.CreateMembership.
+	// Like CreateProjectParams it has no tenant_id field: the tenant comes from
+	// the transaction, so an admin cannot add a member to another organization.
+	CreateMembershipParams = gen.CreateMembershipParams
+
 	// ListMembersRow is one row of Querier.ListMembers — a membership joined to
 	// the user it refers to.
 	ListMembersRow = gen.ListMembersRow

@@ -11,6 +11,15 @@ import (
 )
 
 type Querier interface {
+	// The second half of an invite, and the half that is *not* pre-tenant.
+	//
+	// Once the pre-tenant path has resolved (or created) the global user, joining
+	// them to an organization is ordinary tenant-scoped work: the tenant comes from
+	// the transaction, and an admin scoped to their own organization cannot add a
+	// member to anyone else's. Adding the membership is also what makes the user
+	// visible to this tenant at all, since users_visible_via_membership is derived
+	// from this table.
+	CreateMembership(ctx context.Context, arg CreateMembershipParams) (Membership, error)
 	// The tenant comes from the transaction, never from the caller: an INSERT cannot
 	// name a tenant it is not already scoped to, so the WITH CHECK half of the
 	// policy is unreachable in practice rather than merely unviolated.

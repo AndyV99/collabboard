@@ -36,6 +36,12 @@ const (
 	// no BYPASSRLS, owns nothing, table grants only.
 	AppRole = "collabboard_app"
 
+	// IdentityRole owns the pre-tenant identity functions that migration 00004
+	// creates. Nothing connects as it — it cannot log in — so there is no DSN
+	// here to go with it. It appears in the harness only so that tests can ask
+	// the catalog what it is and is not allowed to touch.
+	IdentityRole = "collabboard_identity"
+
 	// Database is the database the migrations are applied to.
 	Database = "collabboard"
 )
