@@ -1,0 +1,55 @@
+version: "2"
+
+sql:
+  - engine: postgresql
+    # The migrations are the schema. Pointing sqlc at a separate schema.sql would
+    # create a second description of the same tables that can drift from the one
+    # the database actually runs; sqlc understands goose annotations and applies
+    # the Up blocks in order, so there is only ever one source of truth.
+    schema: migrations
+    queries: internal/store/query.sql
+    gen:
+      go:
+        # Generated code lands in a nested `internal` package on purpose. Go's
+        # internal rule means .../internal/store/internal/gen is importable only
+        # from within .../internal/store, so internal/api physically cannot
+        # construct a querier bound to the pool and bypass WithTenant. See
+        # internal/store/README.md.
+        package: gen
+        out: internal/store/internal/gen
+        sql_package: pgx/v5
+
+        emit_interface: true
+        emit_empty_slices: true
+        emit_pointers_for_null_types: true
+
+        overrides:
+          # google/uuid is already a dependency and is what the rest of the code
+          # speaks; pgtype.UUID would leak the driver's representation into every
+          # handler signature.
+          - db_type: uuid
+            go_type: github.com/google/uuid.UUID
+          - db_type: uuid
+            nullable: true
+            go_type:
+              import: github.com/google/uuid
+              type: UUID
+              pointer: true
+
+          # sqlc's pgx default for timestamptz is pgtype.Timestamptz even when
+          # the column is NOT NULL, which pushes a driver wrapper type into
+          # every caller for a value that can never be null. time.Time /
+          # *time.Time say the same thing and pgx encodes both natively.
+          - db_type: timestamptz
+            go_type: time.Time
+          - db_type: timestamptz
+            nullable: true
+            go_type:
+              import: time
+              type: Time
+              pointer: true
+
+          # numeric is deliberately left as pgtype.Numeric: `position` is
+          # exact-precision on purpose (midpoint reordering, see
+          # 00003_domain.sql) and mapping it to float64 would quietly discard
+          # the property the column type was chosen for.

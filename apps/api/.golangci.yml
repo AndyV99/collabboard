@@ -10,6 +10,7 @@ linters:
     # Correctness
     - bodyclose
     - contextcheck
+    - depguard
     - durationcheck
     - errorlint
     - noctx
@@ -27,6 +28,23 @@ linters:
     - unconvert
     - wsl_v5
   settings:
+    # The compiler already stops the direct bypass: the sqlc output lives in
+    # internal/store/internal/gen, so no package outside internal/store can
+    # import it. This closes the remaining gap — a package that gets handed a
+    # pool and writes raw SQL against it, skipping the tenant context entirely.
+    # See docs/adr/0001-tenant-isolation.md and internal/store/README.md.
+    depguard:
+      rules:
+        no-database-access-outside-store:
+          list-mode: lax
+          files:
+            - "**/internal/api/**"
+            - "**/internal/realtime/**"
+          deny:
+            - pkg: github.com/jackc/pgx
+              desc: only internal/store may talk to Postgres; go through store.WithTenant so the tenant context is set
+            - pkg: database/sql
+              desc: only internal/store may talk to Postgres; go through store.WithTenant so the tenant context is set
     errcheck:
       check-type-assertions: true
     goconst:
