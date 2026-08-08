@@ -24,9 +24,10 @@ without a new ADR.
 | Migrations | **goose** | Plain up/down SQL, embedded via `go:embed` so migrations ship with the binary. RLS policies expressed directly in SQL. |
 | Job queue | **Asynq (Redis)** | Redis is already in the compose stack, so the dev loop works offline with no AWS credentials. |
 
-Note the vault's architecture diagram shows SQS for the job queue — Asynq was
-chosen instead for local-dev ergonomics. If that sticks, update the diagram in
-`Projects/01 Full-Stack SaaS Platform.md` so the vault stays accurate.
+The vault has been updated to match these choices — `Projects/01 Full-Stack
+SaaS Platform.md` now names Asynq in both the Async work section and the
+architecture diagram, so the vault and this file agree. Keep them that way: if
+one of these decisions changes, change it in both places in the same session.
 
 ## Layout conventions (Go side)
 
