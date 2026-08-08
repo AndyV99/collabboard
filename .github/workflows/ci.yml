@@ -39,6 +39,13 @@ jobs:
     name: changes
     runs-on: ubuntu-latest
     timeout-minutes: 5
+    # On pull_request, dorny/paths-filter asks the API for the PR's changed
+    # files rather than diffing locally, so it needs pull-requests: read. The
+    # workflow-level grant is contents: read only; this widens it for this job
+    # alone rather than for every job.
+    permissions:
+      contents: read
+      pull-requests: read
     outputs:
       api: ${{ steps.filter.outputs.api }}
       web: ${{ steps.filter.outputs.web }}
