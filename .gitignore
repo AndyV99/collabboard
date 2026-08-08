@@ -28,3 +28,8 @@ dist/
 .DS_Store
 .idea/
 .vscode/
+
+# Agent worktrees created by Claude Code tooling (nested inside the repo).
+# Ignore only this path, not all of .claude/, so project-scoped Claude config
+# can still be committed later.
+.claude/worktrees/
