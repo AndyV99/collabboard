@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-import { DEFAULT_API_BASE_URL, apiBaseUrl } from "@/lib/api";
+import { API_URL_ENV, DEFAULT_API_BASE_URL } from "@/lib/api";
 import { parseHealth, probeHealth } from "@/lib/health";
 
 function jsonResponse(body: unknown, status: number): Response {
@@ -15,23 +15,7 @@ afterEach(() => {
   vi.restoreAllMocks();
 });
 
-describe("apiBaseUrl", () => {
-  it("defaults to the local API when unset", () => {
-    expect(apiBaseUrl({})).toBe(DEFAULT_API_BASE_URL);
-  });
-
-  it("uses NEXT_PUBLIC_API_URL and strips a trailing slash", () => {
-    expect(apiBaseUrl({ NEXT_PUBLIC_API_URL: "https://api.example.com/" })).toBe(
-      "https://api.example.com",
-    );
-  });
-
-  it("falls back to the default when the value is blank", () => {
-    expect(apiBaseUrl({ NEXT_PUBLIC_API_URL: "   " })).toBe(
-      DEFAULT_API_BASE_URL,
-    );
-  });
-});
+// Base URL resolution itself is covered in api.test.ts.
 
 describe("parseHealth", () => {
   it("accepts the documented /healthz payload", () => {
@@ -76,7 +60,7 @@ describe("parseHealth", () => {
 describe("probeHealth", () => {
   // Pin the base URL so the suite does not depend on the developer's shell.
   beforeEach(() => {
-    vi.stubEnv("NEXT_PUBLIC_API_URL", "");
+    vi.stubEnv(API_URL_ENV, undefined);
   });
 
   it("reports a healthy API", async () => {
