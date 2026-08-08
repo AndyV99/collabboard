@@ -64,6 +64,8 @@ func NewRouter(logger *slog.Logger, deps HealthDeps, authDeps AuthDeps, realtime
 
 	if authDeps.Store != nil {
 		authenticated.GET("/members", membersHandler(logger, authDeps.Store))
+
+		mountBoardRoutes(authenticated, logger, authDeps.Store)
 	}
 
 	// The WebSocket upgrade is authenticated by the *same* requireAuth as every
@@ -83,4 +85,50 @@ func NewRouter(logger *slog.Logger, deps HealthDeps, authDeps AuthDeps, realtime
 	}
 
 	return router
+}
+
+// mountBoardRoutes mounts projects, boards, columns and cards.
+//
+// Every route is on the `authenticated` group, so requireAuth has already run
+// and a principal exists before any handler does anything. There is no second
+// authorization path: an object id in the path is resolved inside the caller's
+// own tenant context and matches nothing when it belongs elsewhere. See crud.go.
+//
+// The shape is deliberately flat rather than fully nested. A card lives at
+// /cards/:card_id, not /projects/:p/boards/:b/columns/:c/cards/:id, because the
+// longer form invites a handler to trust the ancestors in the path — and a
+// client holding four ids can present three of them from one tenant and one from
+// another. One id, resolved against the token's tenant, has no such seam. The
+// nested forms that do exist are creates and lists, where the parent is the
+// collection being addressed rather than a claim about the child.
+func mountBoardRoutes(authenticated *gin.RouterGroup, logger *slog.Logger, tenantStore TenantStore) {
+	authenticated.POST("/projects", createProjectHandler(logger, tenantStore))
+	authenticated.GET("/projects", listProjectsHandler(logger, tenantStore))
+	authenticated.GET("/projects/:project_id", getProjectHandler(logger, tenantStore))
+	authenticated.PATCH("/projects/:project_id", patchProjectHandler(logger, tenantStore))
+	authenticated.POST("/projects/:project_id/archive", archiveProjectHandler(logger, tenantStore))
+
+	authenticated.POST("/projects/:project_id/boards", createBoardHandler(logger, tenantStore))
+	authenticated.GET("/projects/:project_id/boards", listBoardsHandler(logger, tenantStore))
+	authenticated.GET("/boards/:board_id", getBoardHandler(logger, tenantStore))
+	authenticated.PATCH("/boards/:board_id", patchBoardHandler(logger, tenantStore))
+	authenticated.DELETE("/boards/:board_id", deleteBoardHandler(logger, tenantStore))
+
+	authenticated.POST("/boards/:board_id/columns", createColumnHandler(logger, tenantStore))
+	authenticated.GET("/boards/:board_id/columns", listColumnsHandler(logger, tenantStore))
+	authenticated.PATCH("/columns/:column_id", patchColumnHandler(logger, tenantStore))
+	authenticated.POST("/columns/:column_id/move", moveColumnHandler(logger, tenantStore))
+	authenticated.DELETE("/columns/:column_id", deleteColumnHandler(logger, tenantStore))
+
+	authenticated.POST("/columns/:column_id/cards", createCardHandler(logger, tenantStore))
+	authenticated.GET("/columns/:column_id/cards", listCardsByColumnHandler(logger, tenantStore))
+	authenticated.GET("/boards/:board_id/cards", listCardsByBoardHandler(logger, tenantStore))
+	authenticated.GET("/cards/:card_id", getCardHandler(logger, tenantStore))
+	authenticated.PATCH("/cards/:card_id", patchCardHandler(logger, tenantStore))
+
+	// A move is a POST rather than a PATCH on the card: it is not a partial
+	// update of the card's fields, it is an operation whose arguments (the
+	// target column and the anchor) are not properties of the card at all.
+	authenticated.POST("/cards/:card_id/move", moveCardHandler(logger, tenantStore))
+	authenticated.DELETE("/cards/:card_id", deleteCardHandler(logger, tenantStore))
 }
