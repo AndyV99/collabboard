@@ -1,3 +1,5 @@
+//go:build integration
+
 package store_test
 
 import (
@@ -35,39 +37,39 @@ func TestWithTenantSeesOnlyItsOwnTenantsRows(t *testing.T) {
 		{self: a, other: b},
 		{self: b, other: a},
 	} {
-		t.Run(tc.self.label, func(t *testing.T) {
-			err := s.WithTenant(ctx, tc.self.tenantID, func(ctx context.Context, q store.Querier) error {
+		t.Run(tc.self.Label, func(t *testing.T) {
+			err := s.WithTenant(ctx, tc.self.TenantID, func(ctx context.Context, q store.Querier) error {
 				projects, err := q.ListProjects(ctx)
 				if err != nil {
 					return err
 				}
 
-				t.Logf("tenant %s: ListProjects -> %s", tc.self.label, projectNames(projects))
+				t.Logf("tenant %s: ListProjects -> %s", tc.self.Label, projectNames(projects))
 
-				if len(projects) != 1 || projects[0].ID != tc.self.projectID {
-					t.Errorf("ListProjects = %v, want exactly the %s project", projects, tc.self.label)
+				if len(projects) != 1 || projects[0].ID != tc.self.ProjectID {
+					t.Errorf("ListProjects = %v, want exactly the %s project", projects, tc.self.Label)
 				}
 
 				// The other tenant's board, addressed by its real primary key.
 				// RLS turns a cross-tenant read into "no such row" rather than
 				// into someone else's data.
-				_, err = q.GetBoard(ctx, tc.other.boardID)
+				_, err = q.GetBoard(ctx, tc.other.BoardID)
 				if !errors.Is(err, pgx.ErrNoRows) {
-					t.Errorf("GetBoard(%s's board) = %v, want pgx.ErrNoRows", tc.other.label, err)
+					t.Errorf("GetBoard(%s's board) = %v, want pgx.ErrNoRows", tc.other.Label, err)
 				}
 
-				t.Logf("tenant %s: GetBoard(%s's board id) -> %v", tc.self.label, tc.other.label, err)
+				t.Logf("tenant %s: GetBoard(%s's board id) -> %v", tc.self.Label, tc.other.Label, err)
 
-				cards, err := q.ListCardsByBoard(ctx, tc.other.boardID)
+				cards, err := q.ListCardsByBoard(ctx, tc.other.BoardID)
 				if err != nil {
 					return err
 				}
 
 				if len(cards) != 0 {
-					t.Errorf("ListCardsByBoard(%s's board) returned %d cards, want 0", tc.other.label, len(cards))
+					t.Errorf("ListCardsByBoard(%s's board) returned %d cards, want 0", tc.other.Label, len(cards))
 				}
 
-				t.Logf("tenant %s: ListCardsByBoard(%s's board id) -> %d cards", tc.self.label, tc.other.label, len(cards))
+				t.Logf("tenant %s: ListCardsByBoard(%s's board id) -> %d cards", tc.self.Label, tc.other.Label, len(cards))
 
 				// memberships is tenant-scoped, users is global with a policy
 				// derived from memberships. Both halves have to hold: the
@@ -79,9 +81,9 @@ func TestWithTenantSeesOnlyItsOwnTenantsRows(t *testing.T) {
 				}
 
 				emails := memberEmails(members)
-				t.Logf("tenant %s: ListMembers -> %v", tc.self.label, emails)
+				t.Logf("tenant %s: ListMembers -> %v", tc.self.Label, emails)
 
-				want := []string{sharedEmail, tc.self.memberEmail}
+				want := []string{sharedEmail, tc.self.MemberEmail}
 				sort.Strings(want)
 
 				if !slices.Equal(emails, want) {
@@ -118,7 +120,7 @@ func TestSameQueryOutsideWithTenantSeesNothing(t *testing.T) {
 
 	var seen int
 
-	if err := s.WithTenant(ctx, a.tenantID, func(ctx context.Context, q store.Querier) error {
+	if err := s.WithTenant(ctx, a.TenantID, func(ctx context.Context, q store.Querier) error {
 		projects, err := q.ListProjects(ctx)
 		seen = len(projects)
 
@@ -127,7 +129,7 @@ func TestSameQueryOutsideWithTenantSeesNothing(t *testing.T) {
 		t.Fatalf("WithTenant: %v", err)
 	}
 
-	t.Logf("inside WithTenant(%s): %d project(s) visible", a.label, seen)
+	t.Logf("inside WithTenant(%s): %d project(s) visible", a.Label, seen)
 
 	if seen == 0 {
 		t.Fatal("the tenant saw none of its own rows; the rest of this test would prove nothing")
@@ -286,7 +288,7 @@ func TestCallbackErrorRollsBackTheTransaction(t *testing.T) {
 
 	const name = "rolled back project"
 
-	err := s.WithTenant(ctx, a.tenantID, func(ctx context.Context, q store.Querier) error {
+	err := s.WithTenant(ctx, a.TenantID, func(ctx context.Context, q store.Querier) error {
 		created, cerr := q.CreateProject(ctx, store.CreateProjectParams{Name: name})
 		if cerr != nil {
 			return cerr
@@ -295,8 +297,8 @@ func TestCallbackErrorRollsBackTheTransaction(t *testing.T) {
 		// The insert took the tenant from the transaction, not from an
 		// argument, so this is also the proof that current_tenant_id() is what
 		// lands in the row.
-		if created.TenantID != a.tenantID {
-			t.Errorf("created project tenant = %s, want %s", created.TenantID, a.tenantID)
+		if created.TenantID != a.TenantID {
+			t.Errorf("created project tenant = %s, want %s", created.TenantID, a.TenantID)
 		}
 
 		t.Logf("created project %s in tenant %s, then failing on purpose", created.ID, created.TenantID)
@@ -307,7 +309,7 @@ func TestCallbackErrorRollsBackTheTransaction(t *testing.T) {
 		t.Fatalf("WithTenant error = %v, want %v", err, errBoom)
 	}
 
-	names, err := store.InTenant(ctx, s, a.tenantID, func(ctx context.Context, q store.Querier) ([]string, error) {
+	names, err := store.InTenant(ctx, s, a.TenantID, func(ctx context.Context, q store.Querier) ([]string, error) {
 		projects, lerr := q.ListProjects(ctx)
 
 		return projectNames(projects), lerr
@@ -316,7 +318,7 @@ func TestCallbackErrorRollsBackTheTransaction(t *testing.T) {
 		t.Fatalf("InTenant: %v", err)
 	}
 
-	t.Logf("after rollback, tenant %s sees: %v", a.label, names)
+	t.Logf("after rollback, tenant %s sees: %v", a.Label, names)
 
 	for _, got := range names {
 		if got == name {
@@ -334,7 +336,7 @@ func TestInTenantCommitsAndReturns(t *testing.T) {
 	a, b, _ := seedTenants(t, owner)
 	s := store.New(pool)
 
-	created, err := store.InTenant(ctx, s, a.tenantID, func(ctx context.Context, q store.Querier) (store.Project, error) {
+	created, err := store.InTenant(ctx, s, a.TenantID, func(ctx context.Context, q store.Querier) (store.Project, error) {
 		return q.CreateProject(ctx, store.CreateProjectParams{Name: "committed project"})
 	})
 	if err != nil {
@@ -343,7 +345,7 @@ func TestInTenantCommitsAndReturns(t *testing.T) {
 
 	t.Logf("committed project %s (tenant %s)", created.ID, created.TenantID)
 
-	seenByA, err := store.InTenant(ctx, s, a.tenantID, func(ctx context.Context, q store.Querier) (int, error) {
+	seenByA, err := store.InTenant(ctx, s, a.TenantID, func(ctx context.Context, q store.Querier) (int, error) {
 		projects, lerr := q.ListProjects(ctx)
 
 		return len(projects), lerr
@@ -352,7 +354,7 @@ func TestInTenantCommitsAndReturns(t *testing.T) {
 		t.Fatalf("InTenant: %v", err)
 	}
 
-	seenByB, err := store.InTenant(ctx, s, b.tenantID, func(ctx context.Context, q store.Querier) (int, error) {
+	seenByB, err := store.InTenant(ctx, s, b.TenantID, func(ctx context.Context, q store.Querier) (int, error) {
 		projects, lerr := q.ListProjects(ctx)
 
 		return len(projects), lerr
@@ -361,56 +363,14 @@ func TestInTenantCommitsAndReturns(t *testing.T) {
 		t.Fatalf("InTenant: %v", err)
 	}
 
-	t.Logf("projects visible after the commit: tenant %s = %d, tenant %s = %d", a.label, seenByA, b.label, seenByB)
+	t.Logf("projects visible after the commit: tenant %s = %d, tenant %s = %d", a.Label, seenByA, b.Label, seenByB)
 
 	if seenByA != 2 {
-		t.Errorf("tenant %s sees %d projects, want 2", a.label, seenByA)
+		t.Errorf("tenant %s sees %d projects, want 2", a.Label, seenByA)
 	}
 
 	if seenByB != 1 {
-		t.Errorf("tenant %s sees %d projects, want 1 (its own only)", b.label, seenByB)
-	}
-}
-
-// TestWithTenantRejectsBadArguments needs no database: these are the checks that
-// stop a wiring mistake from reaching one.
-func TestWithTenantRejectsBadArguments(t *testing.T) {
-	ctx := context.Background()
-	noop := func(context.Context, store.Querier) error { return nil }
-
-	var nilStore *store.Store
-
-	for _, tc := range []struct {
-		name  string
-		store *store.Store
-		id    uuid.UUID
-		fn    store.TenantFunc
-		want  error
-	}{
-		{name: "nil store", store: nilStore, id: uuid.New(), fn: noop, want: store.ErrNilPool},
-		{name: "nil pool", store: store.New(nil), id: uuid.New(), fn: noop, want: store.ErrNilPool},
-		{name: "nil callback", store: store.New(&pgxpool.Pool{}), id: uuid.New(), fn: nil, want: store.ErrNilFunc},
-		{name: "zero tenant", store: store.New(&pgxpool.Pool{}), id: uuid.Nil, fn: noop, want: store.ErrNoTenant},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			if err := tc.store.WithTenant(ctx, tc.id, tc.fn); !errors.Is(err, tc.want) {
-				t.Errorf("WithTenant = %v, want %v", err, tc.want)
-			}
-		})
-	}
-}
-
-// TestInTenantReturnsZeroValueOnError: a caller that ignores the error must not
-// be handed a value that looks like it came from a committed transaction.
-func TestInTenantReturnsZeroValueOnError(t *testing.T) {
-	got, err := store.InTenant(context.Background(), store.New(nil), uuid.New(),
-		func(context.Context, store.Querier) (string, error) { return "should not escape", nil })
-	if !errors.Is(err, store.ErrNilPool) {
-		t.Fatalf("InTenant error = %v, want %v", err, store.ErrNilPool)
-	}
-
-	if got != "" {
-		t.Errorf("InTenant returned %q on error, want the zero value", got)
+		t.Errorf("tenant %s sees %d projects, want 1 (its own only)", b.Label, seenByB)
 	}
 }
 
