@@ -19,6 +19,121 @@ npm run typecheck  # tsc --noEmit
 npm run build
 ```
 
+`npm start` (`next start`) still serves a build, but prints
+`"next start" does not work with "output: standalone"`. That warning is expected
+(see [Container image](#container-image)) — use `npm run dev` locally, or the
+image for anything production-shaped.
+
+## Container image
+
+`Dockerfile` builds the deployable artifact. The **context is the repo root**,
+so build from there, not from this directory:
+
+```bash
+# from the repo root
+docker build -f apps/web/Dockerfile -t collabboard-web:dev .
+
+# API on the host (the compose stack + `go run ./cmd/api` from apps/api)
+docker run --rm -p 3000:3000 \
+  --add-host host.docker.internal:host-gateway \
+  -e API_URL=http://host.docker.internal:8080 \
+  collabboard-web:dev
+
+# or against an API container, once apps/api has an image, on a shared network
+docker run --rm -p 3000:3000 --network <that-network> \
+  -e API_URL=http://<api-container-name>:8080 \
+  collabboard-web:dev
+```
+
+Then `http://localhost:3000` for the page and `http://localhost:3000/healthz`
+for readiness.
+
+**`API_URL` is a run-time flag, never a build-time one.** There is no
+`--build-arg` for it and no `ENV API_URL` in the image, on purpose: baking it in
+would undo the whole point of resolving it at request time. The same tag runs
+against a different API by changing nothing but the environment:
+
+```bash
+docker run -d -p 3001:3000 -e API_URL=http://api.staging.internal:8080 collabboard-web:dev
+docker run -d -p 3002:3000 -e API_URL=http://api.prod.internal:8080    collabboard-web:dev
+```
+
+An image run with no `API_URL` at all still starts — it falls back to
+`http://localhost:8080`, which inside a container is the container itself. That
+is a misconfiguration, not a design, and `/healthz` reports it as
+`"source": "default"`.
+
+### How it is built
+
+Three stages, so the runtime image carries neither the toolchain nor the full
+dependency tree:
+
+1. `deps` — `npm ci` from the lockfile alone, so a source edit reuses the layer.
+2. `builder` — `next build`, which with `output: "standalone"` emits a
+   `server.js` plus only the `node_modules` the routes actually reach.
+3. `runner` — copies that standalone tree, the static assets, and nothing else.
+
+The difference is the point: the full install is ~667 MB across 346 packages;
+the traced subset in the image is ~64 MB across 12, with no dev dependencies,
+no `next` CLI and no source tree. The image is ~325 MB, of which ~232 MB is the
+`node:22-alpine` base.
+
+Other properties worth knowing before changing the file:
+
+- **Runs as `node` (uid 1000), not root.** `docker run --rm collabboard-web:dev id`
+  → `uid=1000(node) gid=1000(node)`.
+- **npm, yarn and corepack are removed from the runtime stage.** The container
+  runs `node server.js`; the package managers are only an attack surface and
+  their vendored dependencies were the *only* source of HIGH/CRITICAL findings
+  in this image. With them gone,
+  `trivy image --severity HIGH,CRITICAL collabboard-web:dev` reports none.
+- **`HOSTNAME=0.0.0.0`** is load-bearing. Standalone's `server.js` binds
+  `localhost` by default, which is unreachable from outside the container.
+- **`HEALTHCHECK`** polls `/healthz` with `node -e`, so it needs no `curl` or
+  `wget` in the image and exercises HTTP rather than a bare TCP connect.
+- **Node is PID 1** via the exec-form `CMD`, and Next registers a `SIGTERM`
+  handler, so `docker stop` (and an ECS task drain) exits in well under a
+  second instead of waiting out the 10s kill timer.
+- **Base image tags are pinned to a patch version**, matching how CI pins its
+  toolchains: a base image refresh should arrive as a reviewed commit.
+- The repo-root **`.dockerignore`** keeps the context at ~340 kB against a
+  668 MB working tree, and — more importantly — stops the host's
+  `node_modules`/`.next` from shadowing the ones built inside the image.
+
+## Readiness: `GET /healthz`
+
+The web app's own health signal, for a load balancer target group and for the
+image's `HEALTHCHECK`.
+
+```console
+$ curl -s localhost:3000/healthz
+{"status":"ok","service":"collabboard-web","components":{"api_url_config":{"status":"ok","source":"env"}}}
+```
+
+`200` when ready, `503` when not, always `cache-control: no-store`.
+
+**Ready means the web app can serve a request and its own configuration
+resolved.** Answering at all proves Next booted and can route — which a TCP
+port check does not, since a process wedged after `listen()` still passes that.
+The `api_url_config` component proves the other half, the half `/` cannot
+report: `/` returns 200 with a degraded panel whether `API_URL` is sound or not.
+
+**Ready deliberately does not mean the API is reachable.** This route never
+calls the API. Rendering a degraded panel during an API outage is designed
+behaviour, and it can only be served by a task the load balancer still routes
+to — health-checking the API here would deregister every web task the moment
+the API blinked, and would point a per-task, per-few-seconds traffic source at
+it besides. The API's health is its own target group's business.
+
+`source` (`env` vs `default`) is in the payload because the likeliest real
+misconfiguration is a task definition that never set `API_URL`, leaving the
+container quietly pointed at its own localhost. The **resolved URL is not** in
+the payload: this route is unauthenticated, the URL is internal topology, and
+issue #31 applies to it. The value is already in the logs — `instrumentation.ts`
+emits one structured line per boot naming it. Same split when resolution fails:
+the message quoting the bad value is logged, the response body says only
+`"status": "unavailable"`.
+
 ## Configuration
 
 | Variable  | Scope       | Default                 | Purpose                |
@@ -70,10 +185,12 @@ build-once/promote model holds.
 ## Layout
 
 ```
-app/                 routes (App Router). page.tsx is the health placeholder.
+app/                 routes (App Router). page.tsx is the health placeholder,
+                     healthz/route.ts is the readiness signal.
 components/          presentational components, kept pure so they are unit testable
-lib/                 API client helpers and the structured logger
+lib/                 API client helpers, the readiness policy, the structured logger
 instrumentation.ts   server startup hook: validates + logs the resolved API_URL
+Dockerfile           multi-stage build of the deployable image (context: repo root)
 __tests__/           vitest + React Testing Library
 ```
 
