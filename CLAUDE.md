@@ -7,9 +7,26 @@ Full-stack multi-tenant SaaS Kanban tool with real-time collaboration and Stripe
 ## Stack
 
 - `apps/web` — Next.js (TypeScript), React Server Components + a WebSocket client for live updates.
-- `apps/api` — Go (Gin or Fiber) REST API + WebSocket hub.
+- `apps/api` — Go (Gin) REST API + WebSocket hub. Module path: `github.com/AndyV99/collabboard/apps/api`.
 - `infra/terraform` — VPC, ECS Fargate, RDS, ElastiCache, S3, ALB.
 - `docs/adr` — architecture decision records.
+
+## Decided stack — do not re-litigate these
+
+These were chosen deliberately; the vault note leaves some of them open on
+purpose, and this is where they got settled. Don't swap them out mid-project
+without a new ADR.
+
+| Concern | Choice | Why |
+|---|---|---|
+| HTTP framework | **Gin** | `net/http` compatible, so the WebSocket upgrade and `otelhttp` instrumentation work without adapters. Fiber's fasthttp would fight both. |
+| DB access | **sqlc + pgx** | Hand-written SQL, generated type-safe Go. No hidden queries that could silently bypass tenant RLS. |
+| Migrations | **goose** | Plain up/down SQL, embedded via `go:embed` so migrations ship with the binary. RLS policies expressed directly in SQL. |
+| Job queue | **Asynq (Redis)** | Redis is already in the compose stack, so the dev loop works offline with no AWS credentials. |
+
+Note the vault's architecture diagram shows SQS for the job queue — Asynq was
+chosen instead for local-dev ergonomics. If that sticks, update the diagram in
+`Projects/01 Full-Stack SaaS Platform.md` so the vault stays accurate.
 
 ## Layout conventions (Go side)
 
