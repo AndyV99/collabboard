@@ -159,6 +159,38 @@ func tenantScoped[T any](
 	return out, true
 }
 
+// tenantScopedPublish is [tenantScoped] plus the broadcast, and the order of
+// those two is the entire reason it exists.
+//
+// describe runs only after WithTenant has returned nil — that is, after the
+// transaction has committed. fn cannot publish instead, because fn is handed a
+// [store.Querier] and nothing else: the publisher is not in scope inside the
+// transaction, on this handler or on any future one. "A rolled-back write
+// broadcasts nothing" is therefore something the compiler enforces rather than
+// something a reviewer has to check. See events.go, and
+// TestARolledBackWriteBroadcastsNothing.
+//
+// describe may return the zero [BoardEvent] for a write with nothing worth
+// announcing; publishBoardEvent then does nothing.
+func tenantScopedPublish[T any](
+	c *gin.Context,
+	logger *slog.Logger,
+	tenantStore TenantStore,
+	publisher EventPublisher,
+	event string,
+	fn func(ctx context.Context, q store.Querier) (T, error),
+	describe func(T) BoardEvent,
+) (T, bool) {
+	out, ok := tenantScoped(c, logger, tenantStore, event, fn)
+	if !ok {
+		return out, false
+	}
+
+	publishBoardEvent(c, logger, publisher, describe(out))
+
+	return out, true
+}
+
 // writeStoreError maps a failed transaction onto a status.
 //
 // The default is 500 with a generic body and the real error in the log, so a

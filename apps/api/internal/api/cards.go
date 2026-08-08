@@ -80,7 +80,7 @@ func newCardBody(card store.Card) cardBody {
 //
 // LockColumn is the 404 for a column this tenant cannot see *and* the serialiser
 // for the "one past the current maximum" read inside CreateCard.
-func createCardHandler(logger *slog.Logger, tenantStore TenantStore) gin.HandlerFunc {
+func createCardHandler(logger *slog.Logger, tenantStore TenantStore, publisher EventPublisher) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		columnID, ok := pathUUID(c, "column_id")
 		if !ok {
@@ -102,7 +102,7 @@ func createCardHandler(logger *slog.Logger, tenantStore TenantStore) gin.Handler
 			return
 		}
 
-		card, ok := tenantScoped(c, logger, tenantStore, "card.create.failed",
+		card, ok := tenantScopedPublish(c, logger, tenantStore, publisher, "card.create.failed",
 			func(ctx context.Context, q store.Querier) (store.Card, error) {
 				column, err := q.LockColumn(ctx, columnID)
 				if _, err := asNotFound(subjectColumn, column, err); err != nil {
@@ -116,6 +116,15 @@ func createCardHandler(logger *slog.Logger, tenantStore TenantStore) gin.Handler
 				})
 
 				return asNotFound(subjectColumn, card, err)
+			},
+			// Appended to the end of the column, which is why there is no anchor
+			// in the payload — see events.go.
+			func(card store.Card) BoardEvent {
+				return BoardEvent{
+					BoardID: card.BoardID,
+					Type:    eventCardCreated,
+					Payload: cardEventPayload{Card: newCardBody(card)},
+				}
 			})
 		if !ok {
 			return
@@ -186,7 +195,7 @@ func getCardHandler(logger *slog.Logger, tenantStore TenantStore) gin.HandlerFun
 	}
 }
 
-func patchCardHandler(logger *slog.Logger, tenantStore TenantStore) gin.HandlerFunc {
+func patchCardHandler(logger *slog.Logger, tenantStore TenantStore, publisher EventPublisher) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		cardID, ok := pathUUID(c, "card_id")
 		if !ok {
@@ -215,7 +224,7 @@ func patchCardHandler(logger *slog.Logger, tenantStore TenantStore) gin.HandlerF
 			return
 		}
 
-		card, ok := tenantScoped(c, logger, tenantStore, "card.update.failed",
+		card, ok := tenantScopedPublish(c, logger, tenantStore, publisher, "card.update.failed",
 			func(ctx context.Context, q store.Querier) (store.Card, error) {
 				card, err := q.UpdateCard(ctx, store.UpdateCardParams{
 					CardID:      cardID,
@@ -224,6 +233,16 @@ func patchCardHandler(logger *slog.Logger, tenantStore TenantStore) gin.HandlerF
 				})
 
 				return asNotFound(subjectCard, card, err)
+			},
+			// The whole card rather than the fields that changed: a PATCH that
+			// only set the title still produces a card body a client can replace
+			// wholesale, so there is no merge for a client to get wrong.
+			func(card store.Card) BoardEvent {
+				return BoardEvent{
+					BoardID: card.BoardID,
+					Type:    eventCardUpdated,
+					Payload: cardEventPayload{Card: newCardBody(card)},
+				}
 			})
 		if !ok {
 			return
@@ -239,7 +258,7 @@ func patchCardHandler(logger *slog.Logger, tenantStore TenantStore) gin.HandlerF
 // resolved inside the caller's own tenant context, so neither can name anything
 // belonging to another organization. Neither is checked against an owner: a
 // foreign column simply does not exist to this transaction.
-func moveCardHandler(logger *slog.Logger, tenantStore TenantStore) gin.HandlerFunc {
+func moveCardHandler(logger *slog.Logger, tenantStore TenantStore, publisher EventPublisher) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		cardID, ok := pathUUID(c, "card_id")
 		if !ok {
@@ -263,9 +282,25 @@ func moveCardHandler(logger *slog.Logger, tenantStore TenantStore) gin.HandlerFu
 			return
 		}
 
-		card, ok := tenantScoped(c, logger, tenantStore, "card.move.failed",
+		card, ok := tenantScopedPublish(c, logger, tenantStore, publisher, "card.move.failed",
 			func(ctx context.Context, q store.Querier) (store.Card, error) {
 				return moveCard(ctx, q, cardID, columnID, afterCardID)
+			},
+			// The anchor is echoed rather than re-derived, and it is accurate:
+			// MoveCard places the card strictly between this anchor and the next
+			// sibling, under the column lock, so at commit the anchor really is
+			// the card's predecessor. A rebalance may have renumbered the column
+			// afterwards, which changes every rank and no order — and clients
+			// never see a rank, so it needs no event of its own.
+			func(card store.Card) BoardEvent {
+				return BoardEvent{
+					BoardID: card.BoardID,
+					Type:    eventCardMoved,
+					Payload: cardMovedPayload{
+						Card:        newCardBody(card),
+						AfterCardID: optionalID(afterCardID),
+					},
+				}
 			})
 		if !ok {
 			return
@@ -352,25 +387,35 @@ func moveCard(ctx context.Context, q store.Querier, cardID, columnID uuid.UUID, 
 	}, nil
 }
 
-func deleteCardHandler(logger *slog.Logger, tenantStore TenantStore) gin.HandlerFunc {
+// deleteCardHandler removes a card.
+//
+// DeleteCard returns the row it deleted rather than a count, because after the
+// statement runs the card's board is the one thing nothing else knows and the
+// event has to be addressed to it. "No row" is still the 404, and still means
+// the same thing for a card that never existed and for one belonging to another
+// organization.
+func deleteCardHandler(logger *slog.Logger, tenantStore TenantStore, publisher EventPublisher) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		cardID, ok := pathUUID(c, "card_id")
 		if !ok {
 			return
 		}
 
-		_, ok = tenantScoped(c, logger, tenantStore, "card.delete.failed",
-			func(ctx context.Context, q store.Querier) (struct{}, error) {
-				rows, err := q.DeleteCard(ctx, cardID)
-				if err != nil {
-					return struct{}{}, err
-				}
+		_, ok = tenantScopedPublish(c, logger, tenantStore, publisher, "card.delete.failed",
+			func(ctx context.Context, q store.Querier) (store.Card, error) {
+				card, err := q.DeleteCard(ctx, cardID)
 
-				if rows == 0 {
-					return struct{}{}, notFound(subjectCard)
+				return asNotFound(subjectCard, card, err)
+			},
+			func(card store.Card) BoardEvent {
+				return BoardEvent{
+					BoardID: card.BoardID,
+					Type:    eventCardDeleted,
+					Payload: cardDeletedPayload{
+						CardID:   card.ID.String(),
+						ColumnID: card.ColumnID.String(),
+					},
 				}
-
-				return struct{}{}, nil
 			})
 		if !ok {
 			return

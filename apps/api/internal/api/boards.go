@@ -13,6 +13,7 @@ import (
 	"net/http"
 
 	"github.com/gin-gonic/gin"
+	"github.com/google/uuid"
 
 	"github.com/AndyV99/collabboard/apps/api/internal/store"
 )
@@ -44,6 +45,12 @@ func newBoardBody(board store.Board) boardBody {
 }
 
 // createBoardHandler creates a board inside a project.
+//
+// It publishes nothing, and that is a decision rather than an omission: a
+// realtime room *is* a board, so at the moment a board comes into existence
+// there is nobody who could be watching it. Announcing "a board appeared" to the
+// people looking at other boards would need a project- or tenant-scoped room,
+// which is a different fan-out unit and a different issue (#52).
 //
 // The project id comes from the path and is never checked for ownership here:
 // CreateBoard is an INSERT ... SELECT over projects, so a project belonging to
@@ -134,7 +141,7 @@ func getBoardHandler(logger *slog.Logger, tenantStore TenantStore) gin.HandlerFu
 	}
 }
 
-func patchBoardHandler(logger *slog.Logger, tenantStore TenantStore) gin.HandlerFunc {
+func patchBoardHandler(logger *slog.Logger, tenantStore TenantStore, publisher EventPublisher) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		boardID, ok := pathUUID(c, "board_id")
 		if !ok {
@@ -157,7 +164,7 @@ func patchBoardHandler(logger *slog.Logger, tenantStore TenantStore) gin.Handler
 			return
 		}
 
-		board, ok := tenantScoped(c, logger, tenantStore, "board.update.failed",
+		board, ok := tenantScopedPublish(c, logger, tenantStore, publisher, "board.update.failed",
 			func(ctx context.Context, q store.Querier) (store.Board, error) {
 				board, err := q.UpdateBoard(ctx, store.UpdateBoardParams{
 					BoardID: boardID,
@@ -165,6 +172,13 @@ func patchBoardHandler(logger *slog.Logger, tenantStore TenantStore) gin.Handler
 				})
 
 				return asNotFound(subjectBoard, board, err)
+			},
+			func(board store.Board) BoardEvent {
+				return BoardEvent{
+					BoardID: board.ID,
+					Type:    eventBoardUpdated,
+					Payload: boardEventPayload{Board: newBoardBody(board)},
+				}
 			})
 		if !ok {
 			return
@@ -181,25 +195,40 @@ func patchBoardHandler(logger *slog.Logger, tenantStore TenantStore) gin.Handler
 // the sense that matters — a second call changes nothing — but answering 204 for
 // an unknown id would also answer 204 for another tenant's board, which reads
 // like a successful cross-tenant delete to anyone testing this from outside.
-func deleteBoardHandler(logger *slog.Logger, tenantStore TenantStore) gin.HandlerFunc {
+//
+// The board.deleted event is the last thing its room will ever carry, and it is
+// one event rather than one per cascaded column and card: a client should stop
+// showing the board, not reconcile it row by row.
+func deleteBoardHandler(logger *slog.Logger, tenantStore TenantStore, publisher EventPublisher) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		boardID, ok := pathUUID(c, "board_id")
 		if !ok {
 			return
 		}
 
-		_, ok = tenantScoped(c, logger, tenantStore, "board.delete.failed",
-			func(ctx context.Context, q store.Querier) (struct{}, error) {
+		// The callback returns the id rather than closing over it, so the id the
+		// event is addressed to is one a tenant-scoped transaction just proved
+		// belongs to this tenant — a path parameter that matched no row never
+		// reaches the describe function at all.
+		_, ok = tenantScopedPublish(c, logger, tenantStore, publisher, "board.delete.failed",
+			func(ctx context.Context, q store.Querier) (uuid.UUID, error) {
 				rows, err := q.DeleteBoard(ctx, boardID)
 				if err != nil {
-					return struct{}{}, err
+					return uuid.Nil, err
 				}
 
 				if rows == 0 {
-					return struct{}{}, notFound(subjectBoard)
+					return uuid.Nil, notFound(subjectBoard)
 				}
 
-				return struct{}{}, nil
+				return boardID, nil
+			},
+			func(id uuid.UUID) BoardEvent {
+				return BoardEvent{
+					BoardID: id,
+					Type:    eventBoardDeleted,
+					Payload: boardDeletedPayload{BoardID: id.String()},
+				}
 			})
 		if !ok {
 			return
