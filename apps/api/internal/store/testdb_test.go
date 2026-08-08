@@ -4,16 +4,19 @@ package store_test
 
 // Adapters between the package's tests and the shared harness.
 //
-// The harness itself — container, migrations, the two database identities and
-// the two-tenant seed — lives in internal/testsupport/pgtest, so a second
+// The harness itself — container, provisioning, migrations, the database
+// identities and the two-tenant seed — lives in internal/testsupport/pgtest, so a second
 // integration suite (auth, in #8) gets the same fixtures instead of a second
 // opinion about what "two tenants with overlapping data" means.
 //
-// Two identities, deliberately. Queries under test run as the serving role
+// Three identities, deliberately. Queries under test run as the serving role
 // (collabboard_app: no superuser, no BYPASSRLS, owns nothing), which is the
-// only identity the policies actually apply to — identity_test.go asserts that
-// rather than assuming it. Seeding runs as the migration role, because seeding
-// is precisely the thing the policies forbid.
+// identity a request actually uses — identity_test.go asserts that rather than
+// assuming it. Seeding runs as the container's bootstrap superuser, because
+// seeding is precisely the thing every policy-bound role is forbidden from
+// doing. The third, collabboard_owner, applied the migrations and is asserted
+// about rather than used: provisioning_test.go checks that it is subject to the
+// policies it installed.
 
 import (
 	"context"
@@ -38,19 +41,32 @@ func newPool(t *testing.T, maxConns int32) *pgxpool.Pool {
 	return testDB.AppPool(t, maxConns)
 }
 
-// newOwnerPool opens a pool as the migration role, used only to seed fixtures
-// and to read the catalog.
-func newOwnerPool(t *testing.T) *pgxpool.Pool {
+// newSuperuserPool opens a pool as the container's bootstrap superuser, used
+// only to seed fixtures and to read the catalog.
+//
+// Not the schema owner, which since issue #14 is a different, non-superuser
+// role: FORCE ROW LEVEL SECURITY applies to that one, so it can neither insert
+// the fixtures nor delete them. [newSchemaOwnerPool] is how a test asks for it,
+// and the only tests that should are the ones asserting what it cannot do.
+func newSuperuserPool(t *testing.T) *pgxpool.Pool {
 	t.Helper()
 
-	return testDB.OwnerPool(t, 2)
+	return testDB.SuperuserPool(t, 2)
+}
+
+// newSchemaOwnerPool opens a pool as collabboard_owner, the role that applied
+// the migrations. Nothing seeds through it — see [newSuperuserPool].
+func newSchemaOwnerPool(t *testing.T) *pgxpool.Pool {
+	t.Helper()
+
+	return testDB.SchemaOwnerPool(t, 2)
 }
 
 // seedTenants creates two tenants plus a user who belongs to both.
-func seedTenants(t *testing.T, owner *pgxpool.Pool) (a, b tenantFixture, sharedEmail string) {
+func seedTenants(t *testing.T, superuser *pgxpool.Pool) (a, b tenantFixture, sharedEmail string) {
 	t.Helper()
 
-	f := pgtest.SeedTenants(t, owner)
+	f := pgtest.SeedTenants(t, superuser)
 
 	return f.A, f.B, f.SharedEmail
 }
@@ -58,10 +74,10 @@ func seedTenants(t *testing.T, owner *pgxpool.Pool) (a, b tenantFixture, sharedE
 // seedFixture is seedTenants for the tests that need the shared user's id as
 // well as the two tenants — the pre-tenant organization list, whose whole claim
 // is that one user's memberships span both.
-func seedFixture(t *testing.T, owner *pgxpool.Pool) pgtest.Fixture {
+func seedFixture(t *testing.T, superuser *pgxpool.Pool) pgtest.Fixture {
 	t.Helper()
 
-	return pgtest.SeedTenants(t, owner)
+	return pgtest.SeedTenants(t, superuser)
 }
 
 // inTenantTx runs fn inside a transaction scoped to tenantID, exactly the way

@@ -162,22 +162,45 @@ func TestTheAppRoleOwnsNothing(t *testing.T) {
 	}
 }
 
-// TestOwnerAndAppRoleAreDifferentIdentities guards the harness itself. If the
-// two DSNs ever resolved to the same role — a copy-paste in pgtest, an
-// environment override — the seed path and the path under test would be the
-// same identity and the suite would go quietly vacuous.
-func TestOwnerAndAppRoleAreDifferentIdentities(t *testing.T) {
-	app := whoami(t, newPool(t, 1))
-	owner := whoami(t, newOwnerPool(t))
-
-	t.Logf("seed identity=%s, identity under test=%s", owner, app)
-
-	if app == owner {
-		t.Fatalf("both pools connect as %q; the tests and their fixtures share an identity", app)
+// TestHarnessIdentitiesAreDistinct guards the harness itself. If any two of the
+// three DSNs ever resolved to the same role — a copy-paste in pgtest, an
+// environment override — the seed path, the migration path and the path under
+// test would collapse into one identity and the suite would go quietly vacuous.
+//
+// The failure this is really watching for is the one issue #14 fixed: for five
+// migrations the schema owner and the bootstrap superuser were the same role,
+// and nothing said so out loud.
+func TestHarnessIdentitiesAreDistinct(t *testing.T) {
+	identities := map[string]string{
+		"app":         whoami(t, newPool(t, 1)),
+		"superuser":   whoami(t, newSuperuserPool(t)),
+		"schemaOwner": whoami(t, newSchemaOwnerPool(t)),
 	}
 
-	if owner != pgtest.OwnerRole {
-		t.Errorf("owner pool connects as %q, want %q", owner, pgtest.OwnerRole)
+	t.Logf("app=%s, superuser=%s, schema owner=%s",
+		identities["app"], identities["superuser"], identities["schemaOwner"])
+
+	want := map[string]string{
+		"app":         pgtest.AppRole,
+		"superuser":   pgtest.SuperuserRole,
+		"schemaOwner": pgtest.SchemaOwnerRole,
+	}
+
+	for pool, wantRole := range want {
+		if got := identities[pool]; got != wantRole {
+			t.Errorf("%s pool connects as %q, want %q", pool, got, wantRole)
+		}
+	}
+
+	seen := make(map[string]string, len(identities))
+
+	for pool, role := range identities {
+		if other, dup := seen[role]; dup {
+			t.Fatalf("the %s and %s pools both connect as %q; two of the harness's identities are the same role",
+				other, pool, role)
+		}
+
+		seen[role] = pool
 	}
 }
 

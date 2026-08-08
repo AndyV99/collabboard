@@ -161,8 +161,8 @@ func tenantScopedTables() []tenantScopedTable {
 // insert.
 func TestNoTenantCanReachAnotherTenantsRows(t *testing.T) {
 	pool := newPool(t, 4)
-	owner := newOwnerPool(t)
-	a, b, _ := seedTenants(t, owner)
+	superuser := newSuperuserPool(t)
+	a, b, _ := seedTenants(t, superuser)
 
 	for _, table := range tenantScopedTables() {
 		t.Run(table.name, func(t *testing.T) {
@@ -278,9 +278,9 @@ func assertIsolated(t *testing.T, pool *pgxpool.Pool, table tenantScopedTable, s
 // from the catalog, not from this file, so a table added by a future migration
 // fails here until someone adds it above.
 func TestTheIsolationMatrixCoversEveryTable(t *testing.T) {
-	owner := newOwnerPool(t)
+	superuser := newSuperuserPool(t)
 
-	inSchema := tableNames(t, owner)
+	inSchema := tableNames(t, superuser)
 
 	covered := make([]string, 0, len(tenantScopedTables()))
 	for _, table := range tenantScopedTables() {
@@ -316,9 +316,9 @@ func TestTheIsolationMatrixCoversEveryTable(t *testing.T) {
 // migrations_test.go makes the same claims by reading the SQL text. This one
 // asks the running database, which is what actually decides.
 func TestEveryTableHasForcedRLSAPolicyAndGrants(t *testing.T) {
-	owner := newOwnerPool(t)
+	superuser := newSuperuserPool(t)
 
-	rows, err := owner.Query(context.Background(), `
+	rows, err := superuser.Query(context.Background(), `
 		SELECT c.relname,
 		       c.relrowsecurity,
 		       c.relforcerowsecurity,

@@ -76,9 +76,9 @@ func preTenantFunctionNames() []string {
 // users are expressed, so it is not a hypothetical shape.
 func TestTheIdentityRoleCannotTouchAnyTenantScopedTable(t *testing.T) {
 	ctx := context.Background()
-	owner := newOwnerPool(t)
+	superuser := newSuperuserPool(t)
 
-	tables := tableNames(t, owner)
+	tables := tableNames(t, superuser)
 
 	checked := 0
 
@@ -95,7 +95,7 @@ func TestTheIdentityRoleCannotTouchAnyTenantScopedTable(t *testing.T) {
 		for _, verb := range []string{"SELECT", "INSERT", "UPDATE", "DELETE", "TRUNCATE", "REFERENCES"} {
 			var atTable bool
 
-			if err := owner.QueryRow(ctx,
+			if err := superuser.QueryRow(ctx,
 				`SELECT has_table_privilege($1, $2, $3)`,
 				pgtest.IdentityRole, table, verb).Scan(&atTable); err != nil {
 				t.Fatalf("asking the catalog about %s on %s: %v", verb, table, err)
@@ -112,7 +112,7 @@ func TestTheIdentityRoleCannotTouchAnyTenantScopedTable(t *testing.T) {
 		for _, verb := range []string{"SELECT", "INSERT", "UPDATE", "REFERENCES"} {
 			var atColumn bool
 
-			if err := owner.QueryRow(ctx,
+			if err := superuser.QueryRow(ctx,
 				`SELECT has_any_column_privilege($1, $2, $3)`,
 				pgtest.IdentityRole, table, verb).Scan(&atColumn); err != nil {
 				t.Fatalf("asking the catalog about column %s on %s: %v", verb, table, err)
@@ -144,10 +144,10 @@ func TestTheIdentityRoleCannotTouchAnyTenantScopedTable(t *testing.T) {
 // does not work if they do.
 func TestASecurityDefinerFunctionCannotReadTenantData(t *testing.T) {
 	ctx := context.Background()
-	owner := newOwnerPool(t)
+	superuser := newSuperuserPool(t)
 	app := newPool(t, 1)
 
-	for _, table := range tableNames(t, owner) {
+	for _, table := range tableNames(t, superuser) {
 		if slices.Contains(identityVisibleTables, table) {
 			continue
 		}
@@ -165,7 +165,7 @@ func TestASecurityDefinerFunctionCannotReadTenantData(t *testing.T) {
 				GRANT EXECUTE ON FUNCTION public.%s() TO %s;
 			`, probe, table, probe, pgtest.IdentityRole, probe, pgtest.AppRole)
 
-			if _, err := owner.Exec(ctx, create); err != nil {
+			if _, err := superuser.Exec(ctx, create); err != nil {
 				t.Fatalf("creating the probe function: %v", err)
 			}
 
@@ -173,7 +173,7 @@ func TestASecurityDefinerFunctionCannotReadTenantData(t *testing.T) {
 			// context.Background() here and is never cancelled, so the cleanup
 			// cannot inherit a cancellation and leave the probe behind.
 			t.Cleanup(func() {
-				if _, derr := owner.Exec(ctx,
+				if _, derr := superuser.Exec(ctx,
 					fmt.Sprintf(`DROP FUNCTION IF EXISTS public.%s()`, probe)); derr != nil {
 					t.Errorf("dropping the probe function: %v", derr)
 				}
@@ -211,9 +211,9 @@ func TestASecurityDefinerFunctionCannotReadTenantData(t *testing.T) {
 // exists: it asks what the serving role is actually permitted to invoke.
 func TestTheAppRoleMayExecuteExactlyThePreTenantFunctions(t *testing.T) {
 	ctx := context.Background()
-	owner := newOwnerPool(t)
+	superuser := newSuperuserPool(t)
 
-	rows, err := owner.Query(ctx, `
+	rows, err := superuser.Query(ctx, `
 		SELECT p.proname
 		FROM pg_proc p
 		JOIN pg_namespace n ON n.oid = p.pronamespace
@@ -268,9 +268,9 @@ func TestTheAppRoleMayExecuteExactlyThePreTenantFunctions(t *testing.T) {
 //     door is open to every role in the cluster.
 func TestEverySecurityDefinerFunctionIsPinnedAndOwned(t *testing.T) {
 	ctx := context.Background()
-	owner := newOwnerPool(t)
+	superuser := newSuperuserPool(t)
 
-	rows, err := owner.Query(ctx, `
+	rows, err := superuser.Query(ctx, `
 		SELECT p.proname,
 		       pg_get_userbyid(p.proowner),
 		       coalesce(array_to_string(p.proconfig, ','), ''),
@@ -345,7 +345,7 @@ func TestEverySecurityDefinerFunctionIsPinnedAndOwned(t *testing.T) {
 // member that can log in and is not the schema owner is a finding.
 func TestTheServingRoleCannotAssumeTheIdentityRole(t *testing.T) {
 	ctx := context.Background()
-	owner := newOwnerPool(t)
+	superuser := newSuperuserPool(t)
 
 	var (
 		canLogin, super, bypassRLS bool
@@ -353,7 +353,7 @@ func TestTheServingRoleCannotAssumeTheIdentityRole(t *testing.T) {
 		members                    []string
 	)
 
-	err := owner.QueryRow(ctx, `
+	err := superuser.QueryRow(ctx, `
 		SELECT r.rolcanlogin,
 		       r.rolsuper,
 		       r.rolbypassrls,
@@ -399,11 +399,11 @@ func TestTheServingRoleCannotAssumeTheIdentityRole(t *testing.T) {
 // quieter version of granting it BYPASSRLS.
 func TestTheIdentityRoleOwnsNoTables(t *testing.T) {
 	ctx := context.Background()
-	owner := newOwnerPool(t)
+	superuser := newSuperuserPool(t)
 
 	var owned []string
 
-	rows, err := owner.Query(ctx, `
+	rows, err := superuser.Query(ctx, `
 		SELECT c.relname
 		FROM pg_class c
 		JOIN pg_namespace n ON n.oid = c.relnamespace
@@ -445,7 +445,7 @@ func TestTheIdentityRoleOwnsNoTables(t *testing.T) {
 	// nothing quietly starts owning something.
 	var mayUse, mayCreate bool
 
-	if err := owner.QueryRow(ctx, `
+	if err := superuser.QueryRow(ctx, `
 		SELECT has_schema_privilege($1, 'public', 'USAGE'),
 		       has_schema_privilege($1, 'public', 'CREATE')
 	`, pgtest.IdentityRole).Scan(&mayUse, &mayCreate); err != nil {

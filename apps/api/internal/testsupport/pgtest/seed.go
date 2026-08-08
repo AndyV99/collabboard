@@ -69,32 +69,37 @@ func (f Fixture) Tenants() []Tenant {
 // SeedTenants creates two independent tenants plus one user who belongs to
 // both, and removes them when the test ends.
 //
-// It seeds through the owner pool, not a tenant-scoped one, because seeding is
-// precisely what the policies forbid: a tenant-scoped connection cannot create
-// a user at all, since the users policy requires a membership that cannot exist
-// before the user does. That is not a gap in the harness, it is issue #13
-// showing up exactly where migration 00002's header comment says it will.
+// It seeds through the superuser pool, because seeding is precisely what the
+// policies forbid: no role subject to row-level security can create a user at
+// all, since the users policy requires a membership that cannot exist before
+// the user does. That is not a gap in the harness, it is issue #13 showing up
+// exactly where migration 00002's header comment says it will.
+//
+// Since issue #14 that rules out the schema owner too, and deliberately: it is
+// a non-superuser subject to FORCE ROW LEVEL SECURITY, so these inserts would
+// be rejected and these deletes would silently affect nothing. The identity
+// that can seed is the one identity nothing under test ever uses.
 //
 // Every run uses fresh uuids and a random label suffix, so tests that seed
 // concurrently in the same container cannot see each other's fixtures — and
 // could not act on them anyway, since each runs scoped to its own tenant.
-func SeedTenants(tb testing.TB, owner *pgxpool.Pool) Fixture {
+func SeedTenants(tb testing.TB, superuser *pgxpool.Pool) Fixture {
 	tb.Helper()
 
 	run := uuid.NewString()[:8]
 
 	fixture := Fixture{
-		A:            seedTenant(tb, owner, "alpha-"+run),
-		B:            seedTenant(tb, owner, "beta-"+run),
+		A:            seedTenant(tb, superuser, "alpha-"+run),
+		B:            seedTenant(tb, superuser, "beta-"+run),
 		SharedUserID: uuid.New(),
 		SharedEmail:  "shared-" + run + "@example.com",
 	}
 
-	exec(tb, owner, `INSERT INTO users (id, email, display_name) VALUES ($1, $2, $3)`,
+	exec(tb, superuser, `INSERT INTO users (id, email, display_name) VALUES ($1, $2, $3)`,
 		fixture.SharedUserID, fixture.SharedEmail, "Shared Contractor "+run)
 
 	for _, t := range fixture.Tenants() {
-		exec(tb, owner, `INSERT INTO memberships (tenant_id, user_id, role) VALUES ($1, $2, 'member')`,
+		exec(tb, superuser, `INSERT INTO memberships (tenant_id, user_id, role) VALUES ($1, $2, 'member')`,
 			t.TenantID, fixture.SharedUserID)
 	}
 
@@ -103,17 +108,17 @@ func SeedTenants(tb testing.TB, owner *pgxpool.Pool) Fixture {
 		// cards. users is global, so it is outside that cascade and has to go
 		// explicitly — the same asymmetry the schema is built around.
 		for _, t := range fixture.Tenants() {
-			exec(tb, owner, `DELETE FROM organizations WHERE id = $1`, t.TenantID)
+			exec(tb, superuser, `DELETE FROM organizations WHERE id = $1`, t.TenantID)
 		}
 
-		exec(tb, owner, `DELETE FROM users WHERE id = ANY($1)`,
+		exec(tb, superuser, `DELETE FROM users WHERE id = ANY($1)`,
 			[]uuid.UUID{fixture.SharedUserID, fixture.A.MemberID, fixture.B.MemberID})
 	})
 
 	return fixture
 }
 
-func seedTenant(tb testing.TB, owner *pgxpool.Pool, label string) Tenant {
+func seedTenant(tb testing.TB, superuser *pgxpool.Pool, label string) Tenant {
 	tb.Helper()
 
 	t := Tenant{
@@ -129,19 +134,19 @@ func seedTenant(tb testing.TB, owner *pgxpool.Pool, label string) Tenant {
 		CardTitle:    label + " card",
 	}
 
-	exec(tb, owner, `INSERT INTO organizations (id, name, slug) VALUES ($1, $2, $3)`,
+	exec(tb, superuser, `INSERT INTO organizations (id, name, slug) VALUES ($1, $2, $3)`,
 		t.TenantID, label+" org", label)
-	exec(tb, owner, `INSERT INTO users (id, email, display_name) VALUES ($1, $2, $3)`,
+	exec(tb, superuser, `INSERT INTO users (id, email, display_name) VALUES ($1, $2, $3)`,
 		t.MemberID, t.MemberEmail, label+" member")
-	exec(tb, owner, `INSERT INTO memberships (id, tenant_id, user_id, role) VALUES ($1, $2, $3, 'owner')`,
+	exec(tb, superuser, `INSERT INTO memberships (id, tenant_id, user_id, role) VALUES ($1, $2, $3, 'owner')`,
 		t.MembershipID, t.TenantID, t.MemberID)
-	exec(tb, owner, `INSERT INTO projects (id, tenant_id, name) VALUES ($1, $2, $3)`,
+	exec(tb, superuser, `INSERT INTO projects (id, tenant_id, name) VALUES ($1, $2, $3)`,
 		t.ProjectID, t.TenantID, label+" project")
-	exec(tb, owner, `INSERT INTO boards (id, tenant_id, project_id, name) VALUES ($1, $2, $3, $4)`,
+	exec(tb, superuser, `INSERT INTO boards (id, tenant_id, project_id, name) VALUES ($1, $2, $3, $4)`,
 		t.BoardID, t.TenantID, t.ProjectID, label+" board")
-	exec(tb, owner, `INSERT INTO columns (id, tenant_id, board_id, name, position) VALUES ($1, $2, $3, $4, 1)`,
+	exec(tb, superuser, `INSERT INTO columns (id, tenant_id, board_id, name, position) VALUES ($1, $2, $3, $4, 1)`,
 		t.ColumnID, t.TenantID, t.BoardID, "Todo")
-	exec(tb, owner, `INSERT INTO cards (id, tenant_id, board_id, column_id, title, position) VALUES ($1, $2, $3, $4, $5, 1)`,
+	exec(tb, superuser, `INSERT INTO cards (id, tenant_id, board_id, column_id, title, position) VALUES ($1, $2, $3, $4, $5, 1)`,
 		t.CardID, t.TenantID, t.BoardID, t.ColumnID, t.CardTitle)
 
 	return t
