@@ -129,14 +129,17 @@ func (s *SessionStore) Rotate(ctx context.Context, raw string) (Session, string,
 		return Session{}, "", err
 	}
 
-	// Delete before mint: if the mint fails, the old token is already gone and
-	// the client has to log in again. The other order would leave two live
-	// tokens for one session on a partial failure, which is the state reuse
-	// detection exists to make impossible.
-	if err := s.kv.Delete(ctx, refreshKey(raw)); err != nil {
-		return Session{}, "", err
-	}
-
+	// The superseded record is deliberately *not* deleted. It is what makes
+	// reuse detectable: presenting it later finds a record whose session
+	// pointer has moved on, which is a replay, rather than finding nothing,
+	// which is indistinguishable from an ordinary expiry. It carries no
+	// authority on its own — lookup compares against the pointer — and it goes
+	// away on its own when its ttl runs out.
+	//
+	// The cost is one dead key per rotation for the rest of the refresh ttl.
+	// At a 15-minute access token and a 14-day refresh ttl that is ~1300 small
+	// keys per session at the theoretical maximum, and a session that is
+	// revoked or replayed clears its own.
 	next, err := s.mint(ctx, session)
 	if err != nil {
 		return Session{}, "", err

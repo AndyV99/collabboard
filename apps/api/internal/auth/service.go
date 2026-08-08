@@ -700,28 +700,37 @@ type loginCandidate struct {
 func (s *Service) loginSubject(ctx context.Context, email string) (uuid.UUID, loginCandidate) {
 	absent := loginCandidate{salt: s.absentSalt, params: s.params}
 
+	// A random id rather than uuid.Nil when there is no account, so the two
+	// lookups that follow probe the primary key index the same way a real
+	// lookup does, and so nothing downstream can special-case the zero value.
+	userID := uuid.New()
+
 	user, err := withoutTenant(ctx, s.store, store.ReasonLogin,
 		func(ctx context.Context, q store.IdentityQuerier) (store.IdentityUser, error) {
 			return q.FindUserByEmail(ctx, email)
 		})
-	if err != nil {
-		// A random id rather than uuid.Nil, so the verify step below probes the
-		// primary key index the same way a real lookup does.
-		return uuid.New(), absent
+	if err == nil {
+		userID = user.ID
 	}
 
+	// Called unconditionally, including for the stand-in id. Returning early
+	// above would make an unknown address cost one fewer database round trip
+	// than a known one, which is a smaller oracle than a skipped derivation but
+	// an oracle all the same — and one that shows up in the pre-tenant audit
+	// log as a different sequence of reasons.
+	// TestLoginDoesTheSameWorkWhateverIsWrong asserts the sequences match.
 	params, err := withoutTenant(ctx, s.store, store.ReasonPasswordParams,
 		func(ctx context.Context, q store.IdentityQuerier) (store.PasswordKDFParams, error) {
-			return q.PasswordParams(ctx, user.ID)
+			return q.PasswordParams(ctx, userID)
 		})
 	if err != nil {
 		// The account exists but has no password — an invited user who has not
 		// accepted, or later an external-provider-only account. Indistinguish-
 		// able from an unknown address from here on.
-		return user.ID, absent
+		return userID, absent
 	}
 
-	return user.ID, loginCandidate{
+	return userID, loginCandidate{
 		salt: params.Salt,
 		params: Argon2Params{
 			MemoryKiB:   uint32(params.MemoryKib),  //nolint:gosec // CHECK-constrained positive in migration 00005
