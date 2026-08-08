@@ -40,6 +40,23 @@ FROM cards
 WHERE board_id = @board_id
 ORDER BY column_id, position;
 
+-- name: CreateOrganization :one
+-- Registration creates the tenant it is about to belong to.
+--
+-- The id is public.current_tenant_id() rather than a parameter, which reads
+-- oddly until you notice it is the same rule as every other write in this file:
+-- the tenant comes from the transaction, never from the caller. An organization
+-- *is* its tenant, so its primary key is that value. The caller generates a
+-- uuid, opens WithTenant against it, and inserts — which is exactly the
+-- sequence 00002_tenancy.sql predicts when it says creating an organization
+-- "works under this policy without an exception".
+--
+-- The WITH CHECK half of organizations_tenant_isolation is therefore
+-- unreachable in practice here: there is no argument to get wrong.
+INSERT INTO organizations (id, name, slug)
+VALUES (public.current_tenant_id(), @name, @slug)
+RETURNING *;
+
 -- name: CreateMembership :one
 -- The second half of an invite, and the half that is *not* pre-tenant.
 --

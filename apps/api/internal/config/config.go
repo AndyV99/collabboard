@@ -7,6 +7,8 @@
 package config
 
 import (
+	"crypto/rand"
+	"encoding/hex"
 	"fmt"
 	"net/url"
 	"os"
@@ -23,6 +25,58 @@ type Config struct {
 	HTTP     HTTPConfig
 	Postgres PostgresConfig
 	Redis    RedisConfig
+	Auth     AuthConfig
+}
+
+// EnvDevelopment is the value of APP_ENV that relaxes the checks a deployed
+// environment must not relax — chiefly the signing-secret requirement below.
+const EnvDevelopment = "development"
+
+// IsDevelopment reports whether this process is running the local loop.
+func (c Config) IsDevelopment() bool { return c.Env == EnvDevelopment }
+
+// AuthConfig configures registration, login and sessions.
+//
+// The one value with no safe default is JWTSecret. Everything else here is a
+// tuning knob whose wrong setting makes the service slow or annoying;
+// JWTSecret's wrong setting makes every token forgeable, so Load refuses to
+// start without it outside development. A committed default that "works" is how
+// a placeholder reaches production.
+type AuthConfig struct {
+	// JWTSecret signs and verifies access tokens. At least 32 bytes.
+	JWTSecret string
+
+	// TokenIssuer and TokenAudience are stamped on issue and asserted on
+	// verification, so a token minted by a different service sharing the secret
+	// does not verify here.
+	TokenIssuer   string
+	TokenAudience string
+
+	// AccessTokenTTL is the window in which a revoked session still works,
+	// because nothing consults a datastore to validate an access token.
+	AccessTokenTTL time.Duration
+
+	// RefreshTokenTTL is how long a session can be kept alive by refreshing.
+	RefreshTokenTTL time.Duration
+
+	// ClockSkew is the leeway allowed on exp and nbf. It extends the life of
+	// every expired token by exactly this much, so it is small.
+	ClockSkew time.Duration
+
+	// Argon2 cost parameters for *new* credentials. Existing credentials carry
+	// their own, so raising these re-derives each account on its next login
+	// rather than locking anyone out.
+	Argon2MemoryKiB     int
+	Argon2Iterations    int
+	Argon2Parallelism   int
+	Argon2KeyLength     int
+	Argon2SaltLength    int
+	Argon2MaxConcurrent int
+
+	// Login rate limits. Two budgets sharing one window — see internal/auth.
+	LoginRatePerAccount int
+	LoginRatePerAddress int
+	LoginRateWindow     time.Duration
 }
 
 // HTTPConfig configures the public HTTP listener.
@@ -136,13 +190,82 @@ func Load() (Config, error) {
 			Password: envString("REDIS_PASSWORD", ""),
 			DB:       envInt("REDIS_DB", 0, &errs),
 		},
+		Auth: AuthConfig{
+			JWTSecret:     envString("AUTH_JWT_SECRET", ""),
+			TokenIssuer:   envString("AUTH_TOKEN_ISSUER", "collabboard"),
+			TokenAudience: envString("AUTH_TOKEN_AUDIENCE", "collabboard-api"),
+
+			AccessTokenTTL:  envDuration("AUTH_ACCESS_TOKEN_TTL", 15*time.Minute, &errs),
+			RefreshTokenTTL: envDuration("AUTH_REFRESH_TOKEN_TTL", 14*24*time.Hour, &errs),
+			ClockSkew:       envDuration("AUTH_CLOCK_SKEW", 30*time.Second, &errs),
+
+			Argon2MemoryKiB:     envInt("AUTH_ARGON2_MEMORY_KIB", 19456, &errs),
+			Argon2Iterations:    envInt("AUTH_ARGON2_ITERATIONS", 2, &errs),
+			Argon2Parallelism:   envInt("AUTH_ARGON2_PARALLELISM", 1, &errs),
+			Argon2KeyLength:     envInt("AUTH_ARGON2_KEY_LENGTH", 32, &errs),
+			Argon2SaltLength:    envInt("AUTH_ARGON2_SALT_LENGTH", 16, &errs),
+			Argon2MaxConcurrent: envInt("AUTH_ARGON2_MAX_CONCURRENT", 4, &errs),
+
+			LoginRatePerAccount: envInt("AUTH_LOGIN_RATE_PER_ACCOUNT", 5, &errs),
+			LoginRatePerAddress: envInt("AUTH_LOGIN_RATE_PER_ADDRESS", 30, &errs),
+			LoginRateWindow:     envDuration("AUTH_LOGIN_RATE_WINDOW", 15*time.Minute, &errs),
+		},
 	}
+
+	cfg.Auth = resolveAuthSecret(cfg.Env, cfg.Auth, &errs)
 
 	if len(errs) > 0 {
 		return Config{}, fmt.Errorf("invalid configuration: %s", strings.Join(errs, "; "))
 	}
 
 	return cfg, nil
+}
+
+// minJWTSecretLength mirrors internal/auth's floor. Duplicated rather than
+// imported so that config does not depend on auth — the check has to happen
+// here, at load, so an operator gets a message naming the environment variable
+// instead of a wiring error three constructors later.
+const minJWTSecretLength = 32
+
+// resolveAuthSecret enforces the one setting with no safe default.
+//
+// Outside development the secret is required and must be long enough for HS256
+// to mean anything: the signature's strength is capped by the key's entropy, so
+// a short secret is a token forgery away from being brute-forced offline by
+// anyone holding one valid token.
+//
+// In development a random secret is generated per process rather than defaulted
+// to a constant. A constant in a committed file is a real credential the moment
+// someone copies the compose stack to a shared host, and it would silently
+// verify tokens minted by anyone who has read this repository. The cost of
+// randomising is that a local restart invalidates local tokens, which is the
+// correct amount of inconvenience.
+func resolveAuthSecret(env string, auth AuthConfig, errs *[]string) AuthConfig {
+	if auth.JWTSecret != "" {
+		if len(auth.JWTSecret) < minJWTSecretLength {
+			*errs = append(*errs, fmt.Sprintf(
+				"AUTH_JWT_SECRET is %d bytes, minimum %d", len(auth.JWTSecret), minJWTSecretLength))
+		}
+
+		return auth
+	}
+
+	if env != EnvDevelopment {
+		*errs = append(*errs, "AUTH_JWT_SECRET is required outside development")
+
+		return auth
+	}
+
+	buf := make([]byte, minJWTSecretLength)
+	if _, err := rand.Read(buf); err != nil {
+		*errs = append(*errs, "generating a development AUTH_JWT_SECRET: "+err.Error())
+
+		return auth
+	}
+
+	auth.JWTSecret = hex.EncodeToString(buf)
+
+	return auth
 }
 
 func envString(key, def string) string {

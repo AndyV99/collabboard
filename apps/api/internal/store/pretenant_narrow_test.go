@@ -33,15 +33,37 @@ import (
 // table added by a future migration is covered the moment it exists.
 var identityVisibleTables = []string{"organizations", "memberships", "users"}
 
-// identityFunctions is the complete set of SECURITY DEFINER functions the app
-// role may execute — the pre-tenant path's entire surface, spelled out so that
-// a fifth one cannot appear without this test failing and someone explaining
-// why the operation is genuinely pre-tenant.
-var identityFunctions = []string{
-	"identity_create_user",
-	"identity_find_user_by_email",
-	"identity_list_user_organizations",
-	"identity_resolve_user_id_by_email",
+// preTenantFunctions is the complete set of SECURITY DEFINER functions the app
+// role may execute — the pre-tenant path's entire surface — mapped to the role
+// each one runs as. Spelled out so that another cannot appear without this test
+// failing and someone explaining why the operation is genuinely pre-tenant.
+//
+// The owner is part of the assertion rather than a detail, because it is what
+// decides what the function *can* do. The four identity functions run as a role
+// that can read a directory row and cannot see a password; the three credential
+// functions run as a role that can compare a password and cannot see an email.
+// Swapping either owner would silently merge two deliberately disjoint sets of
+// privileges. See migrations 00004 and 00005.
+var preTenantFunctions = map[string]string{
+	"identity_create_user":              pgtest.IdentityRole,
+	"identity_find_user_by_email":       pgtest.IdentityRole,
+	"identity_list_user_organizations":  pgtest.IdentityRole,
+	"identity_resolve_user_id_by_email": pgtest.IdentityRole,
+	"identity_create_password":          pgtest.CredentialsRole,
+	"identity_password_params":          pgtest.CredentialsRole,
+	"identity_verify_password":          pgtest.CredentialsRole,
+}
+
+// preTenantFunctionNames is preTenantFunctions' keys, sorted.
+func preTenantFunctionNames() []string {
+	names := make([]string, 0, len(preTenantFunctions))
+	for name := range preTenantFunctions {
+		names = append(names, name)
+	}
+
+	slices.Sort(names)
+
+	return names
 }
 
 // TestTheIdentityRoleCannotTouchAnyTenantScopedTable is the headline: the role
@@ -224,9 +246,9 @@ func TestTheAppRoleMayExecuteExactlyThePreTenantFunctions(t *testing.T) {
 
 	t.Logf("%s may execute these SECURITY DEFINER functions: %v", pgtest.AppRole, executable)
 
-	if !slices.Equal(executable, identityFunctions) {
+	if want := preTenantFunctionNames(); !slices.Equal(executable, want) {
 		t.Errorf("%s may execute %v, want exactly %v — the pre-tenant path changed width",
-			pgtest.AppRole, executable, identityFunctions)
+			pgtest.AppRole, executable, want)
 	}
 }
 
@@ -234,9 +256,12 @@ func TestTheAppRoleMayExecuteExactlyThePreTenantFunctions(t *testing.T) {
 // definer function goes wrong, over every one that exists rather than over the
 // four this migration added.
 //
-//   - Owned by anyone else, and it runs with that role's privileges instead —
-//     as the schema owner, which is subject to no policy that matters, or worse
-//     as a superuser, which is subject to none at all.
+//   - Owned by the wrong role, and it runs with that role's privileges instead.
+//     The schema owner is subject to no policy that matters and a superuser to
+//     none at all — but so is the *other* pre-tenant role: an identity function
+//     owned by collabboard_credentials could read a verifier, and a credential
+//     function owned by collabboard_identity could read the directory. So the
+//     expected owner is checked per function, from preTenantFunctions.
 //   - No fixed search_path, and a caller can point `users` at a table they
 //     control and have the function operate on it as its owner.
 //   - EXECUTE left to PUBLIC, which is the default on a new function, and the
@@ -278,9 +303,12 @@ func TestEverySecurityDefinerFunctionIsPinnedAndOwned(t *testing.T) {
 
 		t.Logf("%s: owner=%s config=%q public_execute=%t", name, funcOwner, config, publicMayExecute)
 
-		if funcOwner != pgtest.IdentityRole {
-			t.Errorf("%s is SECURITY DEFINER but owned by %s; it runs with that role's privileges, not the identity role's",
-				name, funcOwner)
+		switch wantOwner, known := preTenantFunctions[name]; {
+		case !known:
+			t.Errorf("%s is SECURITY DEFINER and unaccounted for; add it to preTenantFunctions with the role it is meant to run as, or drop it", name)
+		case funcOwner != wantOwner:
+			t.Errorf("%s is SECURITY DEFINER but owned by %s, want %s; it runs with the wrong role's privileges",
+				name, funcOwner, wantOwner)
 		}
 
 		if config == "" {
@@ -298,8 +326,8 @@ func TestEverySecurityDefinerFunctionIsPinnedAndOwned(t *testing.T) {
 
 	t.Logf("%d SECURITY DEFINER function(s) in schema public", seen)
 
-	if seen != len(identityFunctions) {
-		t.Errorf("schema public has %d SECURITY DEFINER functions, want %d", seen, len(identityFunctions))
+	if seen != len(preTenantFunctions) {
+		t.Errorf("schema public has %d SECURITY DEFINER functions, want %d", seen, len(preTenantFunctions))
 	}
 }
 

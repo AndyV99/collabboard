@@ -50,6 +50,12 @@ type (
 	// no tenant_id field: the tenant comes from the transaction.
 	CreateProjectParams = gen.CreateProjectParams
 
+	// CreateOrganizationParams are the arguments to
+	// Querier.CreateOrganization. Like the others it carries no id: an
+	// organization *is* its tenant, so its primary key is
+	// current_tenant_id() and comes from the transaction.
+	CreateOrganizationParams = gen.CreateOrganizationParams
+
 	// CreateMembershipParams are the arguments to Querier.CreateMembership.
 	// Like CreateProjectParams it has no tenant_id field: the tenant comes from
 	// the transaction, so an admin cannot add a member to another organization.

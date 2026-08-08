@@ -27,7 +27,7 @@ func doHealthRequest(t *testing.T, deps HealthDeps) (*httptest.ResponseRecorder,
 
 	gin.SetMode(gin.TestMode)
 
-	router := NewRouter(testLogger(), deps)
+	router := NewRouter(testLogger(), deps, AuthDeps{})
 
 	req := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/healthz", nil)
 	rec := httptest.NewRecorder()
@@ -163,7 +163,7 @@ func TestRecoveryMiddleware(t *testing.T) {
 
 	gin.SetMode(gin.TestMode)
 
-	router := NewRouter(testLogger(), HealthDeps{Postgres: stubPinger{}, Redis: stubPinger{}})
+	router := NewRouter(testLogger(), HealthDeps{Postgres: stubPinger{}, Redis: stubPinger{}}, AuthDeps{})
 	router.GET("/boom", func(*gin.Context) { panic("boom") })
 
 	rec := httptest.NewRecorder()

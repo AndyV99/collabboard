@@ -16,8 +16,10 @@ package main
 
 import (
 	"context"
+	"crypto/sha256"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"net/http"
 	"os"
@@ -28,11 +30,14 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/redis/go-redis/v9"
+	"golang.org/x/crypto/hkdf"
 
 	"github.com/AndyV99/collabboard/apps/api/internal/api"
+	"github.com/AndyV99/collabboard/apps/api/internal/auth"
 	"github.com/AndyV99/collabboard/apps/api/internal/config"
 	"github.com/AndyV99/collabboard/apps/api/internal/logging"
 	"github.com/AndyV99/collabboard/apps/api/internal/migrate"
+	"github.com/AndyV99/collabboard/apps/api/internal/store"
 )
 
 const (
@@ -106,14 +111,21 @@ func runServe(logger *slog.Logger, cfg config.Config) error {
 		}
 	}()
 
-	if cfg.Env != "development" {
+	if !cfg.IsDevelopment() {
 		gin.SetMode(gin.ReleaseMode)
+	}
+
+	dataStore := store.New(pool)
+
+	authDeps, err := newAuthDeps(logger, cfg.Auth, dataStore, redisClient)
+	if err != nil {
+		return err
 	}
 
 	router := api.NewRouter(logger, api.HealthDeps{
 		Postgres: pgxPinger{pool: pool},
 		Redis:    redisPinger{client: redisClient},
-	})
+	}, authDeps)
 
 	server := &http.Server{
 		Addr:              cfg.HTTP.Addr(),
@@ -189,6 +201,94 @@ func newPostgresPool(ctx context.Context, logger *slog.Logger, cfg config.Postgr
 	}
 
 	return pool, nil
+}
+
+// absentSaltLabel domain-separates the salt used for the derivation login
+// performs when no account matches, from the signing key it is derived out of.
+//
+// One configured secret, two uses, and HKDF's info parameter is exactly the
+// mechanism for that: the two outputs are independent, so learning one — say by
+// observing that a stand-in derivation happened — reveals nothing about the
+// other. A second environment variable would be a second thing to rotate and a
+// second thing to forget.
+const absentSaltLabel = "collabboard/auth/absent-account-salt/v1"
+
+// newAuthDeps constructs the auth service and the token verifier the HTTP layer
+// needs. Wiring only: every decision it encodes lives in internal/auth.
+func newAuthDeps(
+	logger *slog.Logger,
+	cfg config.AuthConfig,
+	dataStore *store.Store,
+	redisClient *redis.Client,
+) (api.AuthDeps, error) {
+	secret := []byte(cfg.JWTSecret)
+
+	issuer, err := auth.NewIssuer(auth.TokenConfig{
+		Secret:    secret,
+		Issuer:    cfg.TokenIssuer,
+		Audience:  cfg.TokenAudience,
+		AccessTTL: cfg.AccessTokenTTL,
+		Leeway:    cfg.ClockSkew,
+	})
+	if err != nil {
+		return api.AuthDeps{}, err
+	}
+
+	params := auth.Argon2Params{
+		MemoryKiB:   uint32(cfg.Argon2MemoryKiB),  //nolint:gosec // bounded by Argon2Params.Validate below
+		Iterations:  uint32(cfg.Argon2Iterations), //nolint:gosec // bounded by Argon2Params.Validate below
+		Parallelism: uint8(cfg.Argon2Parallelism), //nolint:gosec // bounded by Argon2Params.Validate below
+		KeyLength:   uint32(cfg.Argon2KeyLength),  //nolint:gosec // bounded by Argon2Params.Validate below
+		SaltLength:  uint32(cfg.Argon2SaltLength), //nolint:gosec // bounded by Argon2Params.Validate below
+	}
+
+	absentSalt, err := deriveKey(secret, absentSaltLabel, int(params.SaltLength))
+	if err != nil {
+		return api.AuthDeps{}, err
+	}
+
+	limiterPepper, err := deriveKey(secret, "collabboard/auth/rate-limit-pepper/v1", sha256.Size)
+	if err != nil {
+		return api.AuthDeps{}, err
+	}
+
+	kv := auth.NewRedisKeyValue(redisClient)
+
+	rateLimits := auth.RateLimitConfig{
+		PerAccount: cfg.LoginRatePerAccount,
+		PerAddress: cfg.LoginRatePerAddress,
+		Window:     cfg.LoginRateWindow,
+	}
+	if err := rateLimits.Validate(); err != nil {
+		return api.AuthDeps{}, err
+	}
+
+	service, err := auth.NewService(auth.ServiceDeps{
+		Store:      dataStore,
+		Deriver:    auth.NewArgon2Deriver(cfg.Argon2MaxConcurrent),
+		Issuer:     issuer,
+		Sessions:   auth.NewSessionStore(kv, cfg.RefreshTokenTTL),
+		Limiter:    auth.NewLimiter(kv, rateLimits, limiterPepper, logger),
+		Logger:     logger,
+		Params:     params,
+		AbsentSalt: absentSalt,
+	})
+	if err != nil {
+		return api.AuthDeps{}, err
+	}
+
+	return api.AuthDeps{Service: service, Verifier: issuer, Store: dataStore}, nil
+}
+
+// deriveKey expands a secret into an independent key of the requested length.
+func deriveKey(secret []byte, label string, length int) ([]byte, error) {
+	out := make([]byte, length)
+
+	if _, err := io.ReadFull(hkdf.New(sha256.New, secret, nil, []byte(label)), out); err != nil {
+		return nil, fmt.Errorf("deriving %s: %w", label, err)
+	}
+
+	return out, nil
 }
 
 func newRedisClient(cfg config.RedisConfig) *redis.Client {
