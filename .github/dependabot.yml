@@ -1,0 +1,153 @@
+# Dependabot version updates. The other half of the dependency-scanning story in
+# `Standards/Security Practices.md`: `.github/workflows/ci.yml` fails the build on
+# a vulnerability that is already here, this file is what stops one arriving.
+#
+# It matters that both halves exist, because the CI gate was tuned on the
+# assumption this file would. The `npm audit` gate in ci.yml deliberately fails
+# only on high/critical advisories in *production* dependencies, on the reasoning
+# that failing on every low/moderate advisory across ~470 dev packages trains
+# people to ignore the check. That is only a sound tradeoff if something else
+# quietly raises PRs for the low and moderate ones. This is that something.
+#
+# Likewise ci.yml pins third-party actions to a commit SHA, which is right for
+# supply-chain safety and useless for maintenance — a pinned SHA never moves, so
+# without the `github-actions` block below the workflow would sit on a frozen
+# action forever, including after that action ships a fix.
+#
+# NOTE: version updates (this file) and *security* updates (Dependabot opening a
+# PR off an advisory) are separate switches. Security updates additionally need
+# "Dependabot alerts" + "Dependabot security updates" enabled in repo settings;
+# on a private repo they are off by default. See the PR that added this file.
+
+version: 2
+
+updates:
+  # ── Go API ────────────────────────────────────────────────────────────────
+  #
+  # Scope note: `gomod` updates modules in go.mod. It does NOT move the `go`
+  # directive or the toolchain. That is deliberate coverage, not a gap:
+  #   - patch-level Go releases are picked up automatically, because ci.yml pins
+  #     GO_VERSION to '1.26.x' and setup-go resolves the newest matching patch;
+  #   - a reachable stdlib vulnerability fails CI anyway, because govulncheck is
+  #     call-graph aware and reports stdlib findings like any other;
+  #   - a minor Go release (1.26 -> 1.27) is a deliberate human decision about
+  #     language and runtime behaviour, not something to merge off a green check.
+  - package-ecosystem: gomod
+    directory: /apps/api
+    schedule:
+      interval: weekly
+      day: monday
+      time: "06:00"
+      timezone: Etc/UTC
+    # Version-update PRs only. Security-update PRs are counted against a separate
+    # internal limit, so this ceiling can never starve an advisory-driven PR.
+    open-pull-requests-limit: 5
+    labels:
+      - dependencies
+      - "area:api"
+    # Conventional Commits, so the history stays changelog-generatable:
+    #   chore(deps): bump github.com/gin-gonic/gin from 1.12.0 to 1.12.1
+    commit-message:
+      prefix: chore
+      include: scope
+    groups:
+      # go.mod carries a long indirect block (testcontainers, docker, pgx and
+      # their transitive graph). Ungrouped, a quiet week is still a dozen PRs
+      # that all say the same thing, and review degrades into rubber-stamping.
+      # One batched PR per week for everything non-major is reviewable; a major
+      # is left on its own below.
+      #
+      # `applies-to: version-updates` is the load-bearing part. Without it a
+      # group swallows security updates too, and the one PR that needed to be
+      # looked at today would arrive folded into a routine batch nobody is in a
+      # hurry to read. Constrained this way, an advisory-driven update always
+      # arrives as its own PR, named for the CVE it fixes.
+      go-minor-and-patch:
+        applies-to: version-updates
+        patterns:
+          - "*"
+        update-types:
+          - minor
+          - patch
+    # Majors are intentionally NOT grouped. In Go a major is a module path change
+    # (`/v2`), i.e. an API break with call-site edits — one PR each, reviewed on
+    # its own, is the only way that is honest.
+
+  # ── Next.js web app ───────────────────────────────────────────────────────
+  - package-ecosystem: npm
+    directory: /apps/web
+    schedule:
+      interval: weekly
+      day: tuesday
+      time: "06:00"
+      timezone: Etc/UTC
+    # Staggered a day off the Go batch so a week's updates arrive as a couple of
+    # PRs to read on consecutive mornings rather than a wall of them on Monday.
+    open-pull-requests-limit: 5
+    labels:
+      - dependencies
+      - "area:web"
+    commit-message:
+      prefix: chore
+      # -> chore(deps-dev): ... so tooling churn is distinguishable at a glance
+      # from a change that reaches a user.
+      prefix-development: chore
+      include: scope
+    groups:
+      # Split production from development on purpose. These two batches carry
+      # very different risk and deserve different attention: 17 production
+      # packages actually ship to a browser, ~470 dev packages never leave CI.
+      # Merged into one group the shipped change hides inside the noise.
+      web-production-minor-and-patch:
+        applies-to: version-updates
+        dependency-type: production
+        patterns:
+          - "*"
+        update-types:
+          - minor
+          - patch
+      web-development-minor-and-patch:
+        applies-to: version-updates
+        dependency-type: development
+        patterns:
+          - "*"
+        update-types:
+          - minor
+          - patch
+    # Majors ungrouped again: a Next or React major is a migration, not a bump.
+
+  # ── GitHub Actions ────────────────────────────────────────────────────────
+  #
+  # `/` is correct here and is not a typo for `/.github/workflows` — the
+  # github-actions ecosystem is rooted at the repository and discovers the
+  # workflow files itself. It handles both pinning styles used in ci.yml: the
+  # floating tags on first-party actions (actions/checkout@v7) and the commit
+  # SHAs on third-party ones (dorny/paths-filter, golangci-lint-action,
+  # setup-sqlc), rewriting the SHA and its trailing `# v4.0.3` comment together.
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+      day: wednesday
+      time: "06:00"
+      timezone: Etc/UTC
+    # Lower ceiling: there are only a handful of actions in the tree, so anything
+    # approaching this number means something is wrong rather than busy.
+    open-pull-requests-limit: 3
+    labels:
+      - dependencies
+      - "area:ci"
+    commit-message:
+      prefix: chore
+      include: scope
+    groups:
+      actions-minor-and-patch:
+        applies-to: version-updates
+        patterns:
+          - "*"
+        update-types:
+          - minor
+          - patch
+    # A major action bump changes runner behaviour (node runtime, input names,
+    # default permissions) and can break CI for every subsequent PR until fixed.
+    # Ungrouped, so it fails in isolation and is obvious about what did it.
