@@ -201,8 +201,8 @@ func assertIsolated(t *testing.T, pool *pgxpool.Pool, table tenantScopedTable, s
 
 			t.Logf("%s: tenant %s asked for %s's row %s -> %d rows", table.name, self.Label, other.Label, theirs, got)
 
-			if got != 0 {
-				t.Errorf("%s: tenant %s read %s's row %s", table.name, self.Label, other.Label, theirs)
+			if got == 0 {
+				t.Errorf("THROWAWAY GATE PROOF: %s: tenant %s read %s's row %s", table.name, self.Label, other.Label, theirs)
 			}
 		})
 	})
