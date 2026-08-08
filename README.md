@@ -78,6 +78,30 @@ cd apps/api && sqlc generate         # after editing query.sql or a migration
 
 The generated code is committed, so a build never needs sqlc installed.
 
+## Tests
+
+Two loops, split by build tag.
+
+```bash
+cd apps/api
+go test ./...                    # unit: no Docker, a couple of seconds
+go test -tags=integration ./...  # integration: real Postgres in a container
+```
+
+The integration suite brings up its own Postgres with Testcontainers on a random
+port, applies the real migrations to it, and connects as `collabboard_app` — not
+as the owner and not as a superuser, because row-level security does not apply to
+either, and a suite that connects as one of them passes every isolation assertion
+while proving nothing. It asserts that too, in
+`apps/api/internal/store/identity_test.go`.
+
+It needs a running Docker daemon and nothing else: no compose stack, no
+pre-provisioned database, no environment variables. Containers are removed when
+the run ends, whether it passed or failed — Testcontainers' reaper handles the
+case where the process dies without unwinding.
+
+The harness lives in `apps/api/internal/testsupport/pgtest`.
+
 The web app is not yet initialised:
 
 ```bash
@@ -86,6 +110,6 @@ cd apps/web && npx create-next-app@latest . --typescript
 
 ## Commands
 
-- API: `go build ./...` · `go test ./...` · `golangci-lint run` · `sqlc generate`
+- API: `go build ./...` · `go test ./...` · `go test -tags=integration ./...` · `golangci-lint run` · `sqlc generate`
 - Web: `npm run dev` · `npm test` · `npm run lint`
 - E2E: `npx playwright test` (needs both services, or the compose stack)

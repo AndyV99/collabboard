@@ -133,12 +133,38 @@ three global queries it is allowed to run — is additive.
 
 ## Tests
 
-`store_test.go` needs a running Postgres and **skips** when there is none, so
-`go test ./...` stays green on a machine without a database. The proper harness
-(Testcontainers, so CI gets one of its own) is
-[issue #7](https://github.com/AndyV99/collabboard/issues/7).
+Split by build tag, because the two loops have very different costs.
+
+```bash
+go test ./internal/store/...                    # ~ms, no Docker
+go test -tags=integration ./internal/store/...  # ~4s, brings up Postgres
+```
+
+| File | Tag | What it covers |
+|---|---|---|
+| `store_unit_test.go` | — | argument checks that stop a wiring mistake reaching a database |
+| `sqlcconfig_test.go` | — | the generated code stays at the unimportable path |
+| `store_test.go` | `integration` | `WithTenant` / `InTenant` through the generated querier |
+| `isolation_test.go` | `integration` | every tenant-scoped table, both directions, all four verbs |
+| `identity_test.go` | `integration` | that the connection under test is actually `collabboard_app` |
+| `main_test.go`, `testdb_test.go` | `integration` | container lifecycle and fixtures |
+
+The harness is `internal/testsupport/pgtest`: a Postgres container on a random
+port, migrated by the real `internal/migrate` code, with a two-tenant fixture
+that includes **one user belonging to both organizations**. That shared user is
+what makes the assertions mean something — without it, "tenant A sees only its
+own members" would also hold if the query returned the whole table.
 
 Queries under test run as the serving role (`collabboard_app`: not a superuser,
 no `BYPASSRLS`, owns nothing), which is the only identity the policies apply to.
+`identity_test.go` asserts that from inside the connection rather than trusting
+the DSN — connecting as the owner or a superuser would make every isolation
+assertion in this package pass while proving nothing, and that is the single
+most likely way for this suite to go quietly vacuous.
+
 Fixtures are seeded as the migration role, because seeding is precisely what the
 policies forbid — see the previous section.
+
+`isolation_test.go` also asks the catalog which tables exist and fails if the
+matrix does not cover one of them, so a table added by a future migration cannot
+slip through untested.

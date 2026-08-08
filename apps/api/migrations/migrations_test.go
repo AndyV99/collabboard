@@ -10,10 +10,11 @@ import (
 )
 
 // The real proof that isolation holds is an integration test against a live
-// Postgres (issue #7). These tests are the cheap complement: they catch the
-// specific mistake the ADR calls out — a table added later without RLS, or
-// with RLS enabled but not FORCEd — at the point the migration is written,
-// with no database and no container.
+// Postgres — internal/store/isolation_test.go, behind the `integration` build
+// tag. These tests are the cheap complement: they catch the specific mistake
+// the ADR calls out — a table added later without RLS, or with RLS enabled but
+// not FORCEd — at the point the migration is written, with no database and no
+// container.
 
 var (
 	createTableRe = regexp.MustCompile(`(?im)^\s*CREATE TABLE\s+(?:IF NOT EXISTS\s+)?([a-z_]+)`)
