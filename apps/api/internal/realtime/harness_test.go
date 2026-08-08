@@ -94,10 +94,14 @@ func (stubAuthService) Organizations(context.Context, auth.Principal) ([]auth.Or
 // recordingStore is a fake database that models the row-level security policies
 // rather than the rows.
 //
-// It answers exactly two questions, both the way Postgres would under
-// ADR 0001's policies: a membership is visible only inside its own tenant's
-// transaction, and a board is visible only inside its own tenant's. Everything
-// else panics.
+// It answers the questions this package's routes actually ask, every one of them
+// the way Postgres would under ADR 0001's policies: a row is visible only inside
+// its own tenant's transaction. Everything else panics.
+//
+// Since #45 that includes the card write path, because the thing being tested is
+// no longer "an endpoint published an event" but "a committed card move
+// published an event". The columns and cards here exist for exactly that: enough
+// of a board for POST /api/v1/cards/:card_id/move to succeed, and no more.
 //
 // It also records every tenant a transaction was opened for, which is the
 // assertion bola_test.go leans on — a leak that filtered afterwards would still
@@ -107,6 +111,8 @@ type recordingStore struct {
 	opened   []uuid.UUID
 	members  map[uuid.UUID]map[uuid.UUID]struct{}
 	boards   map[uuid.UUID]map[uuid.UUID]struct{}
+	columns  map[uuid.UUID]store.Column
+	cards    map[uuid.UUID]store.Card
 	failWith error
 }
 
@@ -114,7 +120,30 @@ func newRecordingStore() *recordingStore {
 	return &recordingStore{
 		members: map[uuid.UUID]map[uuid.UUID]struct{}{},
 		boards:  map[uuid.UUID]map[uuid.UUID]struct{}{},
+		columns: map[uuid.UUID]store.Column{},
+		cards:   map[uuid.UUID]store.Card{},
 	}
+}
+
+// seedCard puts one column and one card on a board, so that a real card move can
+// be made against it.
+//
+// Both rows carry the tenant, which is the only thing the querier below uses to
+// decide whether they exist — the same answer the policy gives.
+func (r *recordingStore) seedCard(tenantID, boardID uuid.UUID) (columnID, cardID uuid.UUID) {
+	r.seedBoard(tenantID, boardID)
+
+	columnID, cardID = uuid.New(), uuid.New()
+
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	r.columns[columnID] = store.Column{ID: columnID, TenantID: tenantID, BoardID: boardID, Name: "Todo"}
+	r.cards[cardID] = store.Card{
+		ID: cardID, TenantID: tenantID, BoardID: boardID, ColumnID: columnID, Title: "a card",
+	}
+
+	return columnID, cardID
 }
 
 func (r *recordingStore) seedMember(tenantID, userID uuid.UUID) {
@@ -195,11 +224,70 @@ func (q recordingQuerier) GetBoard(_ context.Context, boardID uuid.UUID) (store.
 	return store.Board{ID: boardID, TenantID: q.tenantID, Name: "board"}, nil
 }
 
-// instance is one API process: a hub, its broker, and an HTTP server in front
-// of the real router.
+// The card move, modelled. Three queries, each of them invisible outside the
+// row's own tenant — which is why a cross-tenant move is a 404 here for the same
+// reason it is one against Postgres.
+
+func (q recordingQuerier) LockColumn(_ context.Context, columnID uuid.UUID) (store.Column, error) {
+	q.store.mu.Lock()
+	defer q.store.mu.Unlock()
+
+	column, ok := q.store.columns[columnID]
+	if !ok || column.TenantID != q.tenantID {
+		return store.Column{}, store.ErrNoRows
+	}
+
+	return column, nil
+}
+
+func (q recordingQuerier) GetCard(_ context.Context, cardID uuid.UUID) (store.Card, error) {
+	q.store.mu.Lock()
+	defer q.store.mu.Unlock()
+
+	card, ok := q.store.cards[cardID]
+	if !ok || card.TenantID != q.tenantID {
+		return store.Card{}, store.ErrNoRows
+	}
+
+	return card, nil
+}
+
+// MoveCard applies the move, so a test that moves a card twice sees the second
+// move start from where the first one left it.
+//
+// The anchor rule is the real one: an after_card_id that is not currently a card
+// in the target column produces no row, which the handler turns into a 409.
+func (q recordingQuerier) MoveCard(_ context.Context, arg store.MoveCardParams) (store.MoveCardRow, error) {
+	q.store.mu.Lock()
+	defer q.store.mu.Unlock()
+
+	card, ok := q.store.cards[arg.CardID]
+	if !ok || card.TenantID != q.tenantID {
+		return store.MoveCardRow{}, store.ErrNoRows
+	}
+
+	if arg.AfterCardID != nil {
+		anchor, ok := q.store.cards[*arg.AfterCardID]
+		if !ok || anchor.TenantID != q.tenantID || anchor.ColumnID != arg.ColumnID {
+			return store.MoveCardRow{}, store.ErrNoRows
+		}
+	}
+
+	card.ColumnID = arg.ColumnID
+	q.store.cards[arg.CardID] = card
+
+	return store.MoveCardRow{
+		ID: card.ID, TenantID: card.TenantID, BoardID: card.BoardID, ColumnID: card.ColumnID,
+		Title: card.Title, Description: card.Description,
+	}, nil
+}
+
+// instance is one API process: a hub, its broker, a fake database, and an HTTP
+// server in front of the real router.
 type instance struct {
 	t      *testing.T
 	hub    *Hub
+	store  *recordingStore
 	server *httptest.Server
 	issuer *auth.Issuer
 }
@@ -208,6 +296,10 @@ type instanceOptions struct {
 	bus        *MemoryBus
 	authorizer Authorizer
 	issuer     *auth.Issuer
+
+	// store lets a test share one fake database between the authorizer it built
+	// itself and the card routes this harness mounts. Built here when nil.
+	store *recordingStore
 
 	sendBuffer          int
 	pingInterval        time.Duration
@@ -231,6 +323,10 @@ func newInstance(t *testing.T, opts instanceOptions) *instance {
 		opts.issuer = testIssuer(t, 15*time.Minute)
 	}
 
+	if opts.store == nil {
+		opts.store = newRecordingStore()
+	}
+
 	hub, err := NewHub(HubConfig{
 		Broker:                opts.bus.Broker(),
 		Authorizer:            opts.authorizer,
@@ -250,14 +346,18 @@ func newInstance(t *testing.T, opts instanceOptions) *instance {
 		t.Fatalf("building the hub: %v", err)
 	}
 
+	// The real router, with the board routes mounted over the fake database and
+	// the hub wired in as their publisher. Since #45 there is no publish
+	// endpoint: the only way anything reaches the fan-out in these tests is a
+	// card write that committed, which is the whole point of the issue.
 	router := api.NewRouter(discardLogger(),
 		api.HealthDeps{},
-		api.AuthDeps{Service: stubAuthService{}, Verifier: opts.issuer},
-		api.RealtimeDeps{Connect: hub.ConnectHandler(), PublishEvent: hub.PublishHandler()})
+		api.AuthDeps{Service: stubAuthService{}, Verifier: opts.issuer, Store: opts.store},
+		api.RealtimeDeps{Connect: hub.ConnectHandler(), Publisher: hub.EventPublisher()})
 
 	server := httptest.NewServer(router)
 
-	inst := &instance{t: t, hub: hub, server: server, issuer: opts.issuer}
+	inst := &instance{t: t, hub: hub, store: opts.store, server: server, issuer: opts.issuer}
 
 	t.Cleanup(func() {
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
@@ -513,23 +613,67 @@ func (c *client) closeStatus(timeout time.Duration) websocket.StatusCode {
 	return websocket.CloseStatus(c.closeErr)
 }
 
-// publishResult is what the publish helper reports. The body is read and the
+// board is a seeded board and the one column and card on it, so a test can say
+// "move that card" in one line.
+type board struct {
+	tenantID uuid.UUID
+	boardID  uuid.UUID
+	columnID uuid.UUID
+	cardID   uuid.UUID
+}
+
+// seedBoard puts a movable card on a board in this instance's fake database.
+func (i *instance) seedBoard(tenantID, boardID uuid.UUID) board {
+	columnID, cardID := i.store.seedCard(tenantID, boardID)
+
+	return board{tenantID: tenantID, boardID: boardID, columnID: columnID, cardID: cardID}
+}
+
+// httpResult is what the request helpers report. The body is read and the
 // response closed inside the helper, so no test has to remember to.
-type publishResult struct {
+type httpResult struct {
 	StatusCode int
 	Body       string
 }
 
-// publish posts an event through the real HTTP endpoint.
-func (i *instance) publish(t *testing.T, ctx context.Context, token string, boardID uuid.UUID, kind string) publishResult {
+// moveCard moves a card through the real card endpoint — the write that now
+// publishes.
+//
+// It replaces the demo publish endpoint #9 added: everything below asserts on an
+// event that exists because a row changed, not because a client asked for one to
+// be broadcast.
+func (i *instance) moveCard(t *testing.T, ctx context.Context, token string, b board) httpResult {
 	t.Helper()
 
-	body := strings.NewReader(`{"type":"` + kind + `","payload":{"card_id":"c1"}}`)
+	return i.moveCardByID(t, ctx, token, b.cardID, b.columnID)
+}
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost,
-		i.server.URL+"/api/v1/boards/"+boardID.String()+"/events", body)
+// moveCardByID is moveCard with the two ids named separately, for the tests that
+// deliberately mix one tenant's card with another's column.
+func (i *instance) moveCardByID(
+	t *testing.T,
+	ctx context.Context,
+	token string,
+	cardID, columnID uuid.UUID,
+) httpResult {
+	t.Helper()
+
+	return i.request(t, ctx, http.MethodPost, token,
+		"/api/v1/cards/"+cardID.String()+"/move",
+		`{"column_id":"`+columnID.String()+`","after_card_id":null}`)
+}
+
+// request performs one authenticated API call and reads the whole response.
+func (i *instance) request(
+	t *testing.T,
+	ctx context.Context,
+	method, token, path, body string,
+) httpResult {
+	t.Helper()
+
+	req, err := http.NewRequestWithContext(ctx, method, i.server.URL+path, strings.NewReader(body))
 	if err != nil {
-		t.Fatalf("building the publish request: %v", err)
+		t.Fatalf("building the %s %s request: %v", method, path, err)
 	}
 
 	req.Header.Set("Authorization", "Bearer "+token)
@@ -537,21 +681,21 @@ func (i *instance) publish(t *testing.T, ctx context.Context, token string, boar
 
 	resp, err := i.server.Client().Do(req)
 	if err != nil {
-		t.Fatalf("publishing: %v", err)
+		t.Fatalf("%s %s: %v", method, path, err)
 	}
 
 	defer func() {
 		if cerr := resp.Body.Close(); cerr != nil {
-			t.Errorf("closing the publish response: %v", cerr)
+			t.Errorf("closing the %s %s response: %v", method, path, cerr)
 		}
 	}()
 
 	payload, err := io.ReadAll(resp.Body)
 	if err != nil {
-		t.Fatalf("reading the publish response: %v", err)
+		t.Fatalf("reading the %s %s response: %v", method, path, err)
 	}
 
-	return publishResult{StatusCode: resp.StatusCode, Body: string(payload)}
+	return httpResult{StatusCode: resp.StatusCode, Body: string(payload)}
 }
 
 // websocketDial is the raw dial, for tests that want the refusal rather than a

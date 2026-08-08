@@ -156,6 +156,51 @@ func TestTheSubprotocolCannotOverrideAnAuthorizationHeader(t *testing.T) {
 	}
 }
 
+// TestTheDemoPublishEndpointIsGone pins the removal, because "we deleted the
+// handler" is not the same claim as "the route is unreachable".
+//
+// POST /api/v1/boards/:board_id/events existed only to demonstrate #9's fan-out
+// before anything could move a card. It persisted nothing, which meant any
+// authenticated member could announce a card move that never happened to every
+// other client on the board. #45 replaced it with the write path itself.
+func TestTheDemoPublishEndpointIsGone(t *testing.T) {
+	t.Parallel()
+
+	gin.SetMode(gin.TestMode)
+
+	issuer := testIssuer(t)
+
+	token, _, err := issuer.Issue(auth.Principal{
+		UserID: uuid.New(), TenantID: uuid.New(), Role: "member", SessionID: uuid.New(),
+	})
+	if err != nil {
+		t.Fatalf("issuing: %v", err)
+	}
+
+	// The fully wired router — auth, a store, and realtime — so the 404 is the
+	// route table's answer and not a missing dependency's.
+	router := NewRouter(discardLogger(),
+		HealthDeps{Postgres: stubPinger{}, Redis: stubPinger{}},
+		AuthDeps{Service: &membershipService{issuer: issuer}, Verifier: issuer, Store: newCRUDStore()},
+		RealtimeDeps{
+			Connect:   func(c *gin.Context) { c.Status(http.StatusOK) },
+			Publisher: &recordingPublisher{},
+		})
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequestWithContext(t.Context(), http.MethodPost,
+		"/api/v1/boards/"+uuid.NewString()+"/events", strings.NewReader(`{"type":"card.moved"}`))
+	req.Header.Set("Authorization", "Bearer "+token)
+	req.Header.Set("Content-Type", "application/json")
+	router.ServeHTTP(rec, req)
+
+	t.Logf("POST /api/v1/boards/:board_id/events -> %d %s", rec.Code, rec.Body.String())
+
+	if rec.Code != http.StatusNotFound {
+		t.Errorf("status = %d, want 404: a client must not be able to announce a write it did not make", rec.Code)
+	}
+}
+
 // TestTheRealtimeRoutesAreOnlyMountedWhenSupplied covers the optional wiring,
 // which is what keeps the health-only configuration from panicking.
 func TestTheRealtimeRoutesAreOnlyMountedWhenSupplied(t *testing.T) {
@@ -177,15 +222,13 @@ func TestTheRealtimeRoutesAreOnlyMountedWhenSupplied(t *testing.T) {
 		AuthDeps{Service: &membershipService{issuer: issuer}, Verifier: issuer},
 		RealtimeDeps{})
 
-	for _, path := range []string{"/api/v1/ws", "/api/v1/boards/" + uuid.NewString() + "/events"} {
-		rec := httptest.NewRecorder()
-		req := httptest.NewRequestWithContext(t.Context(), http.MethodGet, path, nil)
-		req.Header.Set("Authorization", "Bearer "+token)
-		without.ServeHTTP(rec, req)
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/api/v1/ws", nil)
+	req.Header.Set("Authorization", "Bearer "+token)
+	without.ServeHTTP(rec, req)
 
-		if rec.Code != http.StatusNotFound {
-			t.Errorf("%s without realtime deps -> %d, want 404", path, rec.Code)
-		}
+	if rec.Code != http.StatusNotFound {
+		t.Errorf("/api/v1/ws without realtime deps -> %d, want 404", rec.Code)
 	}
 
 	reached := false
@@ -202,8 +245,8 @@ func TestTheRealtimeRoutesAreOnlyMountedWhenSupplied(t *testing.T) {
 		})
 
 	// Unauthenticated: the handler must not be reached at all.
-	rec := httptest.NewRecorder()
-	req := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/api/v1/ws", nil)
+	rec = httptest.NewRecorder()
+	req = httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/api/v1/ws", nil)
 	with.ServeHTTP(rec, req)
 
 	if rec.Code != http.StatusUnauthorized {

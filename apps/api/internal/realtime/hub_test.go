@@ -58,11 +58,15 @@ func TestTwoClientsOnTheSameBoardSeeEachOthersEvents(t *testing.T) {
 	aliceClient.subscribe(t, ctx, boardID)
 	bobClient.subscribe(t, ctx, boardID)
 
+	board := inst.seedBoard(tenantID, boardID)
+
 	started := time.Now()
 
-	resp := inst.publish(t, ctx, aliceToken, boardID, "card.moved")
-	if resp.StatusCode != http.StatusAccepted {
-		t.Fatalf("publish status = %d, want 202", resp.StatusCode)
+	// A real card move through the real endpoint. Nothing in this test asks for
+	// an event to be published; the event exists because a row changed.
+	resp := inst.moveCard(t, ctx, aliceToken, board)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("move status = %d, want 200: %s", resp.StatusCode, resp.Body)
 	}
 
 	for name, c := range map[string]*client{"alice": aliceClient, "bob": bobClient} {
@@ -78,9 +82,16 @@ func TestTwoClientsOnTheSameBoardSeeEachOthersEvents(t *testing.T) {
 			t.Errorf("%s got board %v, want %s", name, frame.BoardID, boardID)
 		}
 
-		// The actor is the publisher's principal, whatever the body said.
+		// The actor is the mover's principal, from the token and from nowhere
+		// else. Nothing in the request body could have named one.
 		if frame.Event.ActorID != alice.UserID {
 			t.Errorf("%s got actor %s, want %s", name, frame.Event.ActorID, alice.UserID)
+		}
+
+		// And the payload is the card that moved, so a client can apply the
+		// change without re-fetching the column.
+		if !strings.Contains(string(frame.Event.Payload), board.cardID.String()) {
+			t.Errorf("%s got a payload naming no card: %s", name, frame.Event.Payload)
 		}
 	}
 
@@ -113,7 +124,7 @@ func TestClientsOnDifferentBoardsDoNotSeeEachOthersEvents(t *testing.T) {
 	aliceClient.subscribe(t, ctx, watched)
 	bobClient.subscribe(t, ctx, other)
 
-	inst.publish(t, ctx, bobToken, other, "card.moved")
+	inst.moveCard(t, ctx, bobToken, inst.seedBoard(tenantID, other))
 
 	// Bob is on the other board and must see it, which is the control: without
 	// it, alice's silence would also hold for a hub that delivers nothing.
@@ -154,9 +165,9 @@ func TestAnEventPublishedOnOneInstanceReachesAnother(t *testing.T) {
 
 	started := time.Now()
 
-	resp := first.publish(t, ctx, first.token(t, publisher), boardID, "card.moved")
-	if resp.StatusCode != http.StatusAccepted {
-		t.Fatalf("publish status = %d, want 202", resp.StatusCode)
+	resp := first.moveCard(t, ctx, first.token(t, publisher), first.seedBoard(tenantID, boardID))
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("move status = %d, want 200: %s", resp.StatusCode, resp.Body)
 	}
 
 	frame := watcherClient.expect(FrameEvent, 5*time.Second)
@@ -246,13 +257,15 @@ func TestUnsubscribingStopsDelivery(t *testing.T) {
 	c := inst.dial(ctx, t, token)
 	c.subscribe(t, ctx, boardID)
 
-	inst.publish(t, ctx, token, boardID, "card.moved")
+	board := inst.seedBoard(tenantID, boardID)
+
+	inst.moveCard(t, ctx, token, board)
 	c.expect(FrameEvent, 5*time.Second)
 
 	c.send(t, ctx, clientFrame{Type: clientUnsubscribe, BoardID: boardID.String()})
 	c.expect(FrameUnsubscribed, 5*time.Second)
 
-	inst.publish(t, ctx, token, boardID, "card.moved")
+	inst.moveCard(t, ctx, token, board)
 	c.expectNothing(300 * time.Millisecond)
 }
 
