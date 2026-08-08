@@ -583,24 +583,18 @@ func (c *Conn) sendFrame(frame Frame) {
 }
 
 // notifyShutdown queues the warning frame Hub.Shutdown sends before closing.
+//
+// It does not wait for the frame to reach the wire. [Hub.Shutdown] pauses once
+// for the whole fleet of connections rather than once per connection, because
+// per-connection would make a drain cost (connections × grace) — minutes at ten
+// thousand sockets, for a pause that is only there to let the write pump get
+// ahead of the close handshake.
 func (c *Conn) notifyShutdown(reconnectAfter time.Duration) {
 	c.sendFrame(Frame{
 		Type:             FrameShutdown,
 		Message:          "this instance is restarting",
 		ReconnectAfterMs: reconnectAfter.Milliseconds(),
 	})
-
-	// Give the write pump a moment to get the frame out before the close
-	// handshake overtakes it. Bounded and small: a drain must not be held up by
-	// a client that is not reading, and that client learns from the close frame
-	// anyway.
-	timer := time.NewTimer(shutdownFlushGrace)
-	defer timer.Stop()
-
-	select {
-	case <-timer.C:
-	case <-c.closed:
-	}
 }
 
 // close records why the connection is ending and wakes everything watching.

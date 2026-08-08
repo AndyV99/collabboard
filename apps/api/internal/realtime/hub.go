@@ -407,8 +407,28 @@ func (h *Hub) shutdown(ctx context.Context) error {
 		slog.Int("connections", len(live)),
 	)
 
+	// Two passes with one pause between them, rather than
+	// notify-pause-close per connection. The pause exists so a write pump gets
+	// the frame onto the wire before the close handshake overtakes it, and it is
+	// the same pause for everybody: doing it per connection would make a drain
+	// take (connections × grace), which at ten thousand sockets is minutes
+	// rather than the milliseconds it costs here.
 	for _, conn := range live {
 		conn.notifyShutdown(h.reconnectHint())
+	}
+
+	if len(live) > 0 {
+		timer := time.NewTimer(shutdownFlushGrace)
+
+		select {
+		case <-timer.C:
+		case <-ctx.Done():
+		}
+
+		timer.Stop()
+	}
+
+	for _, conn := range live {
 		conn.close(closeGoingAway, "server is restarting")
 	}
 
