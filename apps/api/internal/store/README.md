@@ -108,28 +108,87 @@ the feature that needs them.
 4. Commit the generated files — they are checked in so that a build never needs
    sqlc installed, and so the diff shows what the generated SQL actually became.
 
-## What this package deliberately cannot do
+Adding a *pre-tenant* query is deliberately harder, and should be: see
+"The other door" below.
+
+## The other door: `WithoutTenant`
 
 Identity operations that happen *before* a tenant is known cannot run through
-`WithTenant`:
+`WithTenant`. `users` is global and its policy is derived from `memberships` —
+a row is visible only if a membership joins it to the current tenant — so with
+no tenant set, the app role sees zero rows in `users`, `memberships` and
+`organizations`. That is the correct fail-closed behaviour, and it is also why
+these four operations are *impossible* rather than merely awkward.
 
-- login by email
-- "which organizations do I belong to?"
-- inviting a user who already has an account in another organization
+```go
+user, err := store.WithoutTenantValue(ctx, s, store.ReasonLogin,
+    func(ctx context.Context, q store.IdentityQuerier) (store.IdentityUser, error) {
+        return q.FindUserByEmail(ctx, email)
+    })
+```
 
-`users` is global and its policy is derived from `memberships` — a row is
-visible only if a membership joins it to the current tenant — so there is no
-tenant to scope these to, and a tenant-scoped transaction cannot even create a
-user (the membership that would make it visible cannot exist before the user
-does). That is [issue #13](https://github.com/AndyV99/collabboard/issues/13), and
-it belongs in a **separate, named, auditable entry point on `Store`**, not in a
-widened `WithTenant`.
+| Query | Reason it cannot be tenant-scoped |
+|---|---|
+| `FindUserByEmail` | login: the input is an email; nothing has claimed an organization yet |
+| `ResolveUserIDByEmail` | inviting an existing account: the point is to look *outside* the inviting tenant's visibility |
+| `ListUserOrganizations` | the org switcher: the question is "which tenants", so none can be current |
+| `CreateUser` | the `users` `WITH CHECK` policy needs a membership that cannot exist before the user row does |
 
-Nothing here forecloses it: the restriction is that `gen` is unimportable from
-outside `internal/store`, which says nothing about how many doors
-`internal/store` itself opens. A second method — pool-bound rather than
-transaction-bound, handing back a deliberately narrow interface over the two or
-three global queries it is allowed to run — is additive.
+Everything else belongs in `WithTenant`. Adding a member to an organization,
+for instance, is *not* pre-tenant: `CreateMembership` lives in `query.sql` and
+runs scoped to the admin's own tenant. An invite is deliberately split across
+both doors for exactly that reason.
+
+### Why this cannot become a general escape hatch
+
+Four independent things have to be true for a query to travel this path, and no
+single edit makes them all true.
+
+1. **The compiler.** `identity_query.sql` generates into
+   `internal/store/internal/identitygen`, a *different* package from the
+   tenant-scoped one. `IdentityQuerier` and `Querier` share no methods:
+
+   ```
+   internal/api/handler.go:10:11: q.ListProjects undefined
+   (type store.IdentityQuerier has no field or method ListProjects)
+   ```
+
+   Both are under a nested `internal`, so neither constructor is importable
+   outside `internal/store`.
+
+2. **Function grants.** Every one of those four methods is a call to a
+   `SECURITY DEFINER` function created in
+   [`migrations/00004_pre_tenant_identity.sql`](../../migrations/00004_pre_tenant_identity.sql).
+   `collabboard_app` holds `EXECUTE` on exactly those four and can read nothing
+   without a tenant otherwise.
+
+3. **Table grants.** Those functions run as `collabboard_identity`, which holds
+   *column-level* privileges on `users`, `memberships` and `organizations` and
+   **no privilege of any kind** on `projects`, `boards`, `columns` or `cards`.
+   A definer function that reached for a tenant-scoped table fails with
+   `permission denied for table projects` — asserted at runtime in
+   `pretenant_narrow_test.go`, which builds that exact function and calls it.
+   `collabboard_identity` also cannot log in, is not a superuser, holds no
+   `BYPASSRLS` and owns no tables, and `collabboard_app` is not a member of it,
+   so the serving role cannot `SET ROLE` to it.
+
+4. **A named reason.** Every call passes an `IdentityReason` from a closed set
+   (a struct with an unexported field, so the four constants are the only
+   values any package can name), and every call is logged with it. The zero
+   value is rejected.
+
+So widening the path is not a Go method away. It takes a migration that adds a
+function, a grant, possibly a privilege the identity role has never held, and a
+fifth reason — each a line in a diff that says what it is doing.
+
+**The one thing it cannot enforce:** `ListUserOrganizations` does not authorize.
+Callers must pass the id of the already-authenticated subject; passing one from
+a request body would turn it into a membership-disclosure endpoint. That is #8's
+responsibility, as are rate limiting and the timing characteristics of a login
+lookup.
+
+See [ADR 0002](../../../../docs/adr/0002-pre-tenant-identity-path.md) and
+[issue #13](https://github.com/AndyV99/collabboard/issues/13).
 
 ## Tests
 
@@ -143,10 +202,13 @@ go test -tags=integration ./internal/store/...  # ~4s, brings up Postgres
 | File | Tag | What it covers |
 |---|---|---|
 | `store_unit_test.go` | — | argument checks that stop a wiring mistake reaching a database |
-| `sqlcconfig_test.go` | — | the generated code stays at the unimportable path |
+| `sqlcconfig_test.go` | — | both generated packages stay at the unimportable path |
+| `pretenant_unit_test.go` | — | the width of the pre-tenant door, including a real `go build` proving a tenant-scoped query does not compile against it |
 | `store_test.go` | `integration` | `WithTenant` / `InTenant` through the generated querier |
 | `isolation_test.go` | `integration` | every tenant-scoped table, both directions, all four verbs |
 | `identity_test.go` | `integration` | that the connection under test is actually `collabboard_app` |
+| `pretenant_test.go` | `integration` | each pre-tenant query, including one user's memberships spanning two tenants and an invite end to end |
+| `pretenant_narrow_test.go` | `integration` | that the pre-tenant path cannot reach tenant-scoped data, from the catalog *and* by building a definer function that tries |
 | `main_test.go`, `testdb_test.go` | `integration` | container lifecycle and fixtures |
 
 The harness is `internal/testsupport/pgtest`: a Postgres container on a random
