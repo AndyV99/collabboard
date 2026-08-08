@@ -69,7 +69,7 @@ const shutdownFlushGrace = 50 * time.Millisecond
 // authorizeTimeout bounds one call into the [Authorizer].
 //
 // It is not a tuning knob, it is what keeps a promise. The maintenance loop is
-// one goroutine running four timers, and the token-expiry deadline is one of
+// one goroutine running three timers, and the token-expiry deadline is one of
 // them — so an authorization call that blocked indefinitely on an unreachable
 // database would hold that goroutine and let a connection outlive the token
 // that opened it, which is the one thing this package says cannot happen. The
@@ -469,7 +469,8 @@ func (c *Conn) write(ctx context.Context, payload []byte) bool {
 }
 
 // maintain is keepalive, dead-connection reaping, re-authorization and the
-// token deadline, in one goroutine because all four are timers.
+// token deadline, in one goroutine because they are three timers and one of
+// them (the ping) does both of the first two.
 func (c *Conn) maintain(ctx context.Context) {
 	ping := time.NewTicker(c.hub.cfg.PingInterval)
 	defer ping.Stop()
