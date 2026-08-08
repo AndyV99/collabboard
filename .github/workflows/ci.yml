@@ -1,0 +1,212 @@
+name: CI
+
+# PR-time quality gate only — no deploy, no image build, no registry push.
+# Those arrive with the infra work; see `Standards/CI-CD Standards.md` stages 6-9.
+#
+# Deliberately NO `paths:` filter on the triggers. A workflow that is skipped by
+# a trigger-level path filter never reports its checks at all, so any check it
+# would have produced sits at "Expected — waiting for status to be reported"
+# forever and blocks the PR. Instead this workflow always runs, decides what is
+# affected in the `changes` job, and skips the expensive jobs individually.
+# The single required status check is `ci`, which always runs. See the `ci` job.
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+# Nothing here reads or writes anything but the checkout. No repository secrets
+# are referenced anywhere in this workflow, so it runs unchanged on a fork PR.
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  # Pinned rather than floating so a toolchain release can never turn a green
+  # pipeline red without a commit that says so.
+  GO_VERSION: '1.26.x'
+  NODE_VERSION: '22'
+  GOLANGCI_LINT_VERSION: 'v2.12.2'
+  GOVULNCHECK_VERSION: 'v1.6.0'
+  SQLC_VERSION: '1.31.1'
+
+jobs:
+  # Cheap (~5s) job that decides which app jobs need to run. Its outputs gate
+  # the `api` and `web` jobs below.
+  changes:
+    name: changes
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      api: ${{ steps.filter.outputs.api }}
+      web: ${{ steps.filter.outputs.web }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: dorny/paths-filter@ceb8a2b8f2d89434be7ff52d3de7ec3738c5cc9d # v4.0.3
+        id: filter
+        with:
+          filters: |
+            api:
+              - 'apps/api/**'
+              - '.github/workflows/ci.yml'
+            web:
+              - 'apps/web/**'
+              - '.github/workflows/ci.yml'
+
+  # Stage order follows CI-CD Standards.md: lint first (fails fast), then unit
+  # test, then build, then dependency scan.
+  api:
+    name: api
+    needs: changes
+    if: needs.changes.outputs.api == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: apps/api
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-go@v7
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          # Caches the module and build caches, keyed on go.sum.
+          cache-dependency-path: apps/api/go.sum
+
+      # 1. Lint
+      - name: golangci-lint
+        uses: golangci/golangci-lint-action@ba0d7d2ec06a0ea1cb5fa41b2e4a3ab91d21278a # v9.3.0
+        with:
+          version: ${{ env.GOLANGCI_LINT_VERSION }}
+          working-directory: apps/api
+
+      # 2. Unit test. Deliberately no Postgres/Redis service containers: nothing
+      # here needs them, and internal/store's database-backed tests skip when no
+      # DSN resolves. The harness that gives CI a real database is the
+      # Testcontainers work in #7, which brings its own job rather than making
+      # every PR pay for services it does not use.
+      - name: go test
+        run: go test ./... -race
+
+      # 3. Build
+      - name: go build
+        run: go build ./...
+
+      # 4. Dependency scan. govulncheck is call-graph aware: it only fails on a
+      # vulnerability the code actually reaches, so there is no severity knob to
+      # tune here — a finding means this binary is exploitable, and that should
+      # fail. Vulnerabilities in required-but-uncalled modules are reported as
+      # informational and do not fail the build, which is the correct default.
+      - name: govulncheck
+        run: go run golang.org/x/vuln/cmd/govulncheck@${{ env.GOVULNCHECK_VERSION }} ./...
+
+      # sqlc's output under internal/store/internal/gen is generated code that
+      # is committed, so `go build` and `go test` pass happily against stale
+      # output — someone can edit query.sql or add a migration, forget
+      # `sqlc generate`, and nothing notices. `sqlc diff` exits non-zero when
+      # regenerating would change a committed file, which turns that into a
+      # build failure instead of a mystery a month later.
+      - name: Set up sqlc
+        uses: sqlc-dev/setup-sqlc@bac53b7fb28c039a6c7f5736fd1e89744021bdd6 # v5.0.0
+        with:
+          sqlc-version: ${{ env.SQLC_VERSION }}
+
+      - name: sqlc diff (committed generated code is up to date)
+        run: sqlc diff
+
+  web:
+    name: web
+    needs: changes
+    if: needs.changes.outputs.web == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: apps/web
+    env:
+      NEXT_TELEMETRY_DISABLED: '1'
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+          cache-dependency-path: apps/web/package-lock.json
+
+      - name: npm ci
+        run: npm ci
+
+      # 1. Lint
+      - name: eslint
+        run: npm run lint
+
+      # 2. Unit test
+      - name: vitest
+        run: npm test
+
+      # 3. Build. Next's incremental cache makes a warm build meaningfully
+      # faster; a stale entry only costs a full rebuild, never a wrong result.
+      - name: Restore Next.js build cache
+        uses: actions/cache@v6
+        with:
+          path: apps/web/.next/cache
+          key: nextjs-${{ runner.os }}-${{ hashFiles('apps/web/package-lock.json') }}-${{ hashFiles('apps/web/**/*.[jt]s', 'apps/web/**/*.[jt]sx') }}
+          restore-keys: |
+            nextjs-${{ runner.os }}-${{ hashFiles('apps/web/package-lock.json') }}-
+
+      - name: next build
+        run: npm run build
+
+      # 4. Dependency scan, in two parts on purpose.
+      #
+      # Threshold: the build FAILS on high/critical advisories in production
+      # dependencies only. Everything else is reported but does not fail.
+      #
+      # Why not fail on everything: the npm tree here is 17 production packages
+      # and ~470 dev packages. Failing on every low/moderate advisory in build
+      # tooling means a red pipeline arrives from a transitive dep nobody in
+      # this repo can fix, on a package that never reaches a user. People learn
+      # to re-run or ignore a check that cries wolf, and then it stops working
+      # for the advisory that mattered. A scan people trust beats a stricter
+      # scan people route around.
+      #
+      # What stops low/moderate rotting quietly: the report step below runs at
+      # every severity and shows up as a warning on the job, and Dependabot is
+      # the mechanism that actually files and PRs those upgrades (Security
+      # Practices.md pairs the two deliberately).
+      - name: npm audit (report, all severities)
+        continue-on-error: true
+        run: npm audit --audit-level=low
+
+      - name: npm audit (gate, high+ in production deps)
+        run: npm audit --omit=dev --audit-level=high
+
+  # The one job to mark as a required status check in branch protection.
+  #
+  # It has `if: always()` and no path gating, so it runs and reports a
+  # conclusion on every single PR — including a docs-only PR where both app
+  # jobs are skipped. That is what keeps path filtering from wedging a PR: the
+  # required check is never the thing that got skipped.
+  #
+  # `skipped` needs are treated as success; only `failure` or `cancelled` fail.
+  ci:
+    name: ci
+    needs: [changes, api, web]
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Check upstream job results
+        env:
+          RESULTS: ${{ join(needs.*.result, ' ') }}
+        run: |
+          echo "upstream results: $RESULTS"
+          if ${{ contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled') }}; then
+            echo '::error title=CI failed::At least one upstream job failed or was cancelled.'
+            exit 1
+          fi
+          echo 'All applicable jobs passed (skipped jobs are not applicable to this change).'
