@@ -26,6 +26,7 @@ type Config struct {
 	Postgres PostgresConfig
 	Redis    RedisConfig
 	Auth     AuthConfig
+	Realtime RealtimeConfig
 }
 
 // EnvDevelopment is the value of APP_ENV that relaxes the checks a deployed
@@ -77,6 +78,46 @@ type AuthConfig struct {
 	LoginRatePerAccount int
 	LoginRatePerAddress int
 	LoginRateWindow     time.Duration
+}
+
+// RealtimeConfig configures the WebSocket hub and its Redis fan-out.
+//
+// Every value here is a tuning knob except AllowedOrigins, which is a security
+// boundary — see [Load] for how its default is chosen.
+type RealtimeConfig struct {
+	// AllowedOrigins is the list of Origin patterns accepted on a WebSocket
+	// handshake. Empty means same-origin only.
+	AllowedOrigins []string
+
+	// SendBuffer is how many frames may queue for one connection before it is
+	// dropped as too slow.
+	SendBuffer int
+
+	// PingInterval is how often an idle connection is pinged; PongTimeout is
+	// how long the pong may take before the connection is reaped.
+	PingInterval time.Duration
+	PongTimeout  time.Duration
+
+	// WriteTimeout bounds a single frame write to one client.
+	WriteTimeout time.Duration
+
+	// ReadLimit caps an inbound frame, in bytes.
+	ReadLimit int
+
+	// ReauthorizeInterval is how often a live connection's membership and
+	// subscriptions are re-checked against the database. It is the bound on how
+	// long a revoked membership keeps receiving events.
+	ReauthorizeInterval time.Duration
+
+	// MaxRoomsPerConnection caps how many boards one socket may watch.
+	MaxRoomsPerConnection int
+
+	// BrokerBuffer is how many inbound pub/sub messages may queue.
+	BrokerBuffer int
+
+	// ShutdownReconnectHint is the base delay a draining instance asks clients
+	// to wait before reconnecting. Jittered per connection.
+	ShutdownReconnectHint time.Duration
 }
 
 // HTTPConfig configures the public HTTP listener.
@@ -210,9 +251,21 @@ func Load() (Config, error) {
 			LoginRatePerAddress: envInt("AUTH_LOGIN_RATE_PER_ADDRESS", 30, &errs),
 			LoginRateWindow:     envDuration("AUTH_LOGIN_RATE_WINDOW", 15*time.Minute, &errs),
 		},
+		Realtime: RealtimeConfig{
+			SendBuffer:            envInt("REALTIME_SEND_BUFFER", 64, &errs),
+			PingInterval:          envDuration("REALTIME_PING_INTERVAL", 25*time.Second, &errs),
+			PongTimeout:           envDuration("REALTIME_PONG_TIMEOUT", 10*time.Second, &errs),
+			WriteTimeout:          envDuration("REALTIME_WRITE_TIMEOUT", 5*time.Second, &errs),
+			ReadLimit:             envInt("REALTIME_READ_LIMIT_BYTES", 32<<10, &errs),
+			ReauthorizeInterval:   envDuration("REALTIME_REAUTHORIZE_INTERVAL", 30*time.Second, &errs),
+			MaxRoomsPerConnection: envInt("REALTIME_MAX_BOARDS_PER_CONNECTION", 16, &errs),
+			BrokerBuffer:          envInt("REALTIME_BROKER_BUFFER", 256, &errs),
+			ShutdownReconnectHint: envDuration("REALTIME_SHUTDOWN_RECONNECT_HINT", time.Second, &errs),
+		},
 	}
 
 	cfg.Auth = resolveAuthSecret(cfg.Env, cfg.Auth, &errs)
+	cfg.Realtime.AllowedOrigins = resolveAllowedOrigins(cfg.Env)
 
 	if len(errs) > 0 {
 		return Config{}, fmt.Errorf("invalid configuration: %s", strings.Join(errs, "; "))
@@ -266,6 +319,43 @@ func resolveAuthSecret(env string, auth AuthConfig, errs *[]string) AuthConfig {
 	auth.JWTSecret = hex.EncodeToString(buf)
 
 	return auth
+}
+
+// resolveAllowedOrigins decides which Origins may open a WebSocket.
+//
+// Unset means **same-origin only**, which is the strict answer and the wrong
+// one for this product: the SPA is served from another host, so a deployed
+// environment has to name it. Defaulting to "*" so that it works out of the box
+// is the shortcut this function exists to refuse — an origin allow-list that
+// defaults to open is an allow-list nobody ever configures.
+//
+// Development gets the local Next.js origins, for the same reason the JWT
+// secret gets a random one there: the local loop should work from a fresh
+// checkout, and a value that only applies when APP_ENV=development cannot reach
+// production by being forgotten.
+//
+// Note that this is defence in depth rather than the primary control. The
+// credential on this path is a bearer token the browser does not attach
+// ambiently, so cross-site WebSocket hijacking does not apply today; the
+// allow-list is what keeps that true if a cookie is ever added.
+func resolveAllowedOrigins(env string) []string {
+	if raw, ok := os.LookupEnv("REALTIME_ALLOWED_ORIGINS"); ok && strings.TrimSpace(raw) != "" {
+		var origins []string
+
+		for _, origin := range strings.Split(raw, ",") {
+			if trimmed := strings.TrimSpace(origin); trimmed != "" {
+				origins = append(origins, trimmed)
+			}
+		}
+
+		return origins
+	}
+
+	if env != EnvDevelopment {
+		return nil
+	}
+
+	return []string{"localhost:3000", "127.0.0.1:3000"}
 }
 
 func envString(key, def string) string {
