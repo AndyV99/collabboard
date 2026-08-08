@@ -66,6 +66,21 @@ const cleanupTimeout = 5 * time.Second
 // wire before the close handshake overtakes it.
 const shutdownFlushGrace = 50 * time.Millisecond
 
+// authorizeTimeout bounds one call into the [Authorizer].
+//
+// It is not a tuning knob, it is what keeps a promise. The maintenance loop is
+// one goroutine running four timers, and the token-expiry deadline is one of
+// them — so an authorization call that blocked indefinitely on an unreachable
+// database would hold that goroutine and let a connection outlive the token
+// that opened it, which is the one thing this package says cannot happen. The
+// same bound on the subscribe path stops a stalled database from parking the
+// read pump forever on a frame the client can never be answered about.
+//
+// Generous against a healthy Postgres (the query is one indexed row) and short
+// against an unhealthy one. A timeout is not [ErrForbidden], so it fails closed
+// for a new subscription and leaves existing ones alone — see [Conn.reauthorize].
+const authorizeTimeout = 5 * time.Second
+
 // Conn is one client's WebSocket, as the hub sees it.
 type Conn struct {
 	id        uuid.UUID
@@ -292,7 +307,7 @@ func (c *Conn) handleSubscribe(ctx context.Context, frame clientFrame) {
 	// The check, before anything is registered. Every non-nil error is a
 	// refusal, including the ones that are not ErrForbidden: an authorizer that
 	// could not reach the database has not said yes.
-	if err := c.hub.cfg.Authorizer.AuthorizeBoard(ctx, c.principal, boardID); err != nil {
+	if err := c.authorizeBoard(ctx, boardID); err != nil {
 		c.refuseSubscription(boardID, err)
 
 		return
@@ -326,6 +341,22 @@ func (c *Conn) handleSubscribe(ctx context.Context, frame clientFrame) {
 	)
 
 	c.sendFrame(Frame{Type: FrameSubscribed, BoardID: &boardID})
+}
+
+// authorizeBoard and authorizeTenant are the only two calls into the
+// [Authorizer], and both are bounded — see [authorizeTimeout].
+func (c *Conn) authorizeBoard(ctx context.Context, boardID uuid.UUID) error {
+	authCtx, cancel := context.WithTimeout(ctx, authorizeTimeout)
+	defer cancel()
+
+	return c.hub.cfg.Authorizer.AuthorizeBoard(authCtx, c.principal, boardID)
+}
+
+func (c *Conn) authorizeTenant(ctx context.Context) error {
+	authCtx, cancel := context.WithTimeout(ctx, authorizeTimeout)
+	defer cancel()
+
+	return c.hub.cfg.Authorizer.AuthorizeTenant(authCtx, c.principal)
 }
 
 // refuseSubscription answers a failed authorization.
@@ -453,6 +484,20 @@ func (c *Conn) maintain(ctx context.Context) {
 	defer expiry.Stop()
 
 	for {
+		// Checked before the select, not only as one of its cases. A ping or a
+		// re-authorization can block this goroutine for seconds, and select
+		// picks uniformly among ready cases — so with a wedged database the
+		// expiry could lose that draw repeatedly and a connection would keep
+		// running on a token that has already expired. This makes the deadline
+		// the first thing considered after anything slow returns.
+		if !c.principal.ExpiresAt.IsZero() && c.hub.cfg.now().After(c.principal.ExpiresAt) {
+			c.logger.Info("closing a realtime connection whose token expired",
+				slog.String("event", "realtime.connection.token_expired"))
+			c.close(StatusTokenExpired, "access token expired; refresh and reconnect")
+
+			return
+		}
+
 		select {
 		case <-ctx.Done():
 			return
@@ -505,7 +550,7 @@ func (c *Conn) pingPeer(ctx context.Context) bool {
 // reauthorize re-checks the membership and every live subscription. It reports
 // whether the connection should stay open.
 func (c *Conn) reauthorize(ctx context.Context) bool {
-	if err := c.hub.cfg.Authorizer.AuthorizeTenant(ctx, c.principal); err != nil {
+	if err := c.authorizeTenant(ctx); err != nil {
 		if !errors.Is(err, ErrForbidden) {
 			// The database was unreachable. Deliberately *not* a disconnect: an
 			// unavailable authorizer would otherwise turn a Postgres blip into
@@ -529,7 +574,7 @@ func (c *Conn) reauthorize(ctx context.Context) bool {
 	}
 
 	for _, room := range c.roomList() {
-		if err := c.hub.cfg.Authorizer.AuthorizeBoard(ctx, c.principal, room.BoardID); err == nil {
+		if err := c.authorizeBoard(ctx, room.BoardID); err == nil {
 			continue
 		} else if !errors.Is(err, ErrForbidden) {
 			continue

@@ -89,6 +89,16 @@ A database blip would otherwise become a fleet-wide reconnect storm on top of an
 already-unhealthy database. New subscriptions still fail closed, and the token
 deadline still applies.
 
+Every call into the authorizer is bounded at five seconds, and the maintenance
+loop checks the token deadline *before* its select rather than only as one of
+its cases. Both exist for the same reason: that loop runs the ping, the sweep
+and the deadline in one goroutine, so a database that accepts a connection and
+then says nothing would otherwise hold all three and let a socket outlive its
+token — the one thing this design says cannot happen.
+`TestAWedgedAuthorizerCannotOutlastTheToken` uses an authorizer that only ever
+answers when its context is cancelled; without the bound it would hang rather
+than fail.
+
 The rejected alternative was re-checking on every delivered event: a query on the
 hot path of the thing this package exists to make fast, for a window already
 shorter than the token's.
@@ -111,10 +121,21 @@ Why dropping the client rather than the message, and why never blocking:
   The client sees `4002`, reconnects, and re-fetches the board from Postgres,
   which is the same recovery path it already has for a dropped network.
 
-`TestASlowClientIsDroppedWithoutStallingOthers` demonstrates it rather than
-asserting it: a real connection that never reads is dropped after ~2,000 frames
-(~34 MB) while another client on the same board receives every one of them and
-keeps receiving after the drop.
+Two tests, split on purpose. `TestAFullSendBufferDropsTheClientAndNothingElse`
+drives the hub directly, with one connection draining its buffer and one not:
+the stalled one is closed with `4002` and the other receives every event. It
+touches no socket, because whether a *real* peer's buffers fill depends on the
+machine's `net.ipv4.tcp_wmem` — a test that waits for TCP to push back is a test
+the kernel decides, and CI proved that by failing it in both directions on the
+same code.
+
+`TestASlowClientIsDroppedWithoutStallingOthers` then demonstrates the same thing
+end to end over real sockets: a connection that never reads (~1,800 frames,
+~30 MB before the server gives up) while another client on the same board
+receives every one of them and keeps receiving afterwards. It deliberately does
+*not* assert which of the two mechanisms fired — buffer overflow or write
+timeout — because that is the machine-dependent part. Both are "the hub gave up
+on this peer rather than waiting for it".
 
 One thing worth knowing about the `4002` frame itself. The write pump owns
 *every* write on a socket, the close frame included, because coder/websocket

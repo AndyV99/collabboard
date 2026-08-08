@@ -11,6 +11,7 @@ package realtime
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"strings"
 	"sync/atomic"
@@ -255,27 +256,156 @@ func TestUnsubscribingStopsDelivery(t *testing.T) {
 	c.expectNothing(300 * time.Millisecond)
 }
 
-// TestASlowClientIsDroppedWithoutStallingOthers is the backpressure claim,
-// demonstrated rather than asserted.
+// TestAFullSendBufferDropsTheClientAndNothingElse is the backpressure decision,
+// stated exactly.
 //
-// The slow client is a real connection that never reads. Its socket buffers
-// fill, the write pump blocks on the kernel, its send buffer fills, and the hub
-// drops it. The fast client on the same board receives every event throughout —
-// which is the actual claim, because a hub that blocked on the slow peer would
-// deliver the fast one nothing at all.
+// It drives the hub directly rather than through a socket, and that is the
+// point: whether a real peer's buffers fill depends on the machine's
+// net.ipv4.tcp_wmem, so a test that waits for TCP to push back is a test whose
+// outcome is decided by the kernel it runs on. This one decides the question in
+// the only place the decision actually lives — [Hub.deliver]'s non-blocking
+// send — and the end-to-end behaviour over a real socket is the test below.
+//
+// Two connections, one draining its buffer and one not. The claim is not just
+// "the stalled one is dropped" but "and the other one misses nothing", which is
+// what "does not block the hub or other clients" means.
+func TestAFullSendBufferDropsTheClientAndNothingElse(t *testing.T) {
+	t.Parallel()
+
+	ctx, cancel := context.WithTimeout(t.Context(), 30*time.Second)
+	defer cancel()
+
+	const buffer = 4
+
+	inst := newInstance(t, instanceOptions{authorizer: allowAll{}, sendBuffer: buffer})
+
+	room := Room{TenantID: uuid.New(), BoardID: uuid.New()}
+
+	// Two connections that never run serve, so nothing drains their buffers
+	// except what this test chooses to drain. Their websocket is nil, which is
+	// safe because every path under test — deliver, trySend, close — touches the
+	// buffer and the close state and never the socket. That separation is not an
+	// accident of this test; it is the property that lets the hub's fan-out
+	// goroutine drop a client without ever waiting on a network.
+	stalled := newConn(inst.hub, nil, principalFor(room.TenantID, 15*time.Minute))
+	draining := newConn(inst.hub, nil, principalFor(room.TenantID, 15*time.Minute))
+
+	for _, conn := range []*Conn{stalled, draining} {
+		if err := inst.hub.join(ctx, room, conn); err != nil {
+			t.Fatalf("joining the room: %v", err)
+		}
+	}
+
+	var received atomic.Int64
+
+	drained := make(chan struct{})
+
+	go func() {
+		defer close(drained)
+
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-draining.closed:
+				return
+			case <-draining.send:
+				received.Add(1)
+			}
+		}
+	}()
+
+	// One more than the buffer holds is enough. There is no queue anywhere else
+	// in the path: deliver either lands the frame in the channel or it does not.
+	const events = buffer + 4
+
+	// One at a time, waiting for the draining client to take each. Publishing
+	// them in a burst would let the *draining* client fall behind too if its
+	// goroutine simply was not scheduled in between, and then this would be
+	// measuring the Go scheduler rather than the buffer.
+	for i := range events {
+		before := received.Load()
+
+		if err := inst.hub.Publish(ctx, room, Event{
+			ID:         uuid.New(),
+			Type:       "card.moved",
+			OccurredAt: time.Now().UTC(),
+		}); err != nil {
+			t.Fatalf("publishing: %v", err)
+		}
+
+		eventually(t, 10*time.Second, fmt.Sprintf("the draining client to take event %d", i), func() bool {
+			return received.Load() > before
+		})
+	}
+
+	eventually(t, 10*time.Second, "the stalled client to be dropped", func() bool {
+		select {
+		case <-stalled.closed:
+			return true
+		default:
+			return false
+		}
+	})
+
+	status, reason := stalled.closeInfo()
+
+	t.Logf("the stalled client was closed with %d (%s) after a %d-frame buffer filled", status, reason, buffer)
+
+	if status != StatusSlowConsumer {
+		t.Errorf("close status = %d, want %d (slow consumer)", status, StatusSlowConsumer)
+	}
+
+	// The other connection on the same board received every event, which is the
+	// half that matters: a hub that blocked on the stalled peer would have
+	// delivered it nothing.
+	if got := received.Load(); got != events {
+		t.Errorf("the draining client received %d of %d events", got, events)
+	}
+
+	select {
+	case <-draining.closed:
+		t.Fatal("the draining client was dropped too")
+	default:
+	}
+
+	t.Logf("the draining client received all %d events and is still open", received.Load())
+
+	// And the hub forgot the dropped one only when its connection was cleaned
+	// up, not before — the fan-out goroutine records the decision and never
+	// touches the maps or a socket.
+	if got := inst.hub.connectionsFor(room); got != 2 {
+		t.Errorf("connections for %s = %d, want 2: deliver must not deregister anything itself", room, got)
+	}
+
+	cancel()
+	<-drained
+}
+
+// TestASlowClientIsDroppedWithoutStallingOthers is the same claim end to end,
+// over real sockets.
+//
+// The slow client is a real connection that never reads a byte. Eventually the
+// server cannot make progress writing to it — through its send buffer filling,
+// or through the frame in flight exceeding WriteTimeout, and *which* of those
+// happens first depends on how much the machine's kernel is willing to buffer,
+// so this test does not assert on it. What it asserts is machine-independent
+// and is the actual requirement: the connection ends, and the client on the
+// same board is untouched throughout and still receiving afterwards.
+//
+// The precise "a full buffer yields 4002" claim is pinned deterministically by
+// TestAFullSendBufferDropsTheClientAndNothingElse above.
 func TestASlowClientIsDroppedWithoutStallingOthers(t *testing.T) {
 	t.Parallel()
 
-	ctx, cancel := context.WithTimeout(t.Context(), 90*time.Second)
+	ctx, cancel := context.WithTimeout(t.Context(), 120*time.Second)
 	defer cancel()
 
 	const (
 		payloadSize = 16 << 10
 
 		// Spaced, so that a client which *is* reading has nothing to struggle
-		// with. It also has to be well under writeTimeout/sendBuffer, or the
-		// write pump's own timeout would fire before the buffer filled and the
-		// connection would end for the wrong reason.
+		// with.
 		publishInterval = 2 * time.Millisecond
 	)
 
@@ -283,20 +413,13 @@ func TestASlowClientIsDroppedWithoutStallingOthers(t *testing.T) {
 		authorizer: allowAll{},
 		sendBuffer: 8,
 
-		// Generous on purpose, and the reason is the thing under test. Once the
-		// peer's buffers are full the write pump is parked inside one frame
-		// write; the close frame goes out behind it, when that frame completes.
-		// This test's slow client starts reading again the moment the drop is
-		// detected, so the write completes and 4002 is delivered — which is the
-		// realistic case, a client that was slow rather than gone. A shorter
-		// timeout here would expire mid-fill and end the connection as a write
-		// failure, testing the timeout instead of the buffer.
-		//
-		// The case this deliberately does not cover: a peer that never reads
-		// again cannot be told anything at all, on this socket or any other. It
-		// gets a reset after WriteTimeout, and TestADeadConnectionIsReaped
-		// covers how it is noticed.
-		writeTimeout: 60 * time.Second,
+		// Short, so this terminates promptly whatever the machine's socket
+		// buffers turn out to be. On a host that buffers little, the send buffer
+		// fills first and the client gets 4002; on one that buffers a lot, the
+		// frame in flight times out first and the connection ends as a write
+		// failure. Both are "the hub gave up on this peer rather than waiting for
+		// it", which is what this test is about.
+		writeTimeout: 2 * time.Second,
 	})
 
 	tenantID := uuid.New()
@@ -316,7 +439,7 @@ func TestASlowClientIsDroppedWithoutStallingOthers(t *testing.T) {
 		t.Fatalf("subscribing the slow client: %v", err)
 	}
 
-	eventually(t, 5*time.Second, "the slow client to join the room", func() bool {
+	eventually(t, 10*time.Second, "the slow client to join the room", func() bool {
 		return inst.hub.connectionsFor(room) == 1
 	})
 
@@ -354,7 +477,7 @@ func TestASlowClientIsDroppedWithoutStallingOthers(t *testing.T) {
 		}
 	}()
 
-	eventually(t, 5*time.Second, "both clients to join the room", func() bool {
+	eventually(t, 10*time.Second, "both clients to join the room", func() bool {
 		return inst.hub.connectionsFor(room) == 2
 	})
 
@@ -378,7 +501,7 @@ func TestASlowClientIsDroppedWithoutStallingOthers(t *testing.T) {
 	// is not fixed because it depends on how much the kernel is willing to
 	// buffer, which varies by machine; what is fixed is the *outcome*.
 	started := time.Now()
-	deadline := started.Add(60 * time.Second)
+	deadline := started.Add(90 * time.Second)
 	published := 0
 
 	for inst.hub.connectionsFor(room) == 2 {
@@ -402,8 +525,9 @@ func TestASlowClientIsDroppedWithoutStallingOthers(t *testing.T) {
 	t.Logf("the slow client was dropped after %d events of ~%dB in %s; the reading client had taken %d",
 		published, payloadSize, time.Since(started), received.Load())
 
-	// It was dropped with a code that tells the client what to do about it. The
-	// socket still holds everything it never read, so this drains to the close.
+	// Whatever ended it, the server ended it deliberately rather than hanging.
+	// The socket still holds everything the client never read, so this drains to
+	// the end.
 	var closeErr error
 
 	for {
@@ -414,10 +538,8 @@ func TestASlowClientIsDroppedWithoutStallingOthers(t *testing.T) {
 		}
 	}
 
-	if got := websocket.CloseStatus(closeErr); got != StatusSlowConsumer {
-		t.Errorf("the slow client saw close status %d, want %d (slow consumer): %v",
-			got, StatusSlowConsumer, closeErr)
-	}
+	t.Logf("the slow client's connection ended with close status %d: %v",
+		websocket.CloseStatus(closeErr), closeErr)
 
 	// And the point of the whole exercise: the other client on the same board
 	// is untouched and still receiving. A hub that had blocked on the slow peer
@@ -426,7 +548,7 @@ func TestASlowClientIsDroppedWithoutStallingOthers(t *testing.T) {
 
 	publish()
 
-	eventually(t, 10*time.Second, "the reading client to receive an event published after the drop", func() bool {
+	eventually(t, 20*time.Second, "the reading client to receive an event published after the drop", func() bool {
 		return received.Load() > before
 	})
 
@@ -504,6 +626,44 @@ func TestAConnectionIsClosedWhenItsAccessTokenExpires(t *testing.T) {
 	}
 
 	t.Log("the socket did not outlive the credential that opened it")
+}
+
+// TestAWedgedAuthorizerCannotOutlastTheToken is the guarantee that a socket
+// never outlives the credential that opened it, tested against the thing most
+// likely to break it.
+//
+// The maintenance loop runs the ping, the re-authorization sweep and the
+// token-expiry deadline in one goroutine, so an authorization call that never
+// returned would hold all three — and a connection would quietly keep running
+// on an expired token for as long as Postgres stayed wedged. This authorizer
+// answers only when its context is cancelled, so without the bound in
+// authorizeTimeout the connection would never close and this test would hang
+// rather than fail.
+func TestAWedgedAuthorizerCannotOutlastTheToken(t *testing.T) {
+	t.Parallel()
+
+	ctx, cancel := context.WithTimeout(t.Context(), 60*time.Second)
+	defer cancel()
+
+	inst := newInstance(t, instanceOptions{
+		authorizer: blockingAuthorizer{},
+		issuer:     testIssuer(t, 2*time.Second),
+
+		// Fires long before the token expires, so the sweep is already stuck
+		// inside the authorizer when the deadline arrives.
+		reauthorizeInterval: 50 * time.Millisecond,
+	})
+
+	started := time.Now()
+
+	c := inst.dial(ctx, t, inst.token(t, principalFor(uuid.New(), 2*time.Second)))
+
+	if got := c.closeStatus(45 * time.Second); got != StatusTokenExpired {
+		t.Fatalf("close status = %d, want %d (token expired)", got, StatusTokenExpired)
+	}
+
+	t.Logf("the connection closed %s after opening, despite an authorizer that never answers",
+		time.Since(started).Round(time.Millisecond))
 }
 
 func TestRevokingAMembershipClosesTheConnection(t *testing.T) {

@@ -672,3 +672,24 @@ func (a *scriptedAuthorizer) counts() (tenant, board int) {
 }
 
 var errAuthorizerUnavailable = errors.New("authorizer: database unreachable")
+
+// blockingAuthorizer never answers. It stands in for an unreachable Postgres —
+// not one that refuses a connection, which is the easy case, but one that
+// accepts it and then says nothing, which is what a wedged database or an
+// exhausted pool actually looks like from here.
+//
+// It returns only when its context is cancelled, so a caller that does not
+// bound the call waits forever and a caller that does gets its deadline back.
+type blockingAuthorizer struct{}
+
+func (blockingAuthorizer) AuthorizeBoard(ctx context.Context, _ auth.Principal, _ uuid.UUID) error {
+	<-ctx.Done()
+
+	return ctx.Err()
+}
+
+func (blockingAuthorizer) AuthorizeTenant(ctx context.Context, _ auth.Principal) error {
+	<-ctx.Done()
+
+	return ctx.Err()
+}
