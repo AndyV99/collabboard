@@ -9,6 +9,7 @@ import (
 	"log/slog"
 	"net/url"
 	"os"
+	"sync"
 	"testing"
 	"time"
 
@@ -19,6 +20,7 @@ import (
 	"github.com/testcontainers/testcontainers-go/modules/postgres"
 
 	"github.com/AndyV99/collabboard/apps/api/internal/migrate"
+	"github.com/AndyV99/collabboard/apps/api/internal/store"
 )
 
 const (
@@ -105,6 +107,14 @@ type DB struct {
 	// AppDSN connects as collabboard_app. Everything under test runs through
 	// this one.
 	AppDSN string
+
+	// fixtureOnce guards the long-lived owner pool that Seed and OwnerExec
+	// share. It belongs to the harness rather than to a test, because fixtures
+	// are created and torn down across several tests and a pool closed by the
+	// first test's cleanup would break the second's.
+	fixtureOnce sync.Once
+	fixturePool *pgxpool.Pool
+	fixtureErr  error
 }
 
 // Start brings up Postgres on a random host port, applies the embedded
@@ -172,6 +182,71 @@ func Start(ctx context.Context) (*DB, error) {
 	return db, nil
 }
 
+// AppStore opens a pool as the serving role and wraps it in the real
+// [store.Store].
+//
+// It exists so that a test outside internal/store can exercise code taking a
+// *store.Store without importing pgx — which .golangci.yml's depguard rule
+// forbids in internal/api and internal/realtime, for the reason ADR 0001 gives.
+// Without it, the WebSocket hub's integration test would have to reach for the
+// driver to build the very dependency whose whole job is to keep it away from
+// the driver.
+func (db *DB) AppStore(tb testing.TB, maxConns int32) *store.Store {
+	tb.Helper()
+
+	return store.New(db.AppPool(tb, maxConns))
+}
+
+// Seed creates the two-tenant fixture using the harness's own owner pool.
+func (db *DB) Seed(tb testing.TB) Fixture {
+	tb.Helper()
+
+	return SeedTenants(tb, db.fixtures(tb))
+}
+
+// OwnerExec runs one statement as the schema owner.
+//
+// For the fixture changes the policies deliberately forbid a tenant-scoped
+// connection from making — revoking a membership, for instance, which is how
+// the realtime suite tests what happens to a live WebSocket when one goes away.
+func (db *DB) OwnerExec(tb testing.TB, sql string, args ...any) {
+	tb.Helper()
+
+	if _, err := db.fixtures(tb).Exec(context.Background(), sql, args...); err != nil {
+		tb.Fatalf("pgtest: executing as %s (%s): %v", OwnerRole, sql, err)
+	}
+}
+
+// fixtures returns the harness-owned owner pool, opening it on first use. It is
+// closed by [DB.Close] rather than by a test's cleanup, because it outlives any
+// one test.
+func (db *DB) fixtures(tb testing.TB) *pgxpool.Pool {
+	tb.Helper()
+
+	if db == nil || db.OwnerDSN == "" {
+		tb.Fatal("pgtest: harness was never started; TestMain did not run or failed")
+	}
+
+	db.fixtureOnce.Do(func() {
+		cfg, err := pgxpool.ParseConfig(db.OwnerDSN)
+		if err != nil {
+			db.fixtureErr = fmt.Errorf("parsing the owner dsn: %w", err)
+
+			return
+		}
+
+		cfg.MaxConns = 4
+
+		db.fixturePool, db.fixtureErr = pgxpool.NewWithConfig(context.Background(), cfg)
+	})
+
+	if db.fixtureErr != nil {
+		tb.Fatalf("pgtest: opening the fixture pool: %v", db.fixtureErr)
+	}
+
+	return db.fixturePool
+}
+
 // Close terminates the container. It is safe on a nil or partially built DB, so
 // the caller can defer it immediately.
 //
@@ -183,6 +258,10 @@ func Start(ctx context.Context) (*DB, error) {
 func (db *DB) Close() error {
 	if db == nil || db.container == nil {
 		return nil
+	}
+
+	if db.fixturePool != nil {
+		db.fixturePool.Close()
 	}
 
 	if err := testcontainers.TerminateContainer(db.container); err != nil {
