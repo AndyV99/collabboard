@@ -59,6 +59,25 @@ schema — while the server connects as `POSTGRES_USER`, which must be
 `collabboard_app`. Those two are deliberately different roles: see
 `docs/adr/0001-tenant-isolation.md`.
 
+## Database access
+
+Every tenant-scoped query goes through `internal/store.WithTenant`, which opens
+a transaction, sets `app.tenant_id` for its duration, and hands the callback a
+querier bound to it. Nothing else in the service can reach the database: the
+generated queriers live in `internal/store/internal/gen`, which Go's
+internal-package rule puts out of reach of every package outside
+`internal/store`. See `apps/api/internal/store/README.md` for the why and the
+enforcement.
+
+Queries are hand-written in `apps/api/internal/store/query.sql` and compiled by
+sqlc:
+
+```bash
+cd apps/api && sqlc generate         # after editing query.sql or a migration
+```
+
+The generated code is committed, so a build never needs sqlc installed.
+
 The web app is not yet initialised:
 
 ```bash
@@ -67,6 +86,6 @@ cd apps/web && npx create-next-app@latest . --typescript
 
 ## Commands
 
-- API: `go build ./...` · `go test ./...` · `golangci-lint run`
+- API: `go build ./...` · `go test ./...` · `golangci-lint run` · `sqlc generate`
 - Web: `npm run dev` · `npm test` · `npm run lint`
 - E2E: `npx playwright test` (needs both services, or the compose stack)
