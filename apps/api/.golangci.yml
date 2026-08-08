@@ -4,6 +4,14 @@ run:
   timeout: 3m
   tests: true
 
+  # Without this the integration harness and the tests behind the `integration`
+  # tag are invisible to every linter — files excluded by a build constraint are
+  # not compiled, so they are not analysed either. Lint should cover the test
+  # code that proves tenant isolation at least as closely as it covers the
+  # service.
+  build-tags:
+    - integration
+
 linters:
   default: standard
   enable:
