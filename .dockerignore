@@ -1,0 +1,57 @@
+# Build context exclusions, shared by every image built from this repo.
+#
+# Docker uploads the entire context to the daemon before the first instruction
+# runs, so this file is both a speed control and a correctness one. A host
+# `node_modules` that leaked in would shadow the one the build installs and
+# would carry the host's platform-specific binaries — a glibc SWC build landing
+# in a musl image, for instance, which fails at runtime rather than at build.
+#
+# Scoped by pattern rather than by app, so adding `apps/api/Dockerfile` needs no
+# change here.
+
+# Dependency trees and build output. Always produced inside the image.
+**/node_modules
+**/.next
+**/out
+**/build
+**/dist
+**/coverage
+**/*.tsbuildinfo
+apps/api/bin
+
+# Git metadata and CI config. Nothing in any build step reads them, and `.git`
+# in particular is large and changes on every commit, so including it would
+# invalidate the context on every build.
+.git
+.gitignore
+.gitattributes
+.github
+
+# Agent worktrees nested inside the repo (see .gitignore). Each is a full
+# working copy — including its own node_modules — so leaving this out makes the
+# context grow by a whole repo per concurrent agent.
+.claude
+
+# Local environment and secrets. `.env.example` is committed and harmless, but
+# there is no reason for any of it to be in an image, so the whole family goes.
+**/.env
+**/.env.*
+
+# Terraform state and variable files. State contains resource identifiers and
+# occasionally secrets; neither belongs anywhere near a build context.
+**/.terraform
+**/*.tfstate
+**/*.tfstate.*
+**/*.tfvars
+!**/*.tfvars.example
+
+# Infrastructure and prose. Not inputs to any application build.
+infra
+docs
+**/*.md
+
+# Editor and OS cruft.
+.vscode
+.idea
+**/.DS_Store
+**/*.pem
