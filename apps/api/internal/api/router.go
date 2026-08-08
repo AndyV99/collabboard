@@ -65,6 +65,17 @@ func NewRouter(logger *slog.Logger, deps HealthDeps, authDeps AuthDeps, realtime
 	if authDeps.Store != nil {
 		authenticated.GET("/members", membersHandler(logger, authDeps.Store))
 
+		// A board surface with no publisher commits writes that nobody is told
+		// about, and does it silently. That is the correct configuration for a
+		// router built without realtime — several tests, and nothing else — and
+		// a wiring bug anywhere it is not, so it says so once at startup rather
+		// than being discovered as "the board stopped updating".
+		if realtimeDeps.Publisher == nil {
+			logger.Warn("board routes mounted without a realtime publisher; writes will not be broadcast",
+				slog.String("event", "realtime.publisher.absent"),
+			)
+		}
+
 		mountBoardRoutes(authenticated, logger, authDeps.Store, realtimeDeps.Publisher)
 	}
 

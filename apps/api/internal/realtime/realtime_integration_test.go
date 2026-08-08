@@ -579,6 +579,126 @@ type movedColumn struct {
 		ID       string `json:"id"`
 		ColumnID string `json:"column_id"`
 	} `json:"card"`
+
+	FromColumnID string  `json:"from_column_id"`
+	AfterCardID  *string `json:"after_card_id"`
+}
+
+// TestAMoveCarriesTheAnchorAndTheColumnItLeft covers the two placement fields a
+// client needs and that a null-anchor move never exercises.
+//
+// `after_card_id` is the whole of how a client reproduces the server's order —
+// no rank is ever published (ADR 0004) — so a handler echoing the wrong id here
+// would put every client's column in an order the database does not have, and a
+// suite that only ever moves to the front would not notice. `from_column_id` is
+// what a client keeping one list per column uses to find the row it is moving.
+func TestAMoveCarriesTheAnchorAndTheColumnItLeft(t *testing.T) {
+	t.Parallel()
+
+	ctx, cancel := context.WithTimeout(t.Context(), 60*time.Second)
+	defer cancel()
+
+	fixture := testDB.Seed(t)
+	issuer := testIssuer(t, 15*time.Minute)
+
+	mover := newRedisInstance(t, issuer, time.Minute)
+	observer := newRedisInstance(t, issuer, time.Minute)
+
+	tenant := fixture.A
+	principal := memberPrincipal(tenant)
+	token := mover.token(t, principal)
+
+	watcher := observer.dial(ctx, t, observer.token(t, principal))
+	watcher.subscribe(t, ctx, tenant.BoardID)
+
+	// A second column and a second card, so there is both somewhere to come
+	// from and something real to sit behind.
+	second := createdID(t, mover.request(t, ctx, http.MethodPost, token,
+		"/api/v1/boards/"+tenant.BoardID.String()+"/columns", `{"name":"Doing"}`), "column")
+
+	anchor := createdID(t, mover.request(t, ctx, http.MethodPost, token,
+		"/api/v1/columns/"+second.String()+"/cards", `{"title":"the anchor"}`), "card")
+
+	watcher.expect(FrameEvent, 10*time.Second) // column.created
+	watcher.expect(FrameEvent, 10*time.Second) // card.created
+
+	// The seeded card leaves its own column and lands behind the anchor.
+	moved := mover.request(t, ctx, http.MethodPost, token,
+		"/api/v1/cards/"+tenant.CardID.String()+"/move",
+		`{"column_id":"`+second.String()+`","after_card_id":"`+anchor.String()+`"}`)
+	if moved.StatusCode != http.StatusOK {
+		t.Fatalf("moving behind the anchor: %d %s", moved.StatusCode, moved.Body)
+	}
+
+	frame := watcher.expect(FrameEvent, 10*time.Second)
+
+	t.Logf("card.moved payload: %s", frame.Event.Payload)
+
+	var payload movedColumn
+	if err := json.Unmarshal(frame.Event.Payload, &payload); err != nil {
+		t.Fatalf("decoding the payload: %v", err)
+	}
+
+	switch {
+	case payload.AfterCardID == nil:
+		t.Fatal("after_card_id is null for a move that named an anchor")
+	case *payload.AfterCardID != anchor.String():
+		t.Errorf("after_card_id = %s, want the anchor %s", *payload.AfterCardID, anchor)
+	}
+
+	if payload.FromColumnID != tenant.ColumnID.String() {
+		t.Errorf("from_column_id = %s, want %s", payload.FromColumnID, tenant.ColumnID)
+	}
+
+	if payload.Card.ColumnID != second.String() {
+		t.Errorf("the card landed in %s, want %s", payload.Card.ColumnID, second)
+	}
+
+	// And the order a client would reconstruct from "put it after the anchor"
+	// is the order the database actually holds.
+	listed := mover.request(t, ctx, http.MethodGet, token, "/api/v1/columns/"+second.String()+"/cards", "")
+
+	var cards struct {
+		Cards []struct {
+			ID string `json:"id"`
+		} `json:"cards"`
+	}
+
+	if err := json.Unmarshal([]byte(listed.Body), &cards); err != nil {
+		t.Fatalf("decoding the column: %v", err)
+	}
+
+	got := make([]string, 0, len(cards.Cards))
+	for _, card := range cards.Cards {
+		got = append(got, card.ID)
+	}
+
+	want := []string{anchor.String(), tenant.CardID.String()}
+
+	t.Logf("the column reads %v", got)
+
+	if !slices.Equal(got, want) {
+		t.Errorf("the database order is %v; a client applying the event would have built %v", got, want)
+	}
+}
+
+// createdID pulls the id out of a 201 response's envelope.
+func createdID(t *testing.T, resp httpResult, envelope string) uuid.UUID {
+	t.Helper()
+
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("creating a %s: %d %s", envelope, resp.StatusCode, resp.Body)
+	}
+
+	var decoded map[string]struct {
+		ID string `json:"id"`
+	}
+
+	if err := json.Unmarshal([]byte(resp.Body), &decoded); err != nil {
+		t.Fatalf("decoding the %s: %v", envelope, err)
+	}
+
+	return uuid.MustParse(decoded[envelope].ID)
 }
 
 // TestTwoRapidMovesOfTheSameCardArriveInOrder is the ordering guarantee, stated
@@ -617,23 +737,10 @@ func TestTwoRapidMovesOfTheSameCardArriveInOrder(t *testing.T) {
 
 	// A second column to move between, created through the API — which also
 	// shows column.created reaching the same room.
-	created := mover.request(t, ctx, http.MethodPost, token,
-		"/api/v1/boards/"+tenant.BoardID.String()+"/columns", `{"name":"Doing"}`)
-	if created.StatusCode != http.StatusCreated {
-		t.Fatalf("creating a second column: %d %s", created.StatusCode, created.Body)
-	}
+	second := createdID(t, mover.request(t, ctx, http.MethodPost, token,
+		"/api/v1/boards/"+tenant.BoardID.String()+"/columns", `{"name":"Doing"}`), "column")
 
-	var columnResponse struct {
-		Column struct {
-			ID string `json:"id"`
-		} `json:"column"`
-	}
-
-	if err := json.Unmarshal([]byte(created.Body), &columnResponse); err != nil {
-		t.Fatalf("decoding the column: %v", err)
-	}
-
-	columns := [2]uuid.UUID{tenant.ColumnID, uuid.MustParse(columnResponse.Column.ID)}
+	columns := [2]uuid.UUID{tenant.ColumnID, second}
 
 	if frame := watcher.expect(FrameEvent, 10*time.Second); frame.Event.Type != "column.created" {
 		t.Fatalf("first event = %q, want column.created", frame.Event.Type)

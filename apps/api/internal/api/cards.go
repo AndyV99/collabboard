@@ -282,23 +282,25 @@ func moveCardHandler(logger *slog.Logger, tenantStore TenantStore, publisher Eve
 			return
 		}
 
-		card, ok := tenantScopedPublish(c, logger, tenantStore, publisher, "card.move.failed",
-			func(ctx context.Context, q store.Querier) (store.Card, error) {
+		moved, ok := tenantScopedPublish(c, logger, tenantStore, publisher, "card.move.failed",
+			func(ctx context.Context, q store.Querier) (movedCard, error) {
 				return moveCard(ctx, q, cardID, columnID, afterCardID)
 			},
-			// The anchor is echoed rather than re-derived, and it is accurate:
-			// MoveCard places the card strictly between this anchor and the next
-			// sibling, under the column lock, so at commit the anchor really is
-			// the card's predecessor. A rebalance may have renumbered the column
-			// afterwards, which changes every rank and no order — and clients
+			// The anchor is echoed rather than re-derived. MoveCard placed the
+			// card strictly between it and the next sibling, so it was the
+			// card's predecessor when the rank was computed — see
+			// cardMovedPayload for why that is not the same as a promise about
+			// the present. A rebalance may have renumbered the column
+			// afterwards, which changes every rank and no order, and clients
 			// never see a rank, so it needs no event of its own.
-			func(card store.Card) BoardEvent {
+			func(moved movedCard) BoardEvent {
 				return BoardEvent{
-					BoardID: card.BoardID,
+					BoardID: moved.card.BoardID,
 					Type:    eventCardMoved,
 					Payload: cardMovedPayload{
-						Card:        newCardBody(card),
-						AfterCardID: optionalID(afterCardID),
+						Card:         newCardBody(moved.card),
+						FromColumnID: moved.fromColumnID.String(),
+						AfterCardID:  optionalID(afterCardID),
 					},
 				}
 			})
@@ -306,7 +308,7 @@ func moveCardHandler(logger *slog.Logger, tenantStore TenantStore, publisher Eve
 			return
 		}
 
-		c.JSON(http.StatusOK, gin.H{subjectCard: newCardBody(card)})
+		c.JSON(http.StatusOK, gin.H{subjectCard: newCardBody(moved.card)})
 	}
 }
 
@@ -324,26 +326,26 @@ func moveCardHandler(logger *slog.Logger, tenantStore TenantStore, publisher Eve
 //
 // Only one lock is ever waited for while another is held, so there is no cycle
 // and no deadlock between two concurrent moves.
-func moveCard(ctx context.Context, q store.Querier, cardID, columnID uuid.UUID, afterCardID *uuid.UUID) (store.Card, error) {
+func moveCard(ctx context.Context, q store.Querier, cardID, columnID uuid.UUID, afterCardID *uuid.UUID) (movedCard, error) {
 	column, err := q.LockColumn(ctx, columnID)
 
 	target, err := asNotFound(subjectColumn, column, err)
 	if err != nil {
-		return store.Card{}, err
+		return movedCard{}, err
 	}
 
 	card, err := q.GetCard(ctx, cardID)
 
 	current, err := asNotFound(subjectCard, card, err)
 	if err != nil {
-		return store.Card{}, err
+		return movedCard{}, err
 	}
 
 	// Cards do not change board. The composite foreign key would reject it
 	// anyway; checking here is what turns that into a 409 with a sentence rather
 	// than a 500 with a constraint name in the log.
 	if current.BoardID != target.BoardID {
-		return store.Card{}, conflict("column_id names a column on a different board")
+		return movedCard{}, conflict("column_id names a column on a different board")
 	}
 
 	moved, err := q.MoveCard(ctx, store.MoveCardParams{
@@ -356,11 +358,11 @@ func moveCard(ctx context.Context, q store.Querier, cardID, columnID uuid.UUID, 
 		// The card exists, the column exists, and they share a board — so the
 		// only remaining reason for no row is the anchor. A client that dragged
 		// past a card someone else has just moved or deleted gets this.
-		return store.Card{}, conflict("after_card_id is not a card in that column")
+		return movedCard{}, conflict("after_card_id is not a card in that column")
 	}
 
 	if err != nil {
-		return store.Card{}, err
+		return movedCard{}, err
 	}
 
 	if moved.NeedsRebalance {
@@ -368,23 +370,37 @@ func moveCard(ctx context.Context, q store.Querier, cardID, columnID uuid.UUID, 
 		// writes every row in a column, and it must not run while another move
 		// is comparing against a rank it is about to rewrite.
 		if err := q.RebalanceColumnCards(ctx, columnID); err != nil {
-			return store.Card{}, err
+			return movedCard{}, err
 		}
 	}
 
-	return store.Card{
-		ID:          moved.ID,
-		TenantID:    moved.TenantID,
-		BoardID:     moved.BoardID,
-		ColumnID:    moved.ColumnID,
-		Title:       moved.Title,
-		Description: moved.Description,
-		Position:    moved.Position,
-		AssigneeID:  moved.AssigneeID,
-		DueAt:       moved.DueAt,
-		CreatedAt:   moved.CreatedAt,
-		UpdatedAt:   moved.UpdatedAt,
+	return movedCard{
+		card: store.Card{
+			ID:          moved.ID,
+			TenantID:    moved.TenantID,
+			BoardID:     moved.BoardID,
+			ColumnID:    moved.ColumnID,
+			Title:       moved.Title,
+			Description: moved.Description,
+			Position:    moved.Position,
+			AssigneeID:  moved.AssigneeID,
+			DueAt:       moved.DueAt,
+			CreatedAt:   moved.CreatedAt,
+			UpdatedAt:   moved.UpdatedAt,
+		},
+		// Read inside the same transaction, before the update. It is the only
+		// place the card's previous column still exists, and a client keeping
+		// one list per column needs it to know which list to take the card out
+		// of.
+		fromColumnID: current.ColumnID,
 	}, nil
+}
+
+// movedCard is a move's result: the card as it now is, and the column it came
+// from. The second half exists only for the event — see events.go.
+type movedCard struct {
+	card         store.Card
+	fromColumnID uuid.UUID
 }
 
 // deleteCardHandler removes a card.

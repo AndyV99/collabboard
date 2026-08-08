@@ -252,11 +252,17 @@ go test -tags=integration ./internal/realtime/... -count=1  # ~10s, Postgres + R
 | `harness_test.go` | — | the real router + real WebSockets over a memory bus and an RLS-modelling fake |
 | `realtime_integration_test.go` | `integration` | two instances over real Redis, authorization against live RLS, revocation in the database, latency, restart handover, rollback, ordering |
 
-Every event in every one of those tests exists because a card or column write
-committed. Nothing publishes directly except `publisher_test.go`, which is
-testing the adapter itself, and the two tests that deliberately drive
-`Hub.Publish` to model a mistake — see `bola_test.go`'s
-`TestTheRoomKeyIsWhatKeepsTenantsApart`.
+Every test that asserts something about the *write path* — fan-out, board
+isolation, cross-tenant refusal, ordering, rollback — drives it through
+`POST /api/v1/cards/:card_id/move` and gets its events because a row changed.
+
+`Hub.Publish` is still called directly in three places, all of them on purpose:
+the backpressure tests (`TestAFullSendBufferDropsTheClientAndNothingElse`,
+`TestASlowClientIsDroppedWithoutStallingOthers`), which need thousands of frames
+and care about buffers rather than about where a frame came from;
+`TestTheRoomKeyIsWhatKeepsTenantsApart`, which is deliberately modelling a
+mistake a correct publisher cannot make; and `publisher_test.go`, which is
+testing the adapter itself.
 
 The unit tests run against a `MemoryBus` and a fake store; the integration tests
 run the same code against real Redis and real policies. The fake could be wrong
@@ -301,7 +307,7 @@ has one decoder rather than two.
 |---|---|
 | `card.created` | `{"card": {…}}` — appended to the end of its column |
 | `card.updated` | `{"card": {…}}` — the whole card, not a field diff |
-| `card.moved` | `{"card": {…}, "after_card_id": "<uuid>"\|null}` |
+| `card.moved` | `{"card": {…}, "from_column_id": "…", "after_card_id": "<uuid>"\|null}` |
 | `card.deleted` | `{"card_id": "…", "column_id": "…"}` |
 | `column.created` | `{"column": {…}}` — appended to the end of the board |
 | `column.updated` | `{"column": {…}}` |
@@ -313,6 +319,18 @@ has one decoder rather than two.
 No rank is ever published — see [ADR 0004](../../../../docs/adr/0004-card-ordering.md).
 Project writes and board *creation* publish nothing: a room is a board, so at the
 moment a board is created there is nobody who could be watching it.
+
+Two things a client should not over-read:
+
+- **`after_card_id` describes the past.** It was a card in the target column when
+  the rank was computed. Another client can delete it or move it away before this
+  event is read, so a client that cannot find it should place the card first and
+  wait for the anchor's own event. The card's position on the server is settled
+  either way.
+- **`board.deleted` is the last `event` frame a room carries, not the last
+  frame.** Up to `REALTIME_REAUTHORIZE_INTERVAL` later the sweep finds the board
+  no longer resolves and sends `unsubscribed` / `forbidden` for it. That is
+  expected after a delete and is not an authorization failure.
 
 ### Ordering, exactly
 

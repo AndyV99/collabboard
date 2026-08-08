@@ -487,6 +487,13 @@ type boardCall struct {
 
 	// selfStatus is what the control must answer.
 	selfStatus int
+
+	// publishes is whether a successful call broadcasts. Stated per route
+	// rather than inferred from the method, because it is a decision — see
+	// events.go — and because "this write published nothing" has to be a
+	// failure somewhere, or the cross-tenant assertion below would also pass
+	// against a router that never published at all.
+	publishes bool
 }
 
 // boardCalls is every route mountBoardRoutes mounts that takes an object id.
@@ -533,17 +540,20 @@ func boardCalls() []boardCall {
 			ids:        func(o *tenantObjects) []any { return []any{o.board.ID} },
 			body:       func(*tenantObjects) any { return map[string]string{"name": "renamed by alice"} },
 			selfStatus: http.StatusOK,
+			publishes:  true,
 		},
 		{
 			name: "DELETE /boards/:id", method: http.MethodDelete, path: "/api/v1/boards/%s",
 			ids:        func(o *tenantObjects) []any { return []any{o.board.ID} },
 			selfStatus: http.StatusNoContent,
+			publishes:  true,
 		},
 		{
 			name: "POST /boards/:id/columns", method: http.MethodPost, path: "/api/v1/boards/%s/columns",
 			ids:        func(o *tenantObjects) []any { return []any{o.board.ID} },
 			body:       func(*tenantObjects) any { return map[string]string{"name": "column by alice"} },
 			selfStatus: http.StatusCreated,
+			publishes:  true,
 		},
 		{
 			name: "GET /boards/:id/columns", method: http.MethodGet, path: "/api/v1/boards/%s/columns",
@@ -560,23 +570,27 @@ func boardCalls() []boardCall {
 			ids:        func(o *tenantObjects) []any { return []any{o.column.ID} },
 			body:       func(*tenantObjects) any { return map[string]string{"name": "renamed by alice"} },
 			selfStatus: http.StatusOK,
+			publishes:  true,
 		},
 		{
 			name: "POST /columns/:id/move", method: http.MethodPost, path: "/api/v1/columns/%s/move",
 			ids:        func(o *tenantObjects) []any { return []any{o.column.ID} },
 			body:       func(*tenantObjects) any { return map[string]any{"after_column_id": nil} },
 			selfStatus: http.StatusOK,
+			publishes:  true,
 		},
 		{
 			name: "DELETE /columns/:id", method: http.MethodDelete, path: "/api/v1/columns/%s",
 			ids:        func(o *tenantObjects) []any { return []any{o.column.ID} },
 			selfStatus: http.StatusNoContent,
+			publishes:  true,
 		},
 		{
 			name: "POST /columns/:id/cards", method: http.MethodPost, path: "/api/v1/columns/%s/cards",
 			ids:        func(o *tenantObjects) []any { return []any{o.column.ID} },
 			body:       func(*tenantObjects) any { return map[string]string{"title": "card by alice"} },
 			selfStatus: http.StatusCreated,
+			publishes:  true,
 		},
 		{
 			name: "GET /columns/:id/cards", method: http.MethodGet, path: "/api/v1/columns/%s/cards",
@@ -593,6 +607,7 @@ func boardCalls() []boardCall {
 			ids:        func(o *tenantObjects) []any { return []any{o.card.ID} },
 			body:       func(*tenantObjects) any { return map[string]string{"title": "retitled by alice"} },
 			selfStatus: http.StatusOK,
+			publishes:  true,
 		},
 		{
 			// The move is the interesting one: it names two objects, so the
@@ -604,11 +619,13 @@ func boardCalls() []boardCall {
 				return map[string]any{"column_id": o.column.ID.String(), "after_card_id": nil}
 			},
 			selfStatus: http.StatusOK,
+			publishes:  true,
 		},
 		{
 			name: "DELETE /cards/:id", method: http.MethodDelete, path: "/api/v1/cards/%s",
 			ids:        func(o *tenantObjects) []any { return []any{o.card.ID} },
 			selfStatus: http.StatusNoContent,
+			publishes:  true,
 		},
 	}
 }
@@ -641,12 +658,23 @@ func TestBoardSurfaceControlWorks(t *testing.T) {
 				t.Errorf("a successful response carried none of alice's data: %s", rec.Body.String())
 			}
 
-			// The control for the fan-out half: a successful write really does
-			// broadcast, and always into alice's own room. Without this, "no
-			// event crossed the boundary" below would also hold for a router
-			// that published nothing at all.
-			for _, event := range f.events.published() {
+			// The control for the fan-out half. It has to assert a *count*:
+			// "no event crossed the boundary" in the next test would hold just
+			// as well against a router that published nothing at all, so the
+			// thing that rules that out is this — a write that should broadcast
+			// broadcasts exactly once, into alice's own room.
+			published := f.events.published()
+
+			for _, event := range published {
 				t.Logf("published %s to tenant %s / board %s", event.Type, event.TenantID, event.BoardID)
+			}
+
+			if call.publishes && len(published) != 1 {
+				t.Errorf("published %d events, want exactly 1: %+v", len(published), published)
+			}
+
+			if !call.publishes && len(published) != 0 {
+				t.Errorf("published %+v; this route is one of the ones that deliberately does not", published)
 			}
 
 			f.assertNoEventLeaked(t, 0)

@@ -19,10 +19,12 @@ package api
 // the same world, free to drift.
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"net/http"
+	"net/http/httptest"
 	"slices"
 	"sync"
 	"testing"
@@ -49,11 +51,22 @@ type recordingPublisher struct {
 
 	// entered is closed by the first publish that blocks.
 	entered chan struct{}
+
+	// What the publish's own context looked like, for the two guarantees the
+	// ADR makes about it: detached from the request's cancellation, and bounded.
+	ctxErr      error
+	ctxDeadline bool
+	ctxBudget   time.Duration
 }
 
-func (p *recordingPublisher) PublishBoardEvent(_ context.Context, event BoardEvent) error {
+func (p *recordingPublisher) PublishBoardEvent(ctx context.Context, event BoardEvent) error {
+	deadline, hasDeadline := ctx.Deadline()
+
 	p.mu.Lock()
 	p.events = append(p.events, event)
+	p.ctxErr = ctx.Err()
+	p.ctxDeadline = hasDeadline
+	p.ctxBudget = time.Until(deadline)
 	failWith := p.failWith
 	block, entered := p.block, p.entered
 	p.mu.Unlock()
@@ -192,6 +205,10 @@ func TestEveryBoardWritePublishesItsEvent(t *testing.T) {
 			assert: func(t *testing.T, f *boardFixture, payload map[string]any) {
 				card := object(t, payload, "card")
 				requireField(t, card, "column_id", f.alice.column.ID.String())
+
+				// Where it came from, so a client holding one list per column
+				// knows which list to take it out of without scanning them all.
+				requireField(t, payload, "from_column_id", f.alice.column.ID.String())
 
 				// Present *and* null. Absent would mean "no placement
 				// information"; null means "first in the column", and a client
@@ -435,12 +452,44 @@ func TestARolledBackWriteBroadcastsNothing(t *testing.T) {
 			body: func(*boardFixture) any { return map[string]string{"title": "never committed"} },
 		},
 		{
+			name: "a card update", method: http.MethodPatch,
+			path: func(f *boardFixture) string { return "/api/v1/cards/" + f.alice.card.ID.String() },
+			body: func(*boardFixture) any { return map[string]string{"title": "never committed"} },
+		},
+		{
 			name: "a card delete", method: http.MethodDelete,
 			path: func(f *boardFixture) string { return "/api/v1/cards/" + f.alice.card.ID.String() },
 		},
 		{
+			name: "a column create", method: http.MethodPost,
+			path: func(f *boardFixture) string { return "/api/v1/boards/" + f.alice.board.ID.String() + "/columns" },
+			body: func(*boardFixture) any { return map[string]string{"name": "never committed"} },
+		},
+		{
+			name: "a column update", method: http.MethodPatch,
+			path: func(f *boardFixture) string { return "/api/v1/columns/" + f.alice.column.ID.String() },
+			body: func(*boardFixture) any { return map[string]string{"name": "never committed"} },
+		},
+		{
+			name: "a column move", method: http.MethodPost,
+			path: func(f *boardFixture) string { return "/api/v1/columns/" + f.alice.column.ID.String() + "/move" },
+			body: func(*boardFixture) any { return map[string]any{"after_column_id": nil} },
+		},
+		{
 			name: "a column delete", method: http.MethodDelete,
 			path: func(f *boardFixture) string { return "/api/v1/columns/" + f.alice.column.ID.String() },
+		},
+		{
+			name: "a board update", method: http.MethodPatch,
+			path: func(f *boardFixture) string { return "/api/v1/boards/" + f.alice.board.ID.String() },
+			body: func(*boardFixture) any { return map[string]string{"name": "never committed"} },
+		},
+		{
+			// The one describe function that is not handed a row: it is handed
+			// the id the transaction proved was deletable. If the commit fails,
+			// that proof is worthless and the event must not go out anyway.
+			name: "a board delete", method: http.MethodDelete,
+			path: func(f *boardFixture) string { return "/api/v1/boards/" + f.alice.board.ID.String() },
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -571,6 +620,59 @@ func TestAFailedBroadcastDoesNotFailTheWrite(t *testing.T) {
 
 	if len(f.events.published()) != 1 {
 		t.Error("the publish was not attempted")
+	}
+}
+
+// TestTheBroadcastOutlivesTheRequestThatCausedIt covers the two properties of
+// the publish context that ADR 0005 promises and that nothing else would notice
+// the loss of.
+//
+// The common way a request context is cancelled is a client that hung up. By
+// then the write is committed and durable, so inheriting that cancellation would
+// mean one client closing its laptop is the reason every *other* client on the
+// board never hears about its last card move. And the detached context still has
+// to be bounded, or an unreachable Redis would hold the request open for as long
+// as the driver felt like.
+func TestTheBroadcastOutlivesTheRequestThatCausedIt(t *testing.T) {
+	t.Parallel()
+
+	f := newBoardFixture(t)
+
+	// A request whose context is already cancelled — the client is gone.
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+
+	body, err := json.Marshal(map[string]any{"column_id": f.alice.column.ID.String()})
+	if err != nil {
+		t.Fatalf("encoding the body: %v", err)
+	}
+
+	req := httptest.NewRequestWithContext(ctx, http.MethodPost,
+		"/api/v1/cards/"+f.alice.card.ID.String()+"/move", bytes.NewReader(body))
+	req.Header.Set("Authorization", "Bearer "+f.token)
+	req.Header.Set("Content-Type", "application/json")
+
+	rec := httptest.NewRecorder()
+	f.router.ServeHTTP(rec, req)
+
+	if len(f.events.published()) != 1 {
+		t.Fatal("nothing was published for a request whose caller had gone away")
+	}
+
+	t.Logf("the publish ran with err=%v, deadline set=%t, budget=%s",
+		f.events.ctxErr, f.events.ctxDeadline, f.events.ctxBudget.Round(time.Millisecond))
+
+	if f.events.ctxErr != nil {
+		t.Errorf("the publish inherited the request's cancellation (%v); "+
+			"one client hanging up would stop the board's other clients being told", f.events.ctxErr)
+	}
+
+	if !f.events.ctxDeadline {
+		t.Error("the publish context has no deadline; an unreachable broker would hold the request open")
+	}
+
+	if f.events.ctxBudget > publishTimeout {
+		t.Errorf("the publish budget is %s, over the %s bound", f.events.ctxBudget, publishTimeout)
 	}
 }
 

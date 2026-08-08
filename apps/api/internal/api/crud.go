@@ -15,7 +15,10 @@ package api
 // With twenty-odd handlers, "the tenant comes from the claim" stops being a fact
 // anyone can check by reading them all, and becomes a fact about one function.
 // `grep -n 'principal.TenantID' internal/api` is the audit, and it should return
-// this file and auth.go's members handler.
+// three places: this file, auth.go's members handler, and events.go — which is
+// the *second* thing a tenant id decides, because it is half of the realtime
+// room key. Both halves of that key have to come from the claim for the same
+// reason, and neither is reachable from a request.
 //
 // # Why an id in the path is not an authorization decision
 //

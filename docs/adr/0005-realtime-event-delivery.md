@@ -176,6 +176,14 @@ never hears about it.
   invert. It is narrow, it is not impossible, and it is not closed. When it
   happens, every client still agrees, and the disagreement with the database is
   corrected by the next event for that card or by any re-fetch.
+- **That a committed write always publishes.** A `COMMIT` that fails on a
+  network drop or a deadline may still have succeeded server-side. Postgres
+  reports an error, `WithTenant` returns it, the client gets a 500, and nothing
+  is broadcast for a write that is in fact durable. It is the exact dual of the
+  failure this ADR is built around, it is much rarer, and — because the write is
+  real — the client that retries succeeds or gets a 409 rather than corrupting
+  anything. An outbox would not fix it either: the outbox row would be lost with
+  the same indeterminate commit.
 - **Delivery.** At-most-once, as it was before this change.
 
 Last-writer-wins at the granularity of one card is already the semantic ADR 0004
@@ -212,6 +220,19 @@ decoder, and a field added to a response cannot silently fail to appear in the
 event that announces it. Deletes carry ids only. Moves carry the anchor the mover
 named, with an explicit `null` for "first"; the rank is never published, for the
 reasons ADR 0004 gives.
+
+Anything that leaves a column names the column it left — `card.moved` carries
+`from_column_id`, `card.deleted` carries `column_id` — because a client keeping
+one list per column would otherwise scan every column to find the row it is
+removing, and the server already knows.
+
+The anchor is a statement about the past, not the present: it was a card in the
+target column when the new rank was computed, under that column's lock. Nothing
+stops another client deleting it or moving it away before this event is read —
+`moveCard` holds a lock on the *destination* column, and neither `DeleteCard` nor
+a move of the anchor *out* of that column takes it. A client that cannot find the
+anchor should place the card first and let the anchor's own event correct it. The
+card's rank is unaffected either way; it was computed and committed already.
 
 Events go to a board room, and room membership already implies authorization:
 `StoreAuthorizer` admits a subscriber only if the board resolves inside their own

@@ -82,8 +82,10 @@ const (
 // It is short on purpose. The write has already committed and the response is
 // waiting behind this call, so an unreachable Redis must cost a card move a
 // bounded pause rather than the driver's own timeouts stacked end to end. Two
-// seconds is far above the measured cost of a PUBLISH (sub-millisecond, see
-// internal/realtime/README.md) and far below anything a user would call a hang.
+// seconds is far above the whole cross-instance path, which
+// internal/realtime/README.md measures at a p50 of about 1.5 ms — an authorized
+// HTTP request, the PUBLISH, another instance's fan-out and the client's frame —
+// and far below anything a user would call a hang.
 const publishTimeout = 2 * time.Second
 
 // BoardEvent is one committed change, addressed to the board whose watchers
@@ -106,9 +108,13 @@ type BoardEvent struct {
 	// cannot address a room outside the caller's own tenant.
 	BoardID uuid.UUID
 
-	// Type is one of the event constants above. The zero value means "nothing
-	// to announce": [publishBoardEvent] returns without publishing, which is how
-	// a write that turns out to have nothing worth broadcasting says so.
+	// Type is one of the event constants above, and is required.
+	//
+	// There is deliberately no "nothing to announce" value. A handler that
+	// should not broadcast does not call [tenantScopedPublish] at all, and an
+	// empty type here is a wiring bug — one the publisher refuses and logs,
+	// rather than one that turns a committed write into silence. That is the
+	// same choice [realtime.Hub.Publish] makes for a room with a zero half.
 	Type string
 
 	// Payload is the event-specific body. It is rendered to JSON by the
@@ -147,6 +153,10 @@ type EventPublisher interface {
 //     `null` for "first". It is not omitted, because absent and null mean
 //     different things here and a client must be able to tell them apart. The
 //     rank itself is never published — ADR 0004.
+//   - Anything that leaves a column says which column it left:
+//     `card.moved.from_column_id` and `card.deleted.column_id`. A client keeping
+//     one list per column would otherwise have to scan every column to find the
+//     row it is removing, and the server already knows the answer.
 //   - A `*.deleted` payload carries ids only. There is nothing left to render,
 //     and a client removes by id.
 type (
@@ -155,14 +165,26 @@ type (
 		Card cardBody `json:"card"`
 	}
 
-	// cardMovedPayload announces a move: the card as it now is, and where it
-	// landed relative to its new neighbour.
+	// cardMovedPayload announces a move: the card as it now is, where it came
+	// from, and where it landed relative to its new neighbour.
 	cardMovedPayload struct {
 		Card cardBody `json:"card"`
+
+		// FromColumnID is the column the card was in before this move. It is
+		// equal to Card.ColumnID for a reorder within one column, which is the
+		// signal a client uses to skip removing and re-adding it.
+		FromColumnID string `json:"from_column_id"`
 
 		// AfterCardID is the card this one now sits behind, or null for first
 		// in the column. Applying "put this card after that one" reproduces the
 		// server's order without the client knowing any rank.
+		//
+		// It is the anchor the mover named, and it was a card in the target
+		// column when the new rank was computed. It is not a promise about the
+		// present: nothing stops the anchor being deleted or moved away by
+		// another client before this event is read, and a client that cannot
+		// find it should place the card first and wait for the anchor's own
+		// event.
 		AfterCardID *string `json:"after_card_id"`
 	}
 
@@ -204,8 +226,11 @@ type (
 	// boardDeletedPayload announces that the board this room is about is gone.
 	//
 	// Like a deleted column it is one event rather than a cascade of them, and
-	// it is the last event the room will ever carry: a client should stop
-	// showing the board rather than try to reconcile it.
+	// it is the last *event* the room will ever carry: a client should stop
+	// showing the board rather than try to reconcile it. It is not the last
+	// frame — up to REALTIME_REAUTHORIZE_INTERVAL later the connection's sweep
+	// finds the board no longer resolves and unsubscribes it with reason
+	// "forbidden", which after a delete is expected rather than a refusal.
 	boardDeletedPayload struct {
 		BoardID string `json:"board_id"`
 	}
@@ -231,7 +256,10 @@ func optionalID(id *uuid.UUID) *string {
 // trace ids, the logger's handler context — are kept, so the publish is still
 // correlated with the request that caused it.
 func publishBoardEvent(c *gin.Context, logger *slog.Logger, publisher EventPublisher, event BoardEvent) {
-	if publisher == nil || event.Type == "" {
+	// No publisher means realtime is not configured — the health-only router
+	// several tests build. NewRouter says so at startup when that combination
+	// would be a production wiring bug.
+	if publisher == nil {
 		return
 	}
 
@@ -239,6 +267,19 @@ func publishBoardEvent(c *gin.Context, logger *slog.Logger, publisher EventPubli
 	if !ok {
 		// Unreachable: tenantScoped refused the write without a principal. A
 		// silent return is still better than publishing an event with no actor.
+		return
+	}
+
+	if event.Type == "" {
+		// A describe function that did not name its event. Not silently
+		// dropped: a committed write that announces nothing is the failure this
+		// file exists to make impossible, so it is an error line rather than an
+		// absence somebody has to notice.
+		logger.ErrorContext(c.Request.Context(), "refusing to publish an event with no type",
+			slog.String("event", "realtime.publish.untyped"),
+			slog.String("path", c.FullPath()),
+		)
+
 		return
 	}
 
