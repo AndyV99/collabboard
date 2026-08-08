@@ -92,9 +92,9 @@ jobs:
 
       # 2. Unit test. Deliberately no Postgres/Redis service containers: nothing
       # here needs them, and internal/store's database-backed tests skip when no
-      # DSN resolves. The harness that gives CI a real database is the
-      # Testcontainers work in #7, which brings its own job rather than making
-      # every PR pay for services it does not use.
+      # DSN resolves. The real database lives in the `integration` job below,
+      # which brings its own Postgres through Testcontainers rather than making
+      # this job wait on a container it does not use.
       - name: go test
         run: go test ./... -race
 
@@ -123,6 +123,68 @@ jobs:
 
       - name: sqlc diff (committed generated code is up to date)
         run: sqlc diff
+
+  # Stage 5 of CI-CD Standards.md: real dependencies, not mocks.
+  #
+  # Its own job rather than a step in `api`, for two reasons. It runs in
+  # parallel, so a container bring-up never delays the lint/build/vulncheck
+  # feedback that `api` gives in a couple of minutes. And it reports its own
+  # conclusion in the checks list, so "tenant isolation broke" is legible on the
+  # PR without opening a log — folded into `api` it would read as "api failed",
+  # which is where the fast checks live and is not where anyone would look.
+  #
+  # The cost of splitting is a second checkout and a second Go toolchain setup
+  # (~20s, mostly cache-warm). That is cheap against the two properties above.
+  integration:
+    name: integration
+    needs: changes
+    # Same gate as `api`, so a web-only PR skips this too. `ci` treats a skipped
+    # need as success, so skipping here does not wedge the required check.
+    if: needs.changes.outputs.api == 'true'
+    runs-on: ubuntu-latest
+    # Cold run is checkout + toolchain + module download + a postgres:16-alpine
+    # and a Ryuk pull + migrations + the suite: minutes, not tens of minutes.
+    # 20 leaves room for a slow image pull while still failing a wedged Docker
+    # daemon quickly instead of sitting on the default 360.
+    timeout-minutes: 20
+    defaults:
+      run:
+        working-directory: apps/api
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-go@v7
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          # Same key as the `api` job, so the two share one module/build cache
+          # rather than each populating its own copy.
+          cache-dependency-path: apps/api/go.sum
+
+      # No `services:` block on purpose. The harness starts its own Postgres on
+      # a random port through Testcontainers, so a services container would be a
+      # second database nothing connects to — and it would hide the case where
+      # the harness is misconfigured and silently falls back to something else.
+      #
+      # No TESTCONTAINERS_* configuration either. ubuntu-latest exposes the
+      # daemon at the default /var/run/docker.sock, which Testcontainers finds
+      # unaided. Ryuk in particular is left ENABLED: it is the backstop
+      # pgtest.DB.Close documents for the case where a panic on a test goroutine
+      # kills the process before any defer runs. The job's VM is destroyed
+      # afterwards either way, so disabling it would buy nothing and would make
+      # CI exercise a different teardown path than a developer's machine.
+      #
+      # -count=1 is load-bearing, not habit: setup-go restores the build cache,
+      # and a cached PASS from a previous run would let this job report success
+      # against a database it never started.
+      #
+      # -v because the point of this job is that specific assertions ran. A bare
+      # `ok` line is identical whether the isolation matrix executed or the
+      # package quietly had nothing to do; the subtest names in the log are the
+      # evidence. Race detection is deliberately left to the `api` job's unit
+      # run — nothing here spawns a goroutine, so -race would only slow the
+      # container-bound suite down.
+      - name: go test -tags=integration
+        run: go test -tags=integration -count=1 -v ./...
 
   web:
     name: web
@@ -202,7 +264,7 @@ jobs:
   # `skipped` needs are treated as success; only `failure` or `cancelled` fail.
   ci:
     name: ci
-    needs: [changes, api, web]
+    needs: [changes, api, integration, web]
     if: always()
     runs-on: ubuntu-latest
     timeout-minutes: 5
