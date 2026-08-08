@@ -1,0 +1,61 @@
+version: "2"
+
+run:
+  timeout: 3m
+  tests: true
+
+linters:
+  default: standard
+  enable:
+    # Correctness
+    - bodyclose
+    - contextcheck
+    - durationcheck
+    - errorlint
+    - noctx
+    - nilerr
+    - rowserrcheck
+    - sqlclosecheck
+    # Security
+    - gosec
+    # Style / maintainability
+    - copyloopvar
+    - goconst
+    - misspell
+    - nolintlint
+    - revive
+    - unconvert
+    - wsl_v5
+  settings:
+    errcheck:
+      check-type-assertions: true
+    goconst:
+      min-occurrences: 3
+    gosec:
+      excludes:
+        # G104 duplicates errcheck.
+        - G104
+    nolintlint:
+      require-explanation: true
+      require-specific: true
+    revive:
+      rules:
+        - name: exported
+        - name: package-comments
+  exclusions:
+    rules:
+      # Table-driven tests reuse literals freely; magic-number-ish constants in
+      # assertions are clearer inline than named.
+      - path: _test\.go
+        linters:
+          - goconst
+          - gosec
+
+formatters:
+  enable:
+    - gofmt
+    - goimports
+  settings:
+    goimports:
+      local-prefixes:
+        - github.com/AndyV99/collabboard/apps/api
