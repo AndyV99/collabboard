@@ -98,14 +98,19 @@ COMMENT ON SCHEMA auth IS
 -- a stolen credential, and nothing but this migration ever needs to act as it.
 --
 -- Guarded because CREATE ROLE has no IF NOT EXISTS and Terraform may have
--- provisioned it (issue #14). The unconditional ALTER below is the load-bearing
--- half: it asserts the attributes this path's safety depends on however the
--- role came to exist.
+-- provisioned it (issue #14). The negative attributes are stated on the CREATE
+-- because that is the only statement here that may choose them; the ALTER and
+-- the assertion below split for the reason 00001 explains.
 -- +goose StatementBegin
 DO $$
 BEGIN
     IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'collabboard_credentials') THEN
-        CREATE ROLE collabboard_credentials;
+        CREATE ROLE collabboard_credentials
+            NOSUPERUSER
+            NOBYPASSRLS
+            NOCREATEDB
+            NOCREATEROLE
+            NOREPLICATION;
     END IF;
 END
 $$;
@@ -113,12 +118,35 @@ $$;
 
 ALTER ROLE collabboard_credentials
     NOLOGIN
-    NOSUPERUSER
-    NOBYPASSRLS
-    NOCREATEDB
     NOCREATEROLE
-    NOREPLICATION
     NOINHERIT;
+
+-- +goose StatementBegin
+DO $$
+DECLARE
+    offending text;
+BEGIN
+    SELECT string_agg(a.attribute, ', ' ORDER BY a.attribute)
+      INTO offending
+      FROM pg_roles r
+      CROSS JOIN LATERAL (
+          VALUES ('SUPERUSER', r.rolsuper),
+                 ('BYPASSRLS', r.rolbypassrls),
+                 ('CREATEDB', r.rolcreatedb),
+                 ('REPLICATION', r.rolreplication)
+      ) AS a(attribute, is_held)
+     WHERE r.rolname = 'collabboard_credentials'
+       AND a.is_held;
+
+    IF offending IS NOT NULL THEN
+        RAISE EXCEPTION
+            'collabboard_credentials holds %, so the credential functions it owns would not be bounded by the schema and policy boundaries this migration builds',
+            offending
+            USING HINT = 'Provision collabboard_credentials without those attributes. See apps/api/scripts/provision/bootstrap-owner.sql and docs/adr/0005-database-role-provisioning.md.';
+    END IF;
+END
+$$;
+-- +goose StatementEnd
 
 -- Reassigning ownership of a function requires the migration role to be able to
 -- SET ROLE to the new owner. Same reasoning, and same deliberate non-revoke, as
