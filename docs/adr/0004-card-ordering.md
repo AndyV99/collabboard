@@ -86,6 +86,25 @@ one of the bounds, and two cards end up with the same rank. With `*` `0.5` the
 scale grows by exactly one decimal place per subdivision and the midpoint is
 always strictly between its neighbours.
 
+Measured rather than reasoned about, on postgres:16-alpine — subdividing the gap
+between 1 and 2 repeatedly, both ways:
+
+```
+ step |      div_gap       | div_scale | mul_collapsed | mul_scale
+------+--------------------+-----------+---------------+-----------
+    0 |                  1 |         0 | f             |         0
+   10 | 0.0009765625000000 |        16 | f             |        10
+   30 | 0.0000000009313225 |        16 | f             |        30
+   50 | 0.0000000000000008 |        16 | f             |        50
+   53 | 0.0000000000000001 |        16 | f             |        53
+   54 | 0.0000000000000000 |        16 | f             |        54
+   60 | 0.0000000000000000 |        16 | f             |        60
+```
+
+The `/` scale is pinned at 16 and the gap reaches zero at step 54 — from there
+every "midpoint" equals a bound. The `*` scale tracks the step count and the gap
+never collapses.
+
 **2. Position allocation is serialised on the parent row, not on the siblings.**
 
 Every statement that allocates a position — creating a card, moving a card,
