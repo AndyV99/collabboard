@@ -11,10 +11,11 @@ import (
 
 // NewRouter builds the Gin engine with the service's middleware and routes.
 //
-// Auth is optional so that a build without it — the health-only configuration
-// the tests for /healthz use — still produces a working engine rather than a
-// nil dereference on the first request. In cmd/api it is always supplied.
-func NewRouter(logger *slog.Logger, deps HealthDeps, authDeps AuthDeps) *gin.Engine {
+// Auth and realtime are optional so that a build without them — the health-only
+// configuration the tests for /healthz use — still produces a working engine
+// rather than a nil dereference on the first request. In cmd/api both are
+// always supplied.
+func NewRouter(logger *slog.Logger, deps HealthDeps, authDeps AuthDeps, realtimeDeps RealtimeDeps) *gin.Engine {
 	router := gin.New()
 
 	// Gin trusts X-Forwarded-For from every peer by default, which makes
@@ -63,6 +64,22 @@ func NewRouter(logger *slog.Logger, deps HealthDeps, authDeps AuthDeps) *gin.Eng
 
 	if authDeps.Store != nil {
 		authenticated.GET("/members", membersHandler(logger, authDeps.Store))
+	}
+
+	// The WebSocket upgrade is authenticated by the *same* requireAuth as every
+	// route above, with the same verifier. It is mounted outside the group only
+	// so that websocketBearer can run first — see realtime.go for why a browser
+	// needs it and why it is not a second credential.
+	if realtimeDeps.Connect != nil {
+		v1.GET("/ws", websocketBearer(), requireAuth(logger, authDeps.Verifier), realtimeDeps.Connect)
+	}
+
+	// A board id in the path, which is fine and is not the thing
+	// auth_bola_test.go forbids: boards are objects inside a tenant, and this
+	// one is authorized against the caller's own tenant before anything
+	// happens. An *organization* in the path is what remains impossible.
+	if realtimeDeps.PublishEvent != nil {
+		authenticated.POST("/boards/:board_id/events", realtimeDeps.PublishEvent)
 	}
 
 	return router

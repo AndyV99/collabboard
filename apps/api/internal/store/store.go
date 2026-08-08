@@ -65,6 +65,16 @@ var (
 	ErrNilFunc = errors.New("store: callback is required")
 )
 
+// ErrNoRows is what a :one query returns when it matched nothing.
+//
+// Re-exported rather than left as pgx.ErrNoRows because .golangci.yml's
+// depguard rule forbids importing pgx outside this package — that is what stops
+// a handler from being handed a pool and writing raw SQL — and "no such row" is
+// a distinction callers legitimately need. Under row-level security it is also
+// the *usual* answer for a row belonging to another tenant, so a caller that
+// cannot name it cannot tell "not yours" from "the database is broken".
+var ErrNoRows = pgx.ErrNoRows
+
 // setTenantSQL scopes the transaction to one tenant.
 //
 // SET LOCAL takes a literal and cannot be parameterised, and interpolating a

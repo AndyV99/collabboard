@@ -137,6 +137,10 @@ func (q recordingQuerier) GetBoard(context.Context, uuid.UUID) (store.Board, err
 	panic("recordingQuerier: not modelled")
 }
 
+func (q recordingQuerier) GetMembership(context.Context, uuid.UUID) (store.Membership, error) {
+	panic("recordingQuerier: not modelled")
+}
+
 func (q recordingQuerier) ListColumnsByBoard(context.Context, uuid.UUID) ([]store.Column, error) {
 	panic("recordingQuerier: not modelled")
 }
@@ -237,7 +241,7 @@ func newBOLAFixture(t *testing.T) *bolaFixture {
 
 	router := NewRouter(discardLogger(),
 		HealthDeps{Postgres: stubPinger{}, Redis: stubPinger{}},
-		AuthDeps{Service: service, Verifier: issuer, Store: tenantStore})
+		AuthDeps{Service: service, Verifier: issuer, Store: tenantStore}, RealtimeDeps{})
 
 	token, _, err := issuer.Issue(auth.Principal{
 		UserID:    alice,

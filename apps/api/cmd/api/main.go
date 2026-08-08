@@ -37,6 +37,7 @@ import (
 	"github.com/AndyV99/collabboard/apps/api/internal/config"
 	"github.com/AndyV99/collabboard/apps/api/internal/logging"
 	"github.com/AndyV99/collabboard/apps/api/internal/migrate"
+	"github.com/AndyV99/collabboard/apps/api/internal/realtime"
 	"github.com/AndyV99/collabboard/apps/api/internal/store"
 )
 
@@ -122,10 +123,18 @@ func runServe(logger *slog.Logger, cfg config.Config) error {
 		return err
 	}
 
+	hub, err := newHub(logger, cfg.Realtime, dataStore, redisClient)
+	if err != nil {
+		return err
+	}
+
 	router := api.NewRouter(logger, api.HealthDeps{
 		Postgres: pgxPinger{pool: pool},
 		Redis:    redisPinger{client: redisClient},
-	}, authDeps)
+	}, authDeps, api.RealtimeDeps{
+		Connect:      hub.ConnectHandler(),
+		PublishEvent: hub.PublishHandler(),
+	})
 
 	server := &http.Server{
 		Addr:              cfg.HTTP.Addr(),
@@ -133,11 +142,71 @@ func runServe(logger *slog.Logger, cfg config.Config) error {
 		ReadHeaderTimeout: cfg.HTTP.ReadHeaderTimeout,
 	}
 
-	return serve(ctx, logger, server, cfg.HTTP.ShutdownTimeout)
+	// The hub drains before the HTTP server does, and that order is
+	// load-bearing rather than tidy. A WebSocket is a hijacked connection, and
+	// http.Server.Shutdown neither closes nor waits for those — it would return
+	// "done" with every socket still open, and the process would then exit and
+	// reset them. Draining the hub first means every client gets a shutdown
+	// frame with a jittered reconnect delay and a Going Away close, which is
+	// the difference between a rolling deploy nobody notices and a synchronised
+	// reconnect storm. See internal/realtime/README.md.
+	drain := func(drainCtx context.Context) {
+		if err := hub.Shutdown(drainCtx); err != nil {
+			logger.Error("draining the realtime hub", slog.Any("error", err))
+		}
+	}
+
+	return serve(ctx, logger, server, cfg.HTTP.ShutdownTimeout, drain)
+}
+
+// newHub builds the WebSocket hub. Wiring only: every decision it encodes lives
+// in internal/realtime.
+func newHub(
+	logger *slog.Logger,
+	cfg config.RealtimeConfig,
+	dataStore *store.Store,
+	redisClient *redis.Client,
+) (*realtime.Hub, error) {
+	broker, err := realtime.NewRedisBroker(realtime.RedisBrokerConfig{
+		Client: redisClient,
+		Logger: logger,
+		Buffer: cfg.BrokerBuffer,
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	hub, err := realtime.NewHub(realtime.HubConfig{
+		Broker:                broker,
+		Authorizer:            realtime.NewStoreAuthorizer(dataStore),
+		Logger:                logger,
+		SendBuffer:            cfg.SendBuffer,
+		PingInterval:          cfg.PingInterval,
+		PongTimeout:           cfg.PongTimeout,
+		WriteTimeout:          cfg.WriteTimeout,
+		ReadLimit:             int64(cfg.ReadLimit),
+		ReauthorizeInterval:   cfg.ReauthorizeInterval,
+		MaxRoomsPerConnection: cfg.MaxRoomsPerConnection,
+		AllowedOrigins:        cfg.AllowedOrigins,
+		ShutdownReconnectHint: cfg.ShutdownReconnectHint,
+	})
+	if err != nil {
+		return nil, errors.Join(err, broker.Close())
+	}
+
+	return hub, nil
 }
 
 // serve runs the HTTP server until the context is cancelled, then drains it.
-func serve(ctx context.Context, logger *slog.Logger, server *http.Server, shutdownTimeout time.Duration) error {
+//
+// drain runs before the HTTP shutdown and shares its deadline.
+func serve(
+	ctx context.Context,
+	logger *slog.Logger,
+	server *http.Server,
+	shutdownTimeout time.Duration,
+	drain func(context.Context),
+) error {
 	errCh := make(chan error, 1)
 
 	go func() {
@@ -162,6 +231,10 @@ func serve(ctx context.Context, logger *slog.Logger, server *http.Server, shutdo
 	// in-flight requests shutdownTimeout to finish.
 	shutdownCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), shutdownTimeout)
 	defer cancel()
+
+	if drain != nil {
+		drain(shutdownCtx)
+	}
 
 	if err := server.Shutdown(shutdownCtx); err != nil {
 		return err

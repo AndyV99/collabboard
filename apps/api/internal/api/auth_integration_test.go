@@ -143,7 +143,8 @@ func newServer(t *testing.T, limits auth.RateLimitConfig) *server {
 
 	router := api.NewRouter(logger,
 		api.HealthDeps{},
-		api.AuthDeps{Service: service, Verifier: issuer, Store: dataStore})
+		api.AuthDeps{Service: service, Verifier: issuer, Store: dataStore},
+		api.RealtimeDeps{})
 
 	httpServer := httptest.NewServer(router)
 	t.Cleanup(httpServer.Close)
