@@ -113,3 +113,5 @@ cd apps/web && npx create-next-app@latest . --typescript
 - API: `go build ./...` · `go test ./...` · `go test -tags=integration ./...` · `golangci-lint run` · `sqlc generate`
 - Web: `npm run dev` · `npm test` · `npm run lint`
 - E2E: `npx playwright test` (needs both services, or the compose stack)
+
+<!-- path-filter demo, throwaway -->
