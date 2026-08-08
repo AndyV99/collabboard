@@ -60,8 +60,7 @@ function Body({ probe }: { probe: HealthProbe }) {
       <p className={styles.explanation}>
         Could not reach the API. Start it with{" "}
         <code>go run ./cmd/api</code> from <code>apps/api</code>, or point{" "}
-        <code>NEXT_PUBLIC_API_URL</code> at a running instance. Details:{" "}
-        {probe.error}
+        <code>API_URL</code> at a running instance. Details: {probe.error}
       </p>
     );
   }
@@ -70,8 +69,8 @@ function Body({ probe }: { probe: HealthProbe }) {
     return (
       <p className={styles.explanation}>
         The API answered, but the response did not look like{" "}
-        <code>/healthz</code>. Check that <code>NEXT_PUBLIC_API_URL</code>{" "}
-        points at the CollabBoard API. Details: {probe.error}
+        <code>/healthz</code>. Check that <code>API_URL</code> points at the
+        CollabBoard API. Details: {probe.error}
       </p>
     );
   }

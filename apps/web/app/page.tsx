@@ -15,6 +15,12 @@ export default async function Home() {
   // Health is a live fact about right now, so the page must never be captured
   // into a prerender at build time. `connection()` is the Next 16 way to say
   // that (it replaces `unstable_noStore` and survives Cache Components).
+  //
+  // It is also what makes `API_URL` a runtime value: env reads are only
+  // request-time reads on a dynamically rendered page. If this page were ever
+  // statically optimised, the base URL would be resolved by the build worker
+  // and frozen into the prerendered HTML — the exact failure #16 fixed. The
+  // build output must keep showing `ƒ /`, not `○ /`.
   await connection();
 
   const probe = await probeHealth();
