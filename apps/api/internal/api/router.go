@@ -15,7 +15,19 @@ import (
 // configuration the tests for /healthz use — still produces a working engine
 // rather than a nil dereference on the first request. In cmd/api both are
 // always supplied.
-func NewRouter(logger *slog.Logger, deps HealthDeps, authDeps AuthDeps, realtimeDeps RealtimeDeps) *gin.Engine {
+//
+// limits is configuration rather than a dependency, which is why it comes first
+// and not as another Deps struct. Its zero value is a working pair of limits,
+// not an absent one — see [BodyLimits].
+func NewRouter(
+	logger *slog.Logger,
+	limits BodyLimits,
+	deps HealthDeps,
+	authDeps AuthDeps,
+	realtimeDeps RealtimeDeps,
+) *gin.Engine {
+	limits = limits.resolved()
+
 	router := gin.New()
 
 	// Gin trusts X-Forwarded-For from every peer by default, which makes
@@ -35,7 +47,15 @@ func NewRouter(logger *slog.Logger, deps HealthDeps, authDeps AuthDeps, realtime
 
 	// gin.Logger writes unstructured text to stdout, which would violate the
 	// structured-logging standard; requestLogger replaces it.
-	router.Use(requestLogger(logger), recovery(logger))
+	//
+	// limitRequestBody comes last of the three and applies to everything after
+	// it, including /healthz and the WebSocket upgrade. Last because the other
+	// two have to wrap it: a body refused with 413 is still a request the log
+	// should show, and recovery has to be above anything that can panic. It
+	// cannot go any lower — a limit mounted on the authenticated group would
+	// leave the four routes an anonymous caller can actually reach as the only
+	// unbounded ones, which is the entire vulnerability.
+	router.Use(requestLogger(logger), recovery(logger), limitRequestBody(limits.Default))
 
 	router.GET("/healthz", healthHandler(logger, deps))
 
@@ -49,10 +69,16 @@ func NewRouter(logger *slog.Logger, deps HealthDeps, authDeps AuthDeps, realtime
 	// why the rate limiter lives inside internal/auth rather than as middleware
 	// here: it has to key on the account being attempted, and only the service
 	// knows how to normalise that.
-	v1.POST("/auth/register", registerHandler(logger, authDeps.Service))
-	v1.POST("/auth/login", loginHandler(logger, authDeps.Service))
-	v1.POST("/auth/refresh", refreshHandler(logger, authDeps.Service))
-	v1.POST("/auth/logout", logoutHandler(logger, authDeps.Service))
+	//
+	// They are the only routes with a second, tighter body limit, for the same
+	// reason they are the only ones with a rate limiter: they are what an
+	// anonymous caller can reach. The tighter reader wraps the global one, so it
+	// is the one that trips first.
+	unauthenticated := v1.Group("", limitRequestBody(limits.Unauthenticated))
+	unauthenticated.POST("/auth/register", registerHandler(logger, authDeps.Service))
+	unauthenticated.POST("/auth/login", loginHandler(logger, authDeps.Service))
+	unauthenticated.POST("/auth/refresh", refreshHandler(logger, authDeps.Service))
+	unauthenticated.POST("/auth/logout", logoutHandler(logger, authDeps.Service))
 
 	// Everything below requires a valid access token, and takes its tenant from
 	// that token's org claim. There is no route parameter for an organization

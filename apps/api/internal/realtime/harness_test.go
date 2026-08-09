@@ -351,6 +351,7 @@ func newInstance(t *testing.T, opts instanceOptions) *instance {
 	// endpoint: the only way anything reaches the fan-out in these tests is a
 	// card write that committed, which is the whole point of the issue.
 	router := api.NewRouter(discardLogger(),
+		api.BodyLimits{},
 		api.HealthDeps{},
 		api.AuthDeps{Service: stubAuthService{}, Verifier: opts.issuer, Store: opts.store},
 		api.RealtimeDeps{Connect: hub.ConnectHandler(), Publisher: hub.EventPublisher()})
