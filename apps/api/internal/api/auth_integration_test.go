@@ -108,8 +108,19 @@ type server struct {
 
 // newServer builds the router the way cmd/api does, with the login budgets a
 // test asks for.
-func newServer(t *testing.T, limits auth.RateLimitConfig) *server {
+//
+// wrapAuthStore, when supplied, sits between the auth service and the real
+// store. Exactly one test uses it — the one that has to make registration's
+// second transaction fail on purpose (issue #34) — and it is a parameter rather
+// than a field on the service because the seam being exercised *is* the boundary
+// between the auth service and the store. The router's own store stays the real
+// one, so only the flow under test can be interfered with.
+func newServer(t *testing.T, limits auth.RateLimitConfig, wrapAuthStore ...func(*store.Store) auth.Store) *server {
 	t.Helper()
+
+	if len(wrapAuthStore) > 1 {
+		t.Fatalf("newServer takes at most one auth-store wrapper, got %d", len(wrapAuthStore))
+	}
 
 	logs := &bytes.Buffer{}
 	logger := slog.New(slog.NewJSONHandler(logs, &slog.HandlerOptions{Level: slog.LevelDebug}))
@@ -127,8 +138,13 @@ func newServer(t *testing.T, limits auth.RateLimitConfig) *server {
 		t.Fatalf("building the issuer: %v", err)
 	}
 
+	var authStore auth.Store = dataStore
+	if len(wrapAuthStore) == 1 {
+		authStore = wrapAuthStore[0](dataStore)
+	}
+
 	service, err := auth.NewService(auth.ServiceDeps{
-		Store:      dataStore,
+		Store:      authStore,
 		Deriver:    auth.NewArgon2Deriver(4),
 		Issuer:     issuer,
 		Sessions:   auth.NewSessionStore(kv, time.Hour),
@@ -761,6 +777,15 @@ func TestNoTokenOrPasswordMaterialReachesTheLogs(t *testing.T) {
 	s.do(t, http.MethodPost, "/api/v1/auth/refresh", "",
 		map[string]string{"refresh_token": alice.refreshToken})
 
+	// The fourth endpoint that takes a password (issue #34), on both of its
+	// interesting paths: a wrong password, and a correct one that is refused
+	// because the account already has an organization. Both log, and neither
+	// may log the credential.
+	s.do(t, http.MethodPost, "/api/v1/organizations", "",
+		map[string]string{"email": alice.email, "password": "wrong"})
+	s.do(t, http.MethodPost, "/api/v1/organizations", "",
+		map[string]string{"email": alice.email, "password": integrationPass})
+
 	output := s.logs.String()
 
 	t.Logf("%d bytes of server log emitted during the flow", len(output))
@@ -780,7 +805,10 @@ func TestNoTokenOrPasswordMaterialReachesTheLogs(t *testing.T) {
 		}
 	}
 
-	for _, want := range []string{"auth.register.success", "auth.login.failed", "auth.refresh.success"} {
+	for _, want := range []string{
+		"auth.register.success", "auth.login.failed", "auth.refresh.success",
+		"auth.organization.already_exists",
+	} {
 		if !bytes.Contains([]byte(output), []byte(want)) {
 			t.Errorf("the logs do not contain %q; the assertions above would hold for a silent logger", want)
 		}

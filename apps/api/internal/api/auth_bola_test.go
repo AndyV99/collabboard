@@ -201,6 +201,19 @@ func (s *membershipService) Logout(context.Context, string) error {
 	panic("membershipService: Logout is not modelled")
 }
 
+// CreateFirstOrganization is not modelled, and its absence from this file's
+// attacks is deliberate rather than an omission. Every attack here works by
+// steering an *authenticated* request's tenant, and that endpoint is not
+// authenticated in that sense: it is unauthenticated, takes no principal, and
+// the account it exists for cannot hold a token at all (issue #34). It is
+// attacked in organizations_integration_test.go instead, where the question is
+// "whose organization did it create" rather than "whose tenant did it open".
+func (s *membershipService) CreateFirstOrganization(
+	context.Context, auth.CreateOrganizationInput,
+) (auth.CreateOrganizationResult, error) {
+	panic("membershipService: CreateFirstOrganization is not modelled")
+}
+
 // Me models both halves of GET /me the way the real service does them: the
 // organization list from the principal's user id, and the identity from a
 // tenant-scoped read of the principal's own row.

@@ -34,6 +34,7 @@ type AuthService interface {
 	Refresh(ctx context.Context, refreshToken string) (auth.LoginResult, error)
 	Logout(ctx context.Context, refreshToken string) error
 	SwitchOrganization(ctx context.Context, principal auth.Principal, target uuid.UUID) (auth.LoginResult, error)
+	CreateFirstOrganization(ctx context.Context, in auth.CreateOrganizationInput) (auth.CreateOrganizationResult, error)
 	Me(ctx context.Context, principal auth.Principal) (auth.MeResult, error)
 	AddMember(ctx context.Context, in auth.AddMemberInput) (auth.AddMemberResult, error)
 }
@@ -107,6 +108,29 @@ type refreshRequest struct {
 
 type switchOrganizationRequest struct {
 	OrganizationID string `json:"organization_id" binding:"required"`
+}
+
+// createOrganizationRequest is the body of POST /api/v1/organizations.
+//
+// A credential and a name. There is no user id, no subject, and no field naming
+// an account other than through the address whose password has to verify — the
+// organization is created for whoever that password belongs to. See
+// [createOrganizationHandler] and internal/auth/organizations.go.
+type createOrganizationRequest struct {
+	Email            string `json:"email"    binding:"required"`
+	Password         string `json:"password" binding:"required"`
+	OrganizationName string `json:"organization_name"`
+}
+
+// createOrganizationResponse is what a repaired account gets back.
+//
+// Deliberately not a [sessionResponse]: this endpoint creates an organization,
+// it does not start a session. The client's next call is an ordinary login,
+// which now succeeds. See internal/auth/organizations.go for why token issuance
+// stays where it is.
+type createOrganizationResponse struct {
+	UserID       string           `json:"user_id"`
+	Organization organizationBody `json:"organization"`
 }
 
 // sessionResponse is what login, refresh and organization switch return.
@@ -289,6 +313,68 @@ func logoutHandler(logger *slog.Logger, service AuthService) gin.HandlerFunc {
 		}
 
 		c.Status(http.StatusNoContent)
+	}
+}
+
+// createOrganizationHandler gives an account with no organization one, so that a
+// registration which failed halfway can be recovered without an operator
+// (issue #34).
+//
+// # Why it is mounted with the unauthenticated routes
+//
+// Because the account it serves cannot authenticate in the sense the rest of
+// this file means. A subject with zero memberships has no tenant to put in an
+// org claim, [auth.Issuer] refuses to mint a token without one, and this
+// package's principalFrom refuses a principal without one — so there is no
+// bearer token that could reach a route on the `authenticated` group. Relaxing
+// any of that to let this one endpoint through would widen the exact check that
+// every other endpoint's tenant isolation rests on, which is not a trade worth
+// making for a repair path. Nothing in auth_middleware.go changed for this
+// endpoint, and nothing needed to.
+//
+// So the credential is the password, and this route sits with register, login,
+// refresh and logout: same tighter body limit, and the same rate limiter, which
+// [auth.Service.CreateFirstOrganization] applies before it does any work.
+//
+// The statuses:
+//
+//	201  created; the body is the organization and the caller's own user id
+//	400  the body is not well formed
+//	401  no such address, or the wrong password — one answer for both
+//	409  the account already belongs to an organization
+//	429  too many attempts
+//
+// 409 is only reachable with a correct password, so it tells an attacker
+// nothing. 401 is the same answer an unknown address and a wrong password get
+// from login, for the same reason and by the same code.
+func createOrganizationHandler(logger *slog.Logger, service AuthService) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		var req createOrganizationRequest
+		if !bindJSON(c, &req) {
+			return
+		}
+
+		result, err := service.CreateFirstOrganization(c.Request.Context(), auth.CreateOrganizationInput{
+			Email:            req.Email,
+			Password:         req.Password,
+			OrganizationName: req.OrganizationName,
+			ClientIP:         c.ClientIP(),
+		})
+		if err != nil {
+			writeAuthError(c, logger, err)
+
+			return
+		}
+
+		c.JSON(http.StatusCreated, createOrganizationResponse{
+			UserID: result.UserID.String(),
+			Organization: organizationBody{
+				ID:   result.OrganizationID.String(),
+				Name: result.OrganizationName,
+				Slug: result.OrganizationSlug,
+				Role: result.Role,
+			},
+		})
 	}
 }
 
@@ -595,6 +681,14 @@ func writeAuthError(c *gin.Context, logger *slog.Logger, err error) {
 	case errors.Is(err, auth.ErrNoOrganization):
 		c.AbortWithStatusJSON(http.StatusForbidden,
 			errorResponse{Error: "this account does not belong to an organization"})
+
+	case errors.Is(err, auth.ErrAlreadyHasOrganization):
+		// Reachable only after a correct password, so this says nothing to
+		// anyone who does not already hold the credential. 409 rather than 403:
+		// the caller is entitled, the resource they asked to create already
+		// exists.
+		c.AbortWithStatusJSON(http.StatusConflict,
+			errorResponse{Error: "this account already belongs to an organization"})
 
 	case errors.Is(err, auth.ErrNotAMember):
 		c.AbortWithStatusJSON(http.StatusForbidden,

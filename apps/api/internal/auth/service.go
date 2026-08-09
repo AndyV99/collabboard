@@ -222,7 +222,15 @@ type RegisterResult struct {
 // layer turns into a 403 that says so. It is not compensated by deleting the
 // user because the pre-tenant path deliberately has no delete — ADR 0002 —
 // and adding one to paper over this would be a much worse trade than the
-// failure mode it fixes. Filed as a known gap in the PR rather than hidden.
+// failure mode it fixes.
+//
+// # How the account gets out of that state (issue #34)
+//
+// It calls [Service.CreateFirstOrganization], which is the same second
+// transaction — literally [Service.provisionOrganization], the function this one
+// calls — run again later against an account that already exists. The window is
+// still there and still logged as auth.register.partial; what changed is that
+// the account can now leave it without an operator. See organizations.go.
 func (s *Service) Register(ctx context.Context, in RegisterInput) (RegisterResult, error) {
 	email := NormalizeEmail(in.Email)
 	displayName := strings.TrimSpace(in.DisplayName)
@@ -278,39 +286,8 @@ func (s *Service) Register(ctx context.Context, in RegisterInput) (RegisterResul
 		return RegisterResult{}, fmt.Errorf("creating the account: %w", err)
 	}
 
-	organizationName := strings.TrimSpace(in.OrganizationName)
-	if organizationName == "" {
-		organizationName = displayName + "'s workspace"
-	}
-
-	// The tenant id is generated here and set as the transaction's tenant, then
-	// used as the organization's primary key by the INSERT itself. An
-	// organization *is* its tenant; there is no separate identifier to keep in
-	// sync, and no argument the caller could get wrong.
-	tenantID := uuid.New()
-
-	var organization store.Organization
-
-	err = s.store.WithTenant(ctx, tenantID, func(ctx context.Context, q store.Querier) error {
-		created, cerr := q.CreateOrganization(ctx, store.CreateOrganizationParams{
-			Name: organizationName,
-			Slug: newSlug(organizationName),
-		})
-		if cerr != nil {
-			return cerr
-		}
-
-		if _, cerr = q.CreateMembership(ctx, store.CreateMembershipParams{
-			UserID: user.ID,
-			Role:   RoleOwner,
-		}); cerr != nil {
-			return cerr
-		}
-
-		organization = created
-
-		return nil
-	})
+	organization, err := s.provisionOrganization(ctx, user.ID,
+		workspaceName(in.OrganizationName, displayName))
 	if err != nil {
 		s.logger.ErrorContext(ctx, "registration created an account with no organization",
 			slog.String("event", "auth.register.partial"),
@@ -340,6 +317,89 @@ func (s *Service) Register(ctx context.Context, in RegisterInput) (RegisterResul
 // RoleOwner is the membership role registration grants the account that created
 // the organization.
 const RoleOwner = "owner"
+
+// The endpoints that accept a password, as they appear in a failed-attempt log
+// line. A closed set of literals rather than a caller-supplied string, so the
+// field cannot carry attacker-controlled text into the logs.
+const (
+	operationLogin              = "login"
+	operationCreateOrganization = "create_organization"
+)
+
+// provisionOrganization creates an organization and the owner membership that
+// makes userID its first member, in one tenant-scoped transaction.
+//
+// This is registration's *second* transaction, and it is a function rather than
+// a block inside [Service.Register] because [Service.CreateFirstOrganization]
+// runs the same one to repair a registration that failed between the two (issue
+// #34). Two code paths that each created an organization plus an owner
+// membership would drift, and the drift would be a permissions bug — an
+// organization whose creator is not its owner, or is not a member of it at all.
+// So there is one.
+//
+// The tenant id is generated here and set as the transaction's tenant, then used
+// as the organization's primary key by the INSERT itself. An organization *is*
+// its tenant; there is no separate identifier to keep in sync, and no argument
+// the caller could get wrong.
+//
+// userID is the only thing a caller supplies about *who* this belongs to, and
+// both callers pass a subject they have already authenticated: Register passes
+// the row it just created, CreateFirstOrganization passes the id a password
+// verification returned. Neither passes anything that arrived from a request.
+func (s *Service) provisionOrganization(ctx context.Context, userID uuid.UUID, name string) (store.Organization, error) {
+	tenantID := uuid.New()
+
+	var organization store.Organization
+
+	err := s.store.WithTenant(ctx, tenantID, func(ctx context.Context, q store.Querier) error {
+		created, cerr := q.CreateOrganization(ctx, store.CreateOrganizationParams{
+			Name: name,
+			Slug: newSlug(name),
+		})
+		if cerr != nil {
+			return cerr
+		}
+
+		// No tenant argument and no organization argument: the membership lands
+		// in the transaction's tenant, which is the organization created one
+		// statement ago. See internal/store's query conventions.
+		if _, cerr = q.CreateMembership(ctx, store.CreateMembershipParams{
+			UserID: userID,
+			Role:   RoleOwner,
+		}); cerr != nil {
+			return cerr
+		}
+
+		organization = created
+
+		return nil
+	})
+	if err != nil {
+		return store.Organization{}, err
+	}
+
+	return organization, nil
+}
+
+// workspaceName is the name an organization ends up with: what the caller
+// asked for, or a default built from their display name.
+//
+// Shared by both callers of [Service.provisionOrganization] so that a workspace
+// created by the repair path is named the way one created by registration would
+// have been.
+//
+// Note what is *not* here: a length bound. There is none on registration either
+// — organization_name is the one unbounded user-supplied field on this service,
+// which is issue #67, and matching that gap deliberately is better than fixing
+// it in half the places. When #67 is fixed the bound belongs in this function,
+// where it covers both callers and the generated default at once.
+func workspaceName(requested, displayName string) string {
+	if name := strings.TrimSpace(requested); name != "" {
+		return name
+	}
+
+	return displayName + "'s workspace"
+}
 
 // LoginInput is a credential presentation. ClientIP is used only for rate
 // limiting.
@@ -406,31 +466,12 @@ func (s *Service) Login(ctx context.Context, in LoginInput) (LoginResult, error)
 		return LoginResult{}, &RateLimitError{RetryAfter: decision.RetryAfter}
 	}
 
-	userID, params := s.loginSubject(ctx, email)
-
-	key, err := s.derive(ctx, in.Password, params.salt, params.params)
+	subject, err := s.verifyCredential(ctx, operationLogin, email, in.Password, in.ClientIP)
 	if err != nil {
 		return LoginResult{}, err
 	}
 
-	verified, err := withoutTenant(ctx, s.store, store.ReasonVerifyPassword,
-		func(ctx context.Context, q store.IdentityQuerier) (uuid.UUID, error) {
-			return q.VerifyPassword(ctx, store.VerifyPasswordParams{UserID: userID, Key: key})
-		})
-
-	switch {
-	case errors.Is(err, store.ErrNotFound):
-		s.logFailedLogin(ctx, "credentials", in.ClientIP)
-
-		return LoginResult{}, ErrInvalidCredentials
-	case err != nil:
-		return LoginResult{}, fmt.Errorf("verifying the password: %w", err)
-	case verified != userID:
-		// Cannot happen through the SQL — the function filters on the id it was
-		// given — but a mismatch here would mean the wrong account was about to
-		// be issued a token, which is worth refusing rather than trusting.
-		return LoginResult{}, ErrInvalidCredentials
-	}
+	verified := subject.ID
 
 	organizations, err := s.organizations(ctx, verified)
 	if err != nil {
@@ -679,6 +720,65 @@ func (s *Service) startSession(ctx context.Context, userID uuid.UUID, org Organi
 	}, nil
 }
 
+// verifyCredential resolves an address and password to the account they belong
+// to, or to [ErrInvalidCredentials].
+//
+// It is steps 2 to 5 of [Service.Login]'s list, extracted verbatim, and it is
+// extracted because [Service.CreateFirstOrganization] has to perform exactly the
+// same check — an account with no organization has no token, so a password is
+// the only credential it can present (issue #34, and see organizations.go).
+// Sharing the function rather than the description is what keeps the
+// anti-enumeration property true at both endpoints: one argon2id derivation
+// whatever is wrong, the same two pre-tenant lookups in the same order, and the
+// same error for an unknown address as for a wrong password.
+//
+// It does not count the attempt against the rate-limit budgets. That is step 1,
+// and it stays with the callers, because the budget is per *endpoint attempt*
+// and a caller that forgot it should be a missing line in a short function
+// rather than a silently absent behaviour inside a long one.
+//
+// operation is the label a failed attempt is logged under, so that the two
+// endpoints presenting a password remain distinguishable to an operator. It
+// changes nothing a caller can observe — see [Service.logFailedLogin].
+func (s *Service) verifyCredential(
+	ctx context.Context,
+	operation, email, password, clientIP string,
+) (store.IdentityUser, error) {
+	userID, user, candidate := s.loginSubject(ctx, email)
+
+	key, err := s.derive(ctx, password, candidate.salt, candidate.params)
+	if err != nil {
+		return store.IdentityUser{}, err
+	}
+
+	verified, err := withoutTenant(ctx, s.store, store.ReasonVerifyPassword,
+		func(ctx context.Context, q store.IdentityQuerier) (uuid.UUID, error) {
+			return q.VerifyPassword(ctx, store.VerifyPasswordParams{UserID: userID, Key: key})
+		})
+
+	switch {
+	case errors.Is(err, store.ErrNotFound):
+		s.logFailedLogin(ctx, operation, "credentials", clientIP)
+
+		return store.IdentityUser{}, ErrInvalidCredentials
+	case err != nil:
+		return store.IdentityUser{}, fmt.Errorf("verifying the password: %w", err)
+	case verified != userID:
+		// Cannot happen through the SQL — the function filters on the id it was
+		// given — but a mismatch here would mean the wrong account was about to
+		// be issued a token, which is worth refusing rather than trusting.
+		return store.IdentityUser{}, ErrInvalidCredentials
+	case user.ID != verified:
+		// Equally unreachable, and refused for the equally blunt reason: the
+		// row returned here is what the caller goes on to act *for*. A password
+		// that verified against one account must not hand back another one's
+		// identity. Same check, and same reasoning, as Service.profile's.
+		return store.IdentityUser{}, ErrInvalidCredentials
+	}
+
+	return user, nil
+}
+
 // loginCandidate is the subject a login attempt will be checked against, real
 // or invented.
 type loginCandidate struct {
@@ -694,7 +794,14 @@ type loginCandidate struct {
 // account, or the difference *is* the oracle. The failure still surfaces: the
 // verify step that follows will fail against the same database, and the caller
 // gets a 500 from there rather than a 401 that lies.
-func (s *Service) loginSubject(ctx context.Context, email string) (uuid.UUID, loginCandidate) {
+//
+// The account row is returned alongside the id, zero-valued when there is none.
+// It is the row the lookup already read, so carrying it out costs nothing, and
+// it saves [Service.CreateFirstOrganization] a second pre-tenant round trip to
+// learn the display name it names a default workspace after. Nothing may read it
+// before the password has verified — [Service.verifyCredential] is the only
+// caller, and it returns it only on the success path.
+func (s *Service) loginSubject(ctx context.Context, email string) (uuid.UUID, store.IdentityUser, loginCandidate) {
 	absent := loginCandidate{salt: s.absentSalt, params: s.params}
 
 	// A random id rather than uuid.Nil when there is no account, so the two
@@ -708,6 +815,8 @@ func (s *Service) loginSubject(ctx context.Context, email string) (uuid.UUID, lo
 		})
 	if err == nil {
 		userID = user.ID
+	} else {
+		user = store.IdentityUser{}
 	}
 
 	// Called unconditionally, including for the stand-in id. Returning early
@@ -724,10 +833,10 @@ func (s *Service) loginSubject(ctx context.Context, email string) (uuid.UUID, lo
 		// The account exists but has no password — an invited user who has not
 		// accepted, or later an external-provider-only account. Indistinguish-
 		// able from an unknown address from here on.
-		return userID, absent
+		return userID, user, absent
 	}
 
-	return userID, loginCandidate{
+	return userID, user, loginCandidate{
 		salt: params.Salt,
 		params: Argon2Params{
 			MemoryKiB:   uint32(params.MemoryKib),  //nolint:gosec // CHECK-constrained positive in migration 00005
@@ -783,9 +892,19 @@ func (s *Service) organizations(ctx context.Context, userID uuid.UUID) ([]Organi
 // and none of them need the address — while a log full of addresses is a
 // credential-stuffing target list with timestamps. The rate limiter's counters
 // are keyed by a peppered hash for the same reason.
-func (s *Service) logFailedLogin(ctx context.Context, reason, clientIP string) {
-	s.logger.InfoContext(ctx, "login failed",
+//
+// operation names which endpoint the credential was presented to, because since
+// issue #34 there is more than one. Without it every wrong password on
+// POST /api/v1/organizations would be indistinguishable from one on
+// POST /auth/login, and an alert on the login-failure rate would silently be an
+// alert on two endpoints at once. It is a closed set of literals from the two
+// call sites, so it cannot carry attacker-controlled text, and it discloses
+// nothing: this is a server-side log, not a response, and the *response* still
+// has to be identical for every failing case.
+func (s *Service) logFailedLogin(ctx context.Context, operation, reason, clientIP string) {
+	s.logger.InfoContext(ctx, "credential presentation failed",
 		slog.String("event", "auth.login.failed"),
+		slog.String("operation", operation),
 		slog.String("reason", reason),
 		slog.String("client_ip", clientIP),
 	)
