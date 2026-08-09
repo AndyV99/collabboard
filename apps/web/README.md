@@ -4,8 +4,10 @@ Next.js (App Router, React Server Components) front end for CollabBoard.
 
 What exists: a public landing page that server-side fetches `GET /healthz` from
 the Go API, the [authentication screens](#the-authentication-screens) (register,
-sign in, sign out, route protection), and a signed-in shell. Project, board and
-card UI is issues #62 and #63; the WebSocket client is #9.
+sign in, sign out, route protection), and
+[the signed-in workspace](#the-workspace-projects-boards-and-people) — projects,
+boards and the people in an organization. The board *view* — columns and cards —
+is issue #63; the WebSocket client is #9.
 
 ## Commands
 
@@ -290,7 +292,7 @@ Four routes, and one rule for each of them:
 | `/` | Public landing + API health | Read, never required |
 | `/login` | Sign in | Redirects **away** if you have one |
 | `/register` | Create an account and its workspace | Redirects **away** if you have one |
-| `/app` | The signed-in placeholder | Required |
+| `/app` | The signed-in workspace | Required |
 
 `app/(auth)/` and `app/(protected)/` are route groups, so the URLs above have no
 segment for them. Which group a file is in *is* its access rule.
@@ -443,6 +445,146 @@ lib/session/request-path.ts  how a layout learns which URL it is rendering
 lib/session/viewer.ts   the signed-in user's name, via GET /members
 ```
 
+## The workspace: projects, boards and people
+
+Four routes under `/app`, all behind `app/(protected)/layout.tsx`:
+
+| Route | What it is |
+| --- | --- |
+| `/app` | The organization's projects, and the form that creates one |
+| `/app/projects/<id>` | One project: its boards, rename, archive |
+| `/app/projects/<id>/boards/<id>` | One board — **a placeholder**; #63 renders it |
+| `/app/members` | Everyone in the organization, and the add-member form |
+
+### State lives in the URL, so a reload and a paste both work
+
+The project you are looking at and the board you are looking at are path
+segments, not a selection held in a client component. A reload re-renders the
+same screen on the server; a link opens the same screen for a colleague who has
+access; the back button means what it looks like it means.
+
+The ids are therefore attacker-supplied, which is fine and is why nothing
+validates them locally: an id that names nothing and an id belonging to another
+organization are both resolved inside the caller's own tenant and both come back
+404 (`crud.go`'s `notFound`). The screens render one state for both, because they
+genuinely cannot tell them apart and copy that implied otherwise would hand back
+the bit the API withholds.
+
+**A board's URL is nested under its project even though the API's is not.**
+`apps/api` addresses a board flatly at `/boards/:id` and says why — a nested API
+path invites a handler to trust the ancestors in it. A URL has the opposite
+problem: it has to render a breadcrumb, and fetching the board to discover its
+project would be a round trip for one line of text. So the project id is in the
+path and the board page **checks** it: `board.projectId` must equal the segment
+it was reached through, or the page renders not-found. A mismatched pair would
+otherwise show a real board under a breadcrumb naming a project it is not in.
+
+### Reading is server-side; writing is a Client Component through the proxy
+
+Every list is a Server Component using `serverApi` — the session is already
+there, there is no round trip, and no fetching code reaches the browser. Every
+form is a Client Component using `browserApi()` through `/api/proxy`, because a
+form needs pending state, per-field errors and focus management. After a
+successful write the form calls `router.refresh()`, so the list re-renders from
+the server rather than being patched in client state: one source of truth, and
+the row that appears is the row the API stored.
+
+Two consequences worth knowing:
+
+- **Nothing is optimistic.** The API trims names and can reject a write, so the
+  screen shows what was stored rather than what was typed.
+- **`loading.tsx` per segment is the only loading state**, because there is no
+  client-side fetch on first paint to cover. It is Next's Suspense fallback for
+  the segment and it is served in the first flush.
+
+### Empty states
+
+The first screen a new account sees is `/app` with no projects, so it is a screen
+rather than an absence: a heading, three numbered steps explaining the
+project → board → card vocabulary this app never otherwise defines, and the
+create form with focus already in it. A project with no boards and a workspace
+with one person get the same treatment for the same reason.
+
+### Archiving is one-way, and the UI says so instead of hiding it
+
+`POST /projects/:id/archive` cannot be undone — there is no unarchive and no way
+to list archived projects (#49). Issue #62 allowed either hiding the control or
+making the consequence explicit; this takes the second, because hiding it does
+not make the door reversible, it makes the capability unreachable while leaving
+the endpoint exactly as final.
+
+So `components/projects/archive-project.tsx` sits in a collapsed disclosure and,
+when opened, states three things before the confirmation:
+
+- it **cannot be undone**, and the project leaves every list in the product;
+- **nothing is deleted** — `ArchiveProject` sets `archived_at` and the boards and
+  cards stay in the database;
+- **this page's address keeps working**, because `GetProject` has no
+  `archived_at` predicate. Only `ListProjects` filters. So a saved link is the
+  only route back to those boards, and that is worth knowing *before* confirming
+  rather than discovering after.
+
+Confirming requires typing the project's name. A confirm dialog is a reflex;
+typing is a decision, and for an action with no undo the few seconds are cheap.
+
+Arriving at an archived project by URL renders an explicit archived panel and
+withdraws the rename and archive controls — renaming something nobody can find
+is not a useful offer.
+
+### The caller's role comes from `GET /members`, not from the token
+
+`session.organization.role` is a claim minted at login and re-derived at most
+once per access-token lifetime, so a promoted or demoted account carries a stale
+one. `apps/api` refuses to trust it for exactly this reason: ADR 0008 has
+`AddMember` read the caller's row from `memberships` inside the tenant
+transaction, and again in the transaction that inserts.
+
+`GET /members` lists that same table for that same tenant, and `/app/members`
+already has it. So `lib/workspace/roles.ts` derives the role from the list —
+one request, and the answer the server will give. An `owner` or `admin` is
+offered the form; a `member` is shown a sentence saying who can add people, not a
+button that would 403. A caller who is **not in the list at all** — a revoked
+membership, or #34's half-registered account — is offered nothing and told to
+sign out and back in.
+
+The role choice is bounded the same way: an owner may grant `member` or `admin`,
+an admin may grant `member` only, and nobody is offered `owner`, because
+`validateAddMember` refuses it as a property of the endpoint.
+
+### Adding a member is a direct add, and the copy does not pretend otherwise
+
+ADR 0008: there is no invitation and no mailer, so the person is in the workspace
+immediately and **is not notified**. The success message says so. An address with
+no account is a 404 and always will be — this path never creates a user — so the
+copy says "they need to sign up first" rather than "check the address", which
+would send the user round a loop they cannot exit.
+
+### Files
+
+```
+app/(protected)/app/                      the four routes, plus a loading.tsx each
+components/workspace/workspace.module.css one stylesheet for the whole signed-in app
+components/workspace/fields.tsx           labelled input/textarea/select (ids are props)
+components/workspace/states.tsx           empty, error and loading states
+components/workspace/page-header.tsx      title, lede and breadcrumbs
+components/projects/                      list, create, rename, archive
+components/boards/                        list, create
+components/members/                       list, add
+lib/workspace/routes.ts                   every URL, and why the board one nests
+lib/workspace/rules.ts                    validation mirroring crud.go's limits
+lib/workspace/roles.ts                    who may add, and where the role is read from
+lib/workspace/outcomes.ts                 ApiError → copy, for loads and for writes
+lib/workspace/format.ts                   timestamps, in a fixed locale and zone
+```
+
+### Known rough edge
+
+`app/(protected)/layout.tsx` awaits `loadViewer()`, which is a `GET /members`
+call made only to render one name (#75, #78). Because that await is *above* every
+`loading.tsx`, the segment fallbacks cannot paint until it resolves — on a slow
+API the whole signed-in area waits on a request none of the pages need. #78
+deletes that call, which removes the problem rather than working around it.
+
 ### Session layer files
 
 ```
@@ -466,11 +608,13 @@ app/api/proxy/*         authenticated pass-through for Client Components
 ```
 app/                 routes (App Router). page.tsx is the public landing page,
                      (auth)/ and (protected)/ are the two access rules,
-                     healthz/route.ts is the readiness signal, api/ holds the
-                     session Route Handlers and the authenticated proxy.
+                     (protected)/app/ is the workspace, healthz/route.ts is the
+                     readiness signal, api/ holds the session Route Handlers and
+                     the authenticated proxy.
 components/          presentational components, kept pure so they are unit testable
 lib/                 the API client and session layer, the auth screens' rules
-                     and copy, the readiness policy, the structured logger
+                     and copy, the workspace's rules/roles/copy, the readiness
+                     policy, the structured logger
 proxy.ts             pre-render session refresh + the requested-path stamp
                      (Next 16's renamed middleware)
 instrumentation.ts   server startup hook: validates + logs the resolved API_URL
