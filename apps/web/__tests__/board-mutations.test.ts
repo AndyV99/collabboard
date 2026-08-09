@@ -623,6 +623,122 @@ describe("isRedundantMove", () => {
   });
 });
 
+/**
+ * The two properties the hand-picked cases above only sample.
+ *
+ * `cardDropTarget`'s within-column rule is the subtlest thing in this file and
+ * the likeliest place for an off-by-one to hide, because it has to agree with a
+ * gap something else is drawing: `@dnd-kit`'s sorting strategy opens the space
+ * using `arrayMove` semantics, and committing anything else lands the card one
+ * place from where the user was looking. Rather than trust three examples, this
+ * asserts the agreement for *every* pair of positions in a six-card column —
+ * and for both values of `after`, since within a column the pointer's side of
+ * the card must not matter.
+ */
+describe("within a column, the commit matches the gap the library drew", () => {
+  const SIZE = 6;
+  const ids = Array.from({ length: SIZE }, (_, index) => `k${index}`);
+  const board = groupCardsIntoColumns(
+    [column("c-1", "One"), column("c-2", "Two")],
+    ids.map((id) => card(id, "c-1", id)),
+  );
+
+  /** What `@dnd-kit`'s sorting strategy shows while `from` is held over `to`. */
+  function arrayMove(list: readonly string[], from: number, to: number): string[] {
+    const copy = [...list];
+
+    copy.splice(to, 0, ...copy.splice(from, 1));
+
+    return copy;
+  }
+
+  for (let from = 0; from < SIZE; from += 1) {
+    for (let to = 0; to < SIZE; to += 1) {
+      if (from === to) {
+        continue;
+      }
+
+      it(`${from} → ${to}`, () => {
+        for (const after of [false, true]) {
+          const move = cardDropTarget(board, ids[from], { card: ids[to] }, after);
+
+          expect(move, `no move for ${from} → ${to}`).toBeDefined();
+
+          const next = applyBoardChange(board, { kind: "card.moved", ...move! });
+
+          expect(
+            next.columns[0].cards.map((entry) => entry.id),
+            `after=${after}, ${from} → ${to}`,
+          ).toEqual(arrayMove(ids, from, to));
+        }
+      });
+    }
+  }
+});
+
+/**
+ * Every keyboard nudge is undone by its opposite.
+ *
+ * A round trip is the cheapest statement of "these two anchors are each other's
+ * inverse", and it catches the asymmetry the up case invites — up names the card
+ * *two* places back while down names the one immediately after, so getting
+ * either wrong by one leaves the card somewhere the other direction cannot
+ * return it from. Run from every position in three columns of different
+ * lengths, including the ends, where the answer is that there is no move.
+ */
+describe("nudging a card and nudging it back is the identity", () => {
+  const board = groupCardsIntoColumns(
+    [column("c-1", "One"), column("c-2", "Two"), column("c-3", "Three")],
+    [
+      card("a", "c-1", "a"),
+      card("b", "c-1", "b"),
+      card("c", "c-1", "c"),
+      card("d", "c-2", "d"),
+      card("e", "c-2", "e"),
+      card("f", "c-3", "f"),
+    ],
+  );
+
+  const shape = (snapshot: typeof board) =>
+    snapshot.columns
+      .map((entry) => `${entry.column.id}:${entry.cards.map((c) => c.id).join(",")}`)
+      .join(" | ");
+
+  const pairs = [
+    ["up", "down"],
+    ["down", "up"],
+    ["left", "right"],
+    ["right", "left"],
+  ] as const;
+
+  for (const id of ["a", "b", "c", "d", "e", "f"]) {
+    for (const [there, back] of pairs) {
+      it(`${id}: ${there} then ${back}`, () => {
+        const first = cardNudge(board, id, there);
+
+        // At an edge there is no move, which is itself the right answer.
+        if (first === undefined) {
+          return;
+        }
+
+        const moved = applyBoardChange(board, { kind: "card.moved", ...first });
+
+        // Guards the whole test: a `cardNudge` that returned a no-op move would
+        // otherwise satisfy the round trip without moving anything.
+        expect(shape(moved)).not.toBe(shape(board));
+
+        const second = cardNudge(moved, id, back);
+
+        expect(second, `${id} moved ${there} but cannot come ${back}`).toBeDefined();
+
+        expect(
+          shape(applyBoardChange(moved, { kind: "card.moved", ...second! })),
+        ).toBe(shape(board));
+      });
+    }
+  }
+});
+
 describe("the rule this file must not break", () => {
   it("never sorts anything", () => {
     // Cards arrive in an order no comparison would produce. Every operation has
