@@ -168,6 +168,15 @@ type response struct {
 func (s *server) do(t *testing.T, method, path, token string, body any) response {
 	t.Helper()
 
+	return s.send(t, s.request(t, method, path, token, body))
+}
+
+// request builds the request do would send, for the tests that have to add a
+// header of their own before it goes — which on this surface means the ones
+// attacking the tenant boundary.
+func (s *server) request(t *testing.T, method, path, token string, body any) *http.Request {
+	t.Helper()
+
 	var payload io.Reader
 
 	if body != nil {
@@ -190,7 +199,7 @@ func (s *server) do(t *testing.T, method, path, token string, body any) response
 		req.Header.Set("Authorization", "Bearer "+token)
 	}
 
-	return s.send(t, req)
+	return req
 }
 
 func (s *server) send(t *testing.T, req *http.Request) response {

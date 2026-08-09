@@ -68,10 +68,34 @@ type recordingStore struct {
 	mu      sync.Mutex
 	opened  []uuid.UUID
 	members map[uuid.UUID][]store.ListMembersRow
+
+	// added records every membership POST /api/v1/members created, keyed by the
+	// tenant it landed in. "The response did not leak" is a weaker claim for a
+	// write than for a read: an addition into the wrong organization is a
+	// durable change that a 201 with an innocuous body would hide completely.
+	added map[uuid.UUID][]uuid.UUID
 }
 
 func newRecordingStore() *recordingStore {
-	return &recordingStore{members: map[uuid.UUID][]store.ListMembersRow{}}
+	return &recordingStore{
+		members: map[uuid.UUID][]store.ListMembersRow{},
+		added:   map[uuid.UUID][]uuid.UUID{},
+	}
+}
+
+// recordAddition notes that a user was joined to a tenant.
+func (r *recordingStore) recordAddition(tenantID, userID uuid.UUID) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	r.added[tenantID] = append(r.added[tenantID], userID)
+}
+
+func (r *recordingStore) additionsTo(tenantID uuid.UUID) []uuid.UUID {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	return slices.Clone(r.added[tenantID])
 }
 
 func (r *recordingStore) WithTenant(ctx context.Context, tenantID uuid.UUID, fn store.TenantFunc) error {
@@ -131,6 +155,12 @@ func (q recordingQuerier) ListMembers(context.Context) ([]store.ListMembersRow, 
 type membershipService struct {
 	issuer      *auth.Issuer
 	memberships map[uuid.UUID][]auth.Organization
+
+	// store and accounts exist for AddMember. accounts is the global directory
+	// the real service reaches through the pre-tenant door: an address that is
+	// not in it has no account anywhere.
+	store    *recordingStore
+	accounts map[string]uuid.UUID
 }
 
 func (s *membershipService) Register(context.Context, auth.RegisterInput) (auth.RegisterResult, error) {
@@ -151,6 +181,41 @@ func (s *membershipService) Logout(context.Context, string) error {
 
 func (s *membershipService) Organizations(_ context.Context, principal auth.Principal) ([]auth.Organization, error) {
 	return s.memberships[principal.UserID], nil
+}
+
+// AddMember is modelled at the size these tests need, and the size is chosen to
+// make the attack *possible*.
+//
+// It does not model the role ladder — internal/auth/members_test.go owns that,
+// against a fake that models memberships. What it models is the only thing this
+// file is about: the tenant an addition lands in comes from
+// in.Principal.TenantID, and the transaction is opened for that tenant, so a
+// principal that was allowed to name another organization would show up both in
+// recordingStore.opened and in recordingStore.added. A fake that ignored the
+// principal's tenant would make every assertion below vacuous.
+func (s *membershipService) AddMember(ctx context.Context, in auth.AddMemberInput) (auth.AddMemberResult, error) {
+	userID, registered := s.accounts[auth.NormalizeEmail(in.Email)]
+	if !registered {
+		return auth.AddMemberResult{}, auth.ErrNoSuchAccount
+	}
+
+	result := auth.AddMemberResult{
+		MembershipID: uuid.New(),
+		UserID:       userID,
+		Email:        auth.NormalizeEmail(in.Email),
+		Role:         auth.RoleMember,
+	}
+
+	err := s.store.WithTenant(ctx, in.Principal.TenantID, func(_ context.Context, _ store.Querier) error {
+		s.store.recordAddition(in.Principal.TenantID, userID)
+
+		return nil
+	})
+	if err != nil {
+		return auth.AddMemberResult{}, err
+	}
+
+	return result, nil
 }
 
 // SwitchOrganization is the real check, reimplemented here at the size the test
@@ -188,6 +253,12 @@ type bolaFixture struct {
 	aliceToken string
 	tenantA    uuid.UUID
 	tenantB    uuid.UUID
+
+	// carol has an account and belongs to neither organization. She is what
+	// alice tries to add — to her own organization in the control, and to bob's
+	// in the attack.
+	carolEmail string
+	carolID    uuid.UUID
 }
 
 func newBOLAFixture(t *testing.T) *bolaFixture {
@@ -206,12 +277,19 @@ func newBOLAFixture(t *testing.T) *bolaFixture {
 	tenantStore.seed(tenantA, "alice@example.com")
 	tenantStore.seed(tenantB, "bob@example.com")
 
+	carol := uuid.New()
+
 	service := &membershipService{
 		issuer: issuer,
 		memberships: map[uuid.UUID][]auth.Organization{
 			// Alice belongs to A and to nothing else. Bob's organization exists
 			// and has data; that is the whole setup.
 			alice: {{ID: tenantA, Name: "Alice Co", Slug: "alice-co", Role: "owner"}},
+		},
+		store: tenantStore,
+		accounts: map[string]uuid.UUID{
+			"alice@example.com": alice,
+			"carol@example.com": carol,
 		},
 	}
 
@@ -237,6 +315,8 @@ func newBOLAFixture(t *testing.T) *bolaFixture {
 		aliceToken: token,
 		tenantA:    tenantA,
 		tenantB:    tenantB,
+		carolEmail: "carol@example.com",
+		carolID:    carol,
 	}
 }
 
@@ -310,6 +390,39 @@ func TestAnAuthenticatedUserCannotObtainAnotherTenantsContext(t *testing.T) {
 			method: http.MethodGet,
 			path:   "/api/v1/organizations/" + f.tenantB.String() + "/members",
 		},
+		// Adding a member (#61) is the first *write* on this surface, so the
+		// same channels are attacked again against it. A read that leaks shows
+		// up in the response; a write that leaks does not have to, which is why
+		// assertNoMemberAddedTo runs below as well.
+		{
+			name:    "X-Organization-ID header on an addition",
+			method:  http.MethodPost,
+			path:    "/api/v1/members",
+			headers: map[string]string{"X-Organization-ID": f.tenantB.String()},
+			body:    map[string]string{"email": f.carolEmail},
+		},
+		{
+			name:   "an organization_id field in the addition's body",
+			method: http.MethodPost,
+			path:   "/api/v1/members",
+			body: map[string]string{
+				"email":           f.carolEmail,
+				"organization_id": f.tenantB.String(),
+				"tenant_id":       f.tenantB.String(),
+			},
+		},
+		{
+			name:   "an organization in the path of an addition",
+			method: http.MethodPost,
+			path:   "/api/v1/organizations/" + f.tenantB.String() + "/members",
+			body:   map[string]string{"email": f.carolEmail},
+		},
+		{
+			name:   "an org query parameter on an addition",
+			method: http.MethodPost,
+			path:   "/api/v1/members?org=" + f.tenantB.String(),
+			body:   map[string]string{"email": f.carolEmail},
+		},
 	} {
 		t.Run(attack.name, func(t *testing.T) {
 			before := len(f.store.openedTenants())
@@ -329,7 +442,81 @@ func TestAnAuthenticatedUserCannotObtainAnotherTenantsContext(t *testing.T) {
 			}
 
 			f.assertNoForeignTenantOpened(t, before)
+			f.assertNoMemberAddedTo(t, f.tenantB)
 		})
+	}
+}
+
+// TestAddingAMemberLandsInTheCallersOwnOrganization is the control for the four
+// addition attacks above.
+//
+// Without it they would all hold just as well against a router with no POST
+// /api/v1/members at all: 404 is not a leak, and neither is a route that does
+// not exist.
+func TestAddingAMemberLandsInTheCallersOwnOrganization(t *testing.T) {
+	t.Parallel()
+
+	f := newBOLAFixture(t)
+
+	rec := f.do(t, http.MethodPost, "/api/v1/members", nil, map[string]string{"email": f.carolEmail})
+
+	t.Logf("alice adding carol to her own organization -> %d %s", rec.Code, truncate(rec.Body.String()))
+
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want 201: %s", rec.Code, rec.Body.String())
+	}
+
+	added := f.store.additionsTo(f.tenantA)
+
+	t.Logf("memberships created in alice's organization: %v", added)
+
+	if !slices.Contains(added, f.carolID) {
+		t.Fatalf("the addition reported success but created no membership in %s", f.tenantA)
+	}
+
+	f.assertNoMemberAddedTo(t, f.tenantB)
+}
+
+// TestAddingAMemberByEmailIsNotADirectoryLookup.
+//
+// The refusal for an address with no account must carry nothing but a fixed
+// sentence: no user id, no display name, and nothing about any organization.
+// The status is 404 and that does say "no account with this address" — see
+// internal/auth/members.go for why that bit is inherent to the operation and
+// what bounds it.
+func TestAddingAMemberByEmailIsNotADirectoryLookup(t *testing.T) {
+	t.Parallel()
+
+	f := newBOLAFixture(t)
+
+	rec := f.do(t, http.MethodPost, "/api/v1/members", nil,
+		map[string]string{"email": "definitely-nobody@example.com"})
+
+	t.Logf("adding an address with no account -> %d %s", rec.Code, rec.Body.String())
+
+	if rec.Code != http.StatusNotFound {
+		t.Errorf("status = %d, want 404", rec.Code)
+	}
+
+	var body map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatalf("decoding the body: %v", err)
+	}
+
+	if len(body) != 1 || body["error"] == nil {
+		t.Errorf("the refusal carries %d field(s), want exactly one (\"error\"): %s", len(body), rec.Body.String())
+	}
+
+	// And it must be the same sentence whatever was asked, so that two probes
+	// cannot be told apart by their bodies.
+	other := f.do(t, http.MethodPost, "/api/v1/members", nil,
+		map[string]string{"email": "someone-else-entirely@example.org"})
+
+	t.Logf("a second unregistered address -> %d %s", other.Code, other.Body.String())
+
+	if other.Code != rec.Code || other.Body.String() != rec.Body.String() {
+		t.Errorf("two unregistered addresses answered differently (%d %s vs %d %s)",
+			rec.Code, rec.Body.String(), other.Code, other.Body.String())
 	}
 }
 
@@ -464,6 +651,104 @@ func TestTheAssertionHasTeeth(t *testing.T) {
 	}
 
 	t.Log("confirmed: bypassing the tenant-from-claim rule leaks another organization's members, and both assertions catch it")
+}
+
+// assertNoMemberAddedTo checks that no membership was created in an
+// organization the caller does not belong to.
+//
+// Separate from assertNoForeignTenantOpened because they fail separately, and
+// because this is the one that survives a refactor: a handler could stop
+// opening a foreign tenant context and still write into one through a
+// misdirected query. For a write, "nothing happened over there" is the claim,
+// not "nothing came back from over there".
+func (f *bolaFixture) assertNoMemberAddedTo(t *testing.T, tenantID uuid.UUID) {
+	t.Helper()
+
+	if added := f.store.additionsTo(tenantID); len(added) != 0 {
+		t.Errorf("BOLA: %d membership(s) were created in %s while authenticated as a member of %s only: %v",
+			len(added), tenantID, f.tenantA, added)
+	}
+}
+
+// TestTheMembershipAssertionHasTeeth is the companion to
+// TestTheAssertionHasTeeth for the write half.
+//
+// A response-body assertion cannot detect a leaked *write*: the vulnerable
+// router below answers 201 with a body that names no organization at all, which
+// is exactly what the correct router answers. So the detection has to be the
+// store, and this proves the store detects it.
+func TestTheMembershipAssertionHasTeeth(t *testing.T) {
+	t.Parallel()
+
+	f := newBOLAFixture(t)
+
+	gin.SetMode(gin.TestMode)
+
+	service := &membershipService{
+		issuer:   f.issuer,
+		store:    f.store,
+		accounts: map[string]uuid.UUID{f.carolEmail: f.carolID},
+	}
+
+	vulnerable := gin.New()
+	vulnerable.POST("/api/v1/members",
+		requireAuth(discardLogger(), f.issuer),
+		// The bug, in one middleware: a header is allowed to override the
+		// claim. Everything downstream is the real handler.
+		func(c *gin.Context) {
+			if header := c.GetHeader("X-Organization-ID"); header != "" {
+				if id, err := uuid.Parse(header); err == nil {
+					principal, _ := principalFrom(c)
+					principal.TenantID = id
+					c.Set(principalKey, principal)
+				}
+			}
+
+			c.Next()
+		},
+		addMemberHandler(discardLogger(), service))
+
+	before := len(f.store.openedTenants())
+
+	body, err := json.Marshal(map[string]string{"email": f.carolEmail})
+	if err != nil {
+		t.Fatalf("encoding the body: %v", err)
+	}
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequestWithContext(t.Context(), http.MethodPost, "/api/v1/members", bytes.NewReader(body))
+	req.Header.Set("Authorization", "Bearer "+f.aliceToken)
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-Organization-ID", f.tenantB.String())
+	vulnerable.ServeHTTP(rec, req)
+
+	t.Logf("the same addition against a middleware that trusts the header -> %d %s",
+		rec.Code, truncate(rec.Body.String()))
+
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("the deliberately vulnerable router refused the addition (%d); it cannot demonstrate the leak", rec.Code)
+	}
+
+	// The response is innocuous — which is the point.
+	if bytes.Contains(rec.Body.Bytes(), []byte(f.tenantB.String())) {
+		t.Log("note: the vulnerable response echoed the foreign tenant; the store assertion is not the only detector here")
+	}
+
+	added := f.store.additionsTo(f.tenantB)
+
+	t.Logf("memberships the vulnerable router created in bob's organization: %v", added)
+
+	if !slices.Contains(added, f.carolID) {
+		t.Fatal("the vulnerable router created no membership in the foreign organization; assertNoMemberAddedTo cannot detect one either")
+	}
+
+	opened := f.store.openedTenants()[before:]
+
+	if !slices.Contains(opened, f.tenantB) {
+		t.Fatal("the vulnerable router opened no foreign tenant context; assertNoForeignTenantOpened cannot detect one either")
+	}
+
+	t.Log("confirmed: bypassing the tenant-from-claim rule puts a member into another organization behind a 201 that says nothing, and the store assertion catches it")
 }
 
 // assertNoForeignTenantOpened checks every tenant context opened since index
