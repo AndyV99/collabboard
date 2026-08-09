@@ -225,6 +225,27 @@ function failureBanner() {
 }
 
 /**
+ * A column's cards, top to bottom.
+ *
+ * The card's own text, not the whole list item's: since #65 each row also
+ * carries a grip button whose accessible name repeats the title, so
+ * `li.textContent` reads "⠿Move ZebraZebra" and an order assertion written
+ * against it is really asserting the shape of a control it does not care about.
+ */
+function cardOrder(list: HTMLElement): string[] {
+  return within(list)
+    .getAllByRole("listitem")
+    .map((li) => {
+      const grip = within(li).queryByRole("button");
+
+      return Array.from(li.childNodes)
+        .filter((node) => node !== grip)
+        .map((node) => node.textContent ?? "")
+        .join("");
+    });
+}
+
+/**
  * Column names, in the order the board is drawing them.
  *
  * Filtered by the heading's own id rather than taken as "every level-3
@@ -286,11 +307,12 @@ describe("adding a card", () => {
     );
 
     // Appended, matching where CreateCard puts it.
-    expect(
-      within(doing)
-        .getAllByRole("listitem")
-        .map((li) => li.textContent),
-    ).toEqual(["Zebra", "KiloSome detail", "Alpha", "FreshAdding…"]);
+    expect(cardOrder(doing)).toEqual([
+      "Zebra",
+      "KiloSome detail",
+      "Alpha",
+      "FreshAdding…",
+    ]);
 
     settle(201, { card: cardBody("card-new", "c-doing", "Fresh") });
     await waitFor(() => expect(refresh).toHaveBeenCalled());
