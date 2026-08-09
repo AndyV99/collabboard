@@ -1,0 +1,317 @@
+/*
+ * The board surface.
+ *
+ * # Why this is not in workspace.module.css
+ *
+ * That file's comment says the signed-in screens are one surface with one
+ * vocabulary, and it is right about the screens it covers: they are documents,
+ * a single column of stacked sections inside a 60rem measure. The board is the
+ * one screen in this app that is not a document. It is a horizontally scrolling
+ * region of fixed-width columns, each with its own vertical scroller, and it
+ * wants the whole window rather than a reading measure.
+ *
+ * More concretely: `.card` in workspace.module.css is a link tile in a
+ * responsive grid, and a board card is a much smaller thing in a dense vertical
+ * stack. Making one class serve both would mean bending the class every screen
+ * already uses, which is the drift that comment exists to prevent. So the board
+ * gets its own file and the shared one is left alone.
+ *
+ * Colours are still entirely the custom properties from `app/globals.css`, and
+ * the focus ring is still the app-wide `:focus-visible` rule — nothing here
+ * redeclares either.
+ */
+
+/*
+ * The board's own page wrapper, replacing workspace.module.css's `.page`
+ * because that one caps the width at 60rem. It is not composed with it: CSS
+ * module class order across two files is not something to rely on for an
+ * override.
+ */
+.page {
+  max-width: 96rem;
+  margin: 0 auto;
+  display: flex;
+  flex-direction: column;
+  gap: 1.75rem;
+}
+
+/*
+ * Board beside detail on a wide screen, detail above board on a narrow one.
+ *
+ * The order flip is the point of using areas rather than source order. On a
+ * phone the panel is what you just asked for, so it belongs at the top; on a
+ * desktop the board must not move when a card opens, so the panel goes to the
+ * side. `align-items: start` keeps a short panel from stretching to the height
+ * of the board.
+ */
+.layout {
+  display: grid;
+  gap: 1.5rem;
+  align-items: start;
+  grid-template-areas:
+    "detail"
+    "board";
+}
+
+/*
+ * The side column is reserved only when there is something to put in it.
+ * `grid-template-columns: minmax(0, 1fr) 22rem` unconditionally would hold 22rem
+ * of empty space open on every board with no card open, and the board would
+ * start scrolling a column earlier than it needed to.
+ */
+@media (min-width: 64rem) {
+  .layoutWithDetail {
+    grid-template-columns: minmax(0, 1fr) 22rem;
+    grid-template-areas: "board detail";
+  }
+}
+
+.boardArea {
+  grid-area: board;
+  /* Without this a grid item refuses to shrink below its content, and the
+   * horizontal scroller below would push the page wide instead of scrolling. */
+  min-width: 0;
+}
+
+.detailArea {
+  grid-area: detail;
+}
+
+@media (min-width: 64rem) {
+  .detailArea {
+    position: sticky;
+    top: 1.5rem;
+  }
+}
+
+/* --- the columns ------------------------------------------------------ */
+
+.columns {
+  list-style: none;
+  display: flex;
+  align-items: flex-start;
+  gap: 1rem;
+  overflow-x: auto;
+  /* Room for the focus ring on the first and last column's scroller, which an
+   * `overflow` box would otherwise clip. */
+  padding: 0.25rem;
+  margin: -0.25rem;
+  scroll-snap-type: x proximity;
+}
+
+.column {
+  flex: 0 0 18rem;
+  max-width: 18rem;
+  display: flex;
+  flex-direction: column;
+  gap: 0.75rem;
+  padding: 0.875rem;
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  background: var(--panel);
+  scroll-snap-align: start;
+  /* The column, not the page, is what grows with the number of cards. A board
+   * with 200 cards in one column should scroll inside that column instead of
+   * making the whole page 200 rows tall. */
+  max-height: min(calc(100dvh - 16rem), 48rem);
+}
+
+.columnHeader {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 0.5rem;
+}
+
+.columnName {
+  font-size: 0.9375rem;
+  font-weight: 600;
+  letter-spacing: -0.005em;
+  overflow-wrap: anywhere;
+}
+
+.columnCount {
+  flex: 0 0 auto;
+  font-size: 0.75rem;
+  font-variant-numeric: tabular-nums;
+  color: var(--muted);
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  padding: 0.0625rem 0.5rem;
+}
+
+/*
+ * The vertical scroller. It carries `tabindex="0"` in the markup so that a
+ * keyboard user can scroll it — a scroll container with no focusable child is
+ * unreachable without a pointer in every browser that has not shipped
+ * automatic scroller focusability, and a column whose cards are all below the
+ * fold has exactly that problem.
+ */
+.stack {
+  list-style: none;
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+  overflow-y: auto;
+  /* Same reason as `.columns`: give the card focus ring somewhere to land. */
+  padding: 0.125rem;
+  margin: -0.125rem;
+}
+
+.card {
+  display: block;
+  padding: 0.625rem 0.75rem;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--background);
+  color: inherit;
+  text-decoration: none;
+}
+
+.card:hover {
+  border-color: var(--accent);
+}
+
+.cardSelected {
+  border-color: var(--accent);
+  box-shadow: inset 0 0 0 1px var(--accent);
+}
+
+.cardTitle {
+  display: block;
+  font-size: 0.875rem;
+  font-weight: 600;
+  line-height: 1.35;
+  overflow-wrap: anywhere;
+}
+
+/*
+ * Two lines of the description, clamped. A board is a scanning surface; a card
+ * that renders a 2,000-character description in full turns the column into a
+ * wall and buries every card under it. The full text is one click away in the
+ * detail panel, which is what the panel is for.
+ */
+.cardBody {
+  display: -webkit-box;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
+  line-clamp: 2;
+  overflow: hidden;
+  margin-top: 0.25rem;
+  font-size: 0.8125rem;
+  line-height: 1.4;
+  color: var(--muted);
+  overflow-wrap: anywhere;
+}
+
+.columnEmpty {
+  font-size: 0.8125rem;
+  line-height: 1.45;
+  color: var(--muted);
+  padding: 0.5rem 0.125rem;
+}
+
+/* --- the detail panel ------------------------------------------------- */
+
+.detail {
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  background: var(--panel);
+  padding: 1.25rem;
+  display: flex;
+  flex-direction: column;
+  gap: 1rem;
+}
+
+.detailHeader {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 0.75rem;
+}
+
+.detailTitle {
+  font-size: 1.0625rem;
+  line-height: 1.3;
+  letter-spacing: -0.005em;
+  overflow-wrap: anywhere;
+}
+
+.detailClose {
+  flex: 0 0 auto;
+  font-size: 0.875rem;
+  font-weight: 600;
+  color: var(--muted);
+  text-decoration: none;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 0.25rem 0.625rem;
+}
+
+.detailClose:hover {
+  color: var(--foreground);
+  border-color: var(--muted);
+}
+
+/*
+ * `white-space: pre-wrap` because the API stores the description exactly as it
+ * was typed, newlines included, and collapsing them would render a list of
+ * three bullet points as one paragraph. It is still plain text — nothing here
+ * interprets markup.
+ */
+.detailDescription {
+  font-size: 0.875rem;
+  line-height: 1.55;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.detailEmpty {
+  font-size: 0.875rem;
+  line-height: 1.55;
+  color: var(--muted);
+}
+
+.detailFacts {
+  display: grid;
+  grid-template-columns: auto 1fr;
+  gap: 0.375rem 0.875rem;
+  font-size: 0.8125rem;
+  margin: 0;
+}
+
+.detailTerm {
+  color: var(--muted);
+}
+
+.detailValue {
+  margin: 0;
+  overflow-wrap: anywhere;
+}
+
+/* --- loading ---------------------------------------------------------- */
+
+.skeletonColumn {
+  flex: 0 0 18rem;
+  height: 16rem;
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  background: var(--panel);
+}
+
+@media (prefers-reduced-motion: no-preference) {
+  .skeletonColumn {
+    animation: boardPulse 1.6s ease-in-out infinite;
+  }
+}
+
+@keyframes boardPulse {
+  0%,
+  100% {
+    opacity: 1;
+  }
+
+  50% {
+    opacity: 0.55;
+  }
+}
