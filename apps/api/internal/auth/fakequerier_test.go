@@ -9,6 +9,7 @@ package auth_test
 import (
 	"context"
 	"crypto/sha256"
+	"time"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgconn"
@@ -142,9 +143,25 @@ func (q fakeTenantQuerier) CreateOrganization(_ context.Context, arg store.Creat
 	return store.Organization{ID: q.tenantID, Name: arg.Name, Slug: arg.Slug}, nil
 }
 
+// CreateMembership models the unique index on (tenant_id, user_id) as well as
+// the insert.
+//
+// The duplicate case is not incidental here: AddMember relies on the index
+// rather than on a prior SELECT to refuse a second membership, so a fake that
+// happily appended a second row would let the "duplicate is a clean 409" test
+// pass against code that never checked.
 func (q fakeTenantQuerier) CreateMembership(_ context.Context, arg store.CreateMembershipParams) (store.Membership, error) {
 	q.store.mu.Lock()
 	defer q.store.mu.Unlock()
+
+	for _, existing := range q.store.memberships[arg.UserID] {
+		if existing.OrganizationID == q.tenantID {
+			return store.Membership{}, &pgconn.PgError{
+				Code:    "23505",
+				Message: "duplicate key value violates unique constraint \"memberships_tenant_id_user_id_key\"",
+			}
+		}
+	}
 
 	q.store.memberships[arg.UserID] = append(q.store.memberships[arg.UserID], store.UserOrganization{
 		OrganizationID: q.tenantID,
@@ -153,5 +170,25 @@ func (q fakeTenantQuerier) CreateMembership(_ context.Context, arg store.CreateM
 		Role:           arg.Role,
 	})
 
-	return store.Membership{TenantID: q.tenantID, UserID: arg.UserID, Role: arg.Role}, nil
+	return store.Membership{
+		ID: uuid.New(), TenantID: q.tenantID, UserID: arg.UserID, Role: arg.Role, CreatedAt: time.Now(),
+	}, nil
+}
+
+// GetMembership answers only for the transaction's own tenant, exactly as the
+// policy on memberships does — which is what makes "a caller holding a token
+// for an organization they were removed from is refused" testable here.
+func (q fakeTenantQuerier) GetMembership(_ context.Context, userID uuid.UUID) (store.Membership, error) {
+	q.store.mu.Lock()
+	defer q.store.mu.Unlock()
+
+	for _, existing := range q.store.memberships[userID] {
+		if existing.OrganizationID == q.tenantID {
+			return store.Membership{
+				ID: uuid.New(), TenantID: q.tenantID, UserID: userID, Role: existing.Role,
+			}, nil
+		}
+	}
+
+	return store.Membership{}, store.ErrNoRows
 }
