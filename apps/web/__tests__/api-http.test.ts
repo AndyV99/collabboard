@@ -2,7 +2,7 @@ import { describe, expect, it, vi } from "vitest";
 
 import { sendRequest } from "@/lib/api/http";
 import * as endpoints from "@/lib/api/endpoints";
-import { parseEmpty, parseProject } from "@/lib/api/types";
+import { parseAddedMember, parseEmpty, parseProject } from "@/lib/api/types";
 
 const BASE = "http://api.test/api/v1";
 
@@ -189,6 +189,28 @@ describe("endpoint definitions", () => {
       "/cards/..%2Fboards%2Fother",
     );
   });
+
+  it("omits the member role rather than sending an empty string", () => {
+    // `validateAddMember` reads "" as "grant member" and anything unrecognised
+    // as a 400, so an omitted key and an empty string happen to agree today.
+    // Omitting is still the right shape: it says "no opinion" rather than
+    // asserting a value, and it is what the Go struct's zero value means.
+    expect(JSON.parse(JSON.stringify(endpoints.addMember({ email: "a@b.c" }).body)))
+      .toEqual({ email: "a@b.c" });
+
+    expect(endpoints.addMember({ email: "a@b.c", role: "admin" }).body).toEqual({
+      email: "a@b.c",
+      role: "admin",
+    });
+  });
+
+  it("posts a member to the same /members path the list reads", () => {
+    // One path, two methods — and `members` is already on the proxy allowlist
+    // because of the list, so adding a member needed no widening of it.
+    expect(endpoints.addMember({ email: "a@b.c" }).path).toBe("/members");
+    expect(endpoints.addMember({ email: "a@b.c" }).method).toBe("POST");
+    expect(endpoints.listMembers().path).toBe("/members");
+  });
 });
 
 describe("parsers", () => {
@@ -204,5 +226,33 @@ describe("parsers", () => {
 
   it("parseEmpty is the parser for a 204", () => {
     expect(parseEmpty()).toBeNull();
+  });
+
+  it("parses the narrower body POST /members answers with", () => {
+    // `addedMemberBody` deliberately carries no display_name — a 201 must not
+    // return anything read out of the global directory (ADR 0008). The parser
+    // must therefore not require one, or every successful addition would come
+    // back as `malformed`.
+    expect(
+      parseAddedMember({
+        membership_id: "m1",
+        user_id: "u1",
+        email: "colleague@example.com",
+        role: "member",
+        joined_at: "2026-08-09T10:00:00Z",
+      }),
+    ).toEqual({
+      membershipId: "m1",
+      userId: "u1",
+      email: "colleague@example.com",
+      role: "member",
+      joinedAt: "2026-08-09T10:00:00Z",
+    });
+  });
+
+  it("rejects an added-member body missing a field", () => {
+    expect(
+      parseAddedMember({ membership_id: "m1", user_id: "u1", email: "a@b.c" }),
+    ).toBeNull();
   });
 });

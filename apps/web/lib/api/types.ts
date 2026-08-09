@@ -257,6 +257,52 @@ export function parseMember(value: unknown): Member | null {
   return { membershipId, userId, email, displayName, role, joinedAt };
 }
 
+/**
+ * `POST /members` — the membership that was just created.
+ *
+ * Deliberately narrower than {@link Member}, and the difference is a security
+ * property rather than an oversight. `addedMemberBody` in `apps/api` omits the
+ * display name because the 201 must carry nothing that was read out of the
+ * global directory: the address is the one the caller typed, normalised, and the
+ * rest is the row they just created. ADR 0008 spells out why. Keeping the two
+ * types separate here means a screen cannot accidentally render a field the API
+ * never sent and get `undefined`.
+ *
+ * The full row, display name included, arrives on the next `GET /members` — by
+ * which point it is scoped to the organization the account is now in.
+ */
+export type AddedMember = {
+  membershipId: string;
+  userId: string;
+  email: string;
+  role: string;
+  joinedAt: string;
+};
+
+export function parseAddedMember(value: unknown): AddedMember | null {
+  if (!isRecord(value)) {
+    return null;
+  }
+
+  const membershipId = str(value, "membership_id");
+  const userId = str(value, "user_id");
+  const email = str(value, "email");
+  const role = str(value, "role");
+  const joinedAt = str(value, "joined_at");
+
+  if (
+    membershipId === null ||
+    userId === null ||
+    email === null ||
+    role === null ||
+    joinedAt === null
+  ) {
+    return null;
+  }
+
+  return { membershipId, userId, email, role, joinedAt };
+}
+
 /** A project. `archivedAt` is null while the project is active. */
 export type Project = {
   id: string;
