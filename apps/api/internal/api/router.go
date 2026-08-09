@@ -53,7 +53,7 @@ func NewRouter(
 	// two have to wrap it: a body refused with 413 is still a request the log
 	// should show, and recovery has to be above anything that can panic. It
 	// cannot go any lower — a limit mounted on the authenticated group would
-	// leave the four routes an anonymous caller can actually reach as the only
+	// leave the five routes an anonymous caller can actually reach as the only
 	// unbounded ones, which is the entire vulnerability.
 	router.Use(requestLogger(logger), recovery(logger), limitRequestBody(limits.Default))
 
@@ -79,6 +79,15 @@ func NewRouter(
 	unauthenticated.POST("/auth/login", loginHandler(logger, authDeps.Service))
 	unauthenticated.POST("/auth/refresh", refreshHandler(logger, authDeps.Service))
 	unauthenticated.POST("/auth/logout", logoutHandler(logger, authDeps.Service))
+
+	// The odd one out, and here rather than on the authenticated group for a
+	// structural reason rather than a convenient one: the account it serves has
+	// no organization, so it has no tenant, so it cannot hold a token this
+	// service would issue or verify. It presents a password like the four above
+	// and is rate limited like login. See createOrganizationHandler and
+	// internal/auth/organizations.go — and note that requireAuth is untouched by
+	// it, which was the constraint that decided the design.
+	unauthenticated.POST("/organizations", createOrganizationHandler(logger, authDeps.Service))
 
 	// Everything below requires a valid access token, and takes its tenant from
 	// that token's org claim. There is no route parameter for an organization
