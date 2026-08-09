@@ -8,6 +8,7 @@
 
 import type { NextRequest } from "next/server";
 
+import { REFUSAL_CROSS_ORIGIN, REFUSAL_HEADER } from "@/lib/auth/outcomes";
 import { type ApiError, relayStatus } from "@/lib/api/errors";
 import { logEvent } from "@/lib/log";
 import { checkSameOrigin } from "./origin";
@@ -52,6 +53,13 @@ export function noContent(): Response {
  *
  * Returns a 403 to send, or null to proceed. See `lib/session/origin.ts` for
  * why this exists on top of `sameSite: "lax"`.
+ *
+ * The refusal carries {@link REFUSAL_HEADER}. The Go API also answers 403 —
+ * "this account does not belong to an organization", which is issue #34
+ * surfacing and needs a completely different screen — and the sign-in form has
+ * to tell the two apart. `relayApiError` never sets the header, so its presence
+ * means the refusal was this app's. The alternative was matching on the message
+ * text, which would make the copy load-bearing.
  */
 export function guardOrigin(request: NextRequest): Response | null {
   const verdict = checkSameOrigin(request.headers, request.nextUrl.origin);
@@ -66,7 +74,9 @@ export function guardOrigin(request: NextRequest): Response | null {
     path: request.nextUrl.pathname,
   });
 
-  return jsonError(403, "This request did not come from this site.");
+  return jsonError(403, "This request did not come from this site.", {
+    [REFUSAL_HEADER]: REFUSAL_CROSS_ORIGIN,
+  });
 }
 
 /**

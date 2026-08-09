@@ -36,6 +36,12 @@
  * that header" true rather than merely intended. Found in review; the test is in
  * `__tests__/auth-routes.test.ts`.
  *
+ * **It also stamps the requested path onto the request.** A layout is not told
+ * its own URL, and the protected layout needs one to send an unauthenticated
+ * visitor to sign in and back again. Same discipline as above — `set`, not
+ * `append`, on every path — and the value is only ever read through
+ * `safeReturnPath`. See `lib/session/request-path.ts`.
+ *
  * **It never redirects.** Signing out is a state, not a navigation: the cookies
  * are cleared and the render sees no session. Where an unauthenticated visitor
  * should be sent is a decision for the screen that knows what it needed, made
@@ -60,6 +66,7 @@ import {
   stripForwardedSession,
 } from "@/lib/session/forward";
 import { resolveProxySession } from "@/lib/session/proxy-session";
+import { setRequestPath } from "@/lib/session/request-path";
 
 /**
  * Paths that get the header strip and nothing else.
@@ -77,6 +84,13 @@ export default async function proxy(request: NextRequest): Promise<NextResponse>
   // on every path and whatever the outcome. Server code must only ever see one
   // this file wrote.
   const requestHeaders = stripForwardedSession(request.headers);
+
+  // Which page was asked for, so the protected layout can send an
+  // unauthenticated visitor to sign in *and back again*. Written with `set` on
+  // every path, which is also how a client-supplied copy is discarded. It never
+  // becomes a destination without going through `safeReturnPath` — see
+  // `lib/session/request-path.ts`.
+  setRequestPath(requestHeaders, request.nextUrl);
 
   if (strippedOnly(request.nextUrl.pathname)) {
     return NextResponse.next({ request: { headers: requestHeaders } });

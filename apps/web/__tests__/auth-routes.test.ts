@@ -175,6 +175,12 @@ describe("POST /api/auth/login", () => {
 
     expect(response.status).toBe(403);
     expect(fetchImpl).not.toHaveBeenCalled();
+
+    // The Go API also answers 403 — "this account does not belong to an
+    // organization", which is a completely different screen — so the sign-in
+    // form has to tell the two apart by something other than the status. This
+    // header is that something; `relayApiError` never sets it.
+    expect(response.headers.get("x-collabboard-refusal")).toBe("cross-origin");
   });
 
   it("rejects an incomplete body without spending a rate-limit slot", async () => {

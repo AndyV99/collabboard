@@ -1,7 +1,10 @@
+import Link from "next/link";
 import { connection } from "next/server";
 
 import { HealthPanel } from "@/components/health-panel";
+import { DEFAULT_SIGNED_IN_PATH, SIGN_IN_PATH, SIGN_UP_PATH } from "@/lib/auth/routes";
 import { probeHealth } from "@/lib/health";
+import { getRenderSession } from "@/lib/session/server";
 import styles from "./page.module.css";
 
 /**
@@ -23,7 +26,10 @@ export default async function Home() {
   // build output must keep showing `ƒ /`, not `○ /`.
   await connection();
 
-  const probe = await probeHealth();
+  // The public page, so it reads the session rather than requiring one: a
+  // visitor with no session sees the way in, and one with a session sees the
+  // way back. Neither is a redirect — this route belongs to nobody.
+  const [probe, session] = await Promise.all([probeHealth(), getRenderSession()]);
 
   return (
     <div className={styles.page}>
@@ -31,10 +37,27 @@ export default async function Home() {
         <header className={styles.intro}>
           <h1 className={styles.heading}>CollabBoard</h1>
           <p className={styles.subheading}>
-            App shell only. The panel below is server-rendered from the Go
-            API&rsquo;s <code>/healthz</code> endpoint — board UI lands in a
-            later issue.
+            Multi-tenant, real-time Kanban. Sign in to reach your workspace; the
+            panel below is server-rendered from the Go API&rsquo;s{" "}
+            <code>/healthz</code> endpoint, and board UI lands in a later issue.
           </p>
+
+          <div className={styles.actions}>
+            {session === null ? (
+              <>
+                <Link className={styles.primary} href={SIGN_IN_PATH}>
+                  Sign in
+                </Link>
+                <Link className={styles.secondary} href={SIGN_UP_PATH}>
+                  Create an account
+                </Link>
+              </>
+            ) : (
+              <Link className={styles.primary} href={DEFAULT_SIGNED_IN_PATH}>
+                Open {session.organization.name}
+              </Link>
+            )}
+          </div>
         </header>
 
         <HealthPanel probe={probe} />
