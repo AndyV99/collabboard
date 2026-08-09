@@ -1,16 +1,27 @@
 "use client";
 
-import Link from "next/link";
-import { useCallback, useEffect, useOptimistic, useRef, useState } from "react";
+import { useCallback, useEffect, useId, useOptimistic, useRef, useState } from "react";
 
-import type { Card } from "@/lib/api/types";
-import { type BoardChange, applyBoardChange, isPendingId } from "@/lib/board/mutations";
+import {
+  type BoardChange,
+  type CardDirection,
+  type CardMove,
+  applyBoardChange,
+  cardDropTarget,
+  cardNudge,
+  cardPosition,
+  isPendingId,
+  isRedundantMove,
+} from "@/lib/board/mutations";
 import type { BoardSnapshot, ColumnWithCards } from "@/lib/board/snapshot";
 import { columnNameOf, findCard } from "@/lib/board/snapshot";
-import { boardHref, cardHref } from "@/lib/workspace/routes";
+import { boardHref } from "@/lib/workspace/routes";
 import { FormMessage } from "@/components/workspace/fields";
 import { CardComposer, ColumnActions, ColumnComposer } from "./board-controls";
 import { CardDetail, CardNotOnBoard } from "./card-detail";
+import { CardDragArea, CardDropZone, DraggableCard, PendingCard } from "./card-drag";
+import type { DragReport } from "./card-drag";
+import { useCardMoves } from "./card-moves";
 import styles from "./board.module.css";
 import workspace from "@/components/workspace/workspace.module.css";
 
@@ -64,6 +75,33 @@ import workspace from "@/components/workspace/workspace.module.css";
  * `board-controls.tsx` for why; the short version is that an 18rem column has
  * no room for six open forms, and that a board nobody is editing should mount
  * nothing that edits.
+ *
+ * #65 is the exception, and it ends a property #64 had: a board nobody is
+ * editing used to mount nothing router-bound, so `__tests__/board-view.test.tsx`
+ * could render it with no app-router context at all. A card is draggable
+ * without anyone opening anything, so the drag context and the mutation runner
+ * behind it are mounted for every board. That test now mocks
+ * `next/navigation` — which is the honest consequence of the feature, not a
+ * test being bent to fit.
+ *
+ * # One proposed move, two ways to make it
+ *
+ * A drag and a keyboard lift are the same interaction: pick a card up, choose
+ * somewhere, commit or give up. So they share one piece of state — `proposal`,
+ * a {@link CardMove} — and the board is drawn by running it through
+ * `applyBoardChange`, the same pure reducer the optimistic store uses. The two
+ * input methods differ only in what sets it: a pointer over a card, or an arrow
+ * key.
+ *
+ * That is why moving a card five places with the keyboard costs one request,
+ * exactly like one drag. Each arrow key moves the *proposal*, which is local and
+ * free; only the drop sends anything. A control that posted per keypress would
+ * be five moves, five whole-board re-reads, and five chances for someone else's
+ * edit to land in the middle of one gesture.
+ *
+ * `proposal` is plain `useState` and not part of the optimistic store on
+ * purpose. It is a question, not an edit — nothing has been sent, and there is
+ * nothing for the server to confirm or refuse until the card is dropped.
  */
 export function BoardView({
   snapshot,
@@ -105,13 +143,195 @@ export function BoardView({
 
   const [addingColumn, setAddingColumn] = useState(false);
 
-  const columns = board.columns.map((entry) => entry.column);
-  const cards = [...board.columns.flatMap((entry) => entry.cards), ...board.unplaced];
+  const sendMove = useCardMoves(applyChange, report);
+
+  /** Where a card would go if it were dropped now. Nothing has been sent. */
+  const [proposal, setProposal] = useState<CardMove | null>(null);
+  /** The card held by the keyboard, if any. Null during a pointer drag. */
+  const [lifted, setLifted] = useState<string | null>(null);
+  /** The card under the pointer, for the floating copy that follows it. */
+  const [dragging, setDragging] = useState<string | null>(null);
+  const [announcement, setAnnouncement] = useState("");
+
+  const instructionsId = `${useId()}-move-help`;
+
+  // The board as the user is looking at it: the server's, plus every optimistic
+  // edit React is holding, plus the move being proposed. Only the last of those
+  // is undecided, and it is undone by setting it back to null.
+  const shown = proposal === null ? board : applyBoardChange(board, { kind: "card.moved", ...proposal });
+
+  const columns = shown.columns.map((entry) => entry.column);
+  const cards = [...shown.columns.flatMap((entry) => entry.cards), ...shown.unplaced];
 
   const openCard = selectedCardId === null ? null : findCard(cards, selectedCardId);
   const closeHref = boardHref(projectId, boardId);
 
   const wiring = { applyChange, report };
+
+  const titleOf = (cardId: string): string =>
+    cards.find((card) => card.id === cardId)?.title ?? "The card";
+
+  /**
+   * Sends a move, unless it would change nothing.
+   *
+   * `board` rather than `shown` is what "nothing" is measured against: `shown`
+   * already has the proposal applied, so every move looks redundant against it.
+   * The comparison that matters is against the board the server last confirmed
+   * plus whatever is already in flight, which is exactly the optimistic value.
+   */
+  function commit(move: CardMove): void {
+    if (isRedundantMove(board, move)) {
+      say(`${titleOf(move.cardId)} was not moved. ${whereIs(shown, move.cardId)}`);
+
+      return;
+    }
+
+    sendMove(move);
+    say(
+      `${titleOf(move.cardId)} moved. ${whereIs(
+        applyBoardChange(board, { kind: "card.moved", ...move }),
+        move.cardId,
+      )}`,
+    );
+  }
+
+  function say(message: string): void {
+    // A live region whose text has not changed is not re-announced, and two
+    // arrow presses that both hit the top of a column are two separate answers
+    // to two separate questions. A zero-width space alternates on and off so
+    // consecutive identical sentences are two different strings, and reads as
+    // nothing.
+    setAnnouncement((previous) => (previous === message ? `${message}​` : message));
+  }
+
+  function handleDragStart(cardId: string): void {
+    setDragging(cardId);
+    setLifted(null);
+    setProposal(null);
+    say(`${titleOf(cardId)} picked up. ${whereIs(shown, cardId)}`);
+  }
+
+  /**
+   * Relocates the card while it is being dragged, but only across columns.
+   *
+   * Within a column the sortable strategy is already opening a gap where the
+   * card would land, so re-ordering the list underneath it too would move the
+   * card twice for one gesture. Crossing into another column has no such
+   * preview — the card would otherwise hover over a list that has not made room
+   * for it — so that one is drawn here.
+   */
+  function handleDragOver(report: DragReport): void {
+    const target = cardDropTarget(shown, report.cardId, report.over, report.past);
+
+    if (target === undefined || target.columnId === columnIdOf(shown, report.cardId)) {
+      return;
+    }
+
+    setProposal(target);
+  }
+
+  function handleDrop(report: DragReport | null): void {
+    const heldCard = dragging;
+    const heldMove = proposal;
+
+    setDragging(null);
+    setProposal(null);
+
+    if (report === null) {
+      // Let go outside every column. The card goes back — and says so, for
+      // anyone who cannot watch it go back.
+      if (heldCard !== null) {
+        say(`${titleOf(heldCard)} was not moved. ${whereIs(board, heldCard)}`);
+      }
+
+      return;
+    }
+
+    // Falling back to the proposal is not belt-and-braces, it is the common
+    // case for a drag that crossed columns — and getting it wrong is what made
+    // every cross-column drop silently do nothing the first time this ran
+    // against a real board. The preview has already drawn the card where it
+    // would land, so by the time the button comes up the pointer is over *the
+    // dragged card itself*; `cardDropTarget` rightly has no answer for that,
+    // because `after_card_id` equal to the moving card's own id is a 409. The
+    // proposal is what the user is looking at, and it is what they meant.
+    const target =
+      cardDropTarget(shown, report.cardId, report.over, report.past) ?? heldMove;
+
+    if (target === null) {
+      return;
+    }
+
+    commit(target);
+  }
+
+  function handleDragCancel(): void {
+    const held = dragging;
+
+    setDragging(null);
+    setProposal(null);
+
+    if (held !== null) {
+      say(`Move cancelled. ${titleOf(held)} is back in ${whereIs(board, held)}`);
+    }
+  }
+
+  function handleLift(cardId: string): void {
+    setLifted(cardId);
+    setProposal(null);
+    say(
+      `${titleOf(cardId)} lifted. ${whereIs(shown, cardId)} Use the arrow keys to move it, ` +
+        "Enter to drop it, Escape to cancel.",
+    );
+  }
+
+  function handleNudge(cardId: string, direction: CardDirection): void {
+    const target = cardNudge(shown, cardId, direction);
+
+    if (target === undefined) {
+      say(`${titleOf(cardId)} cannot move ${direction} from here. ${whereIs(shown, cardId)}`);
+
+      return;
+    }
+
+    setProposal(target);
+    say(
+      whereIs(applyBoardChange(shown, { kind: "card.moved", ...target }), cardId),
+    );
+  }
+
+  function handleKeyboardDrop(): void {
+    const held = proposal;
+
+    setLifted(null);
+    setProposal(null);
+
+    if (held === null) {
+      return;
+    }
+
+    commit(held);
+  }
+
+  function handleKeyboardCancel(): void {
+    const held = lifted;
+
+    setLifted(null);
+    setProposal(null);
+
+    if (held !== null) {
+      say(`Move cancelled. ${titleOf(held)} is back in ${whereIs(board, held)}`);
+    }
+  }
+
+  const moving = {
+    instructionsId,
+    lifted,
+    onCancel: handleKeyboardCancel,
+    onDrop: handleKeyboardDrop,
+    onLift: handleLift,
+    onNudge: handleNudge,
+  };
 
   return (
     <div
@@ -128,7 +348,36 @@ export function BoardView({
           </FormMessage>
         )}
 
-        {board.columns.length === 0 ? (
+        {/*
+         * One live region for both input methods. `assertive`, because a
+         * position that arrives after the next keypress is describing a board
+         * that has already moved on; and `atomic`, so the whole sentence is
+         * read rather than the words that happen to have changed.
+         */}
+        {/*
+         * Named, because it is not the only one on the page: `DndContext`
+         * renders a live region of its own that this board keeps silent (see
+         * `card-drag.tsx`). A name is what distinguishes the region that speaks
+         * from the one that does not, for a test and for anyone browsing
+         * regions with a screen reader.
+         */}
+        <div
+          aria-atomic="true"
+          aria-label="Card moves"
+          aria-live="assertive"
+          className={styles.visuallyHidden}
+          role="status"
+        >
+          {announcement}
+        </div>
+
+        <p className={styles.visuallyHidden} id={instructionsId}>
+          Press Enter or Space to lift this card. Use the arrow keys to move it
+          up and down its column or into the column beside it, then press Enter
+          to drop it or Escape to leave it where it was.
+        </p>
+
+        {shown.columns.length === 0 ? (
           <EmptyBoard
             adding={addingColumn}
             boardId={boardId}
@@ -137,42 +386,51 @@ export function BoardView({
             wiring={wiring}
           />
         ) : (
-          <ol className={styles.columns}>
-            {board.columns.map((entry) => (
-              <BoardColumn
-                boardId={boardId}
-                columns={board.columns}
-                entry={entry}
-                key={entry.column.id}
-                projectId={projectId}
-                selectedCardId={openCard?.id ?? null}
-                wiring={wiring}
-              />
-            ))}
-
-            <li className={styles.addColumn}>
-              {addingColumn ? (
-                <ColumnComposer
-                  applyChange={applyChange}
+          <CardDragArea
+            onCancel={handleDragCancel}
+            onDrop={handleDrop}
+            onOver={handleDragOver}
+            onStart={handleDragStart}
+            overlay={dragging === null ? null : (findCard(cards, dragging) ?? null)}
+          >
+            <ol className={styles.columns}>
+              {shown.columns.map((entry) => (
+                <BoardColumn
                   boardId={boardId}
-                  onClose={() => setAddingColumn(false)}
-                  report={report}
+                  columns={shown.columns}
+                  entry={entry}
+                  key={entry.column.id}
+                  moving={moving}
+                  projectId={projectId}
+                  selectedCardId={openCard?.id ?? null}
+                  wiring={wiring}
                 />
-              ) : (
-                // No `aria-expanded`: this button is *replaced* by the form
-                // rather than disclosing a region it stays next to, and a
-                // control that reports itself collapsed after being activated
-                // describes something that is not on the page.
-                <button
-                  className={styles.addColumnButton}
-                  onClick={() => setAddingColumn(true)}
-                  type="button"
-                >
-                  + Add a column
-                </button>
-              )}
-            </li>
-          </ol>
+              ))}
+
+              <li className={styles.addColumn}>
+                {addingColumn ? (
+                  <ColumnComposer
+                    applyChange={applyChange}
+                    boardId={boardId}
+                    onClose={() => setAddingColumn(false)}
+                    report={report}
+                  />
+                ) : (
+                  // No `aria-expanded`: this button is *replaced* by the form
+                  // rather than disclosing a region it stays next to, and a
+                  // control that reports itself collapsed after being activated
+                  // describes something that is not on the page.
+                  <button
+                    className={styles.addColumnButton}
+                    onClick={() => setAddingColumn(true)}
+                    type="button"
+                  >
+                    + Add a column
+                  </button>
+                )}
+              </li>
+            </ol>
+          </CardDragArea>
         )}
       </div>
 
@@ -201,6 +459,37 @@ type Wiring = {
   applyChange: (change: BoardChange) => void;
   report: (message: string | null) => void;
 };
+
+/** The keyboard move, wired down to each card's grip. */
+type Moving = {
+  instructionsId: string;
+  /** The card currently held by the keyboard, if it is this one. */
+  lifted: string | null;
+  onLift: (cardId: string) => void;
+  onNudge: (cardId: string, direction: CardDirection) => void;
+  onDrop: () => void;
+  onCancel: () => void;
+};
+
+/**
+ * Where a card is, as the end of a spoken sentence: "Doing, 2 of 3."
+ *
+ * "2 of 3" rather than "second" because a position is only meaningful next to
+ * the length — "second" tells you nothing about whether the card is near the
+ * bottom, which is the thing someone moving it wants to know.
+ */
+function whereIs(snapshot: BoardSnapshot, cardId: string): string {
+  const at = cardPosition(snapshot, cardId);
+
+  return at === undefined ? "" : `${at.columnName}, ${at.index} of ${at.total}.`;
+}
+
+/** Which column a card is currently drawn in, if any. */
+function columnIdOf(snapshot: BoardSnapshot, cardId: string): string | undefined {
+  return snapshot.columns.find((entry) =>
+    entry.cards.some((card) => card.id === cardId),
+  )?.column.id;
+}
 
 /**
  * A board with no columns yet.
@@ -270,6 +559,7 @@ function BoardColumn({
   boardId,
   selectedCardId,
   wiring,
+  moving,
 }: {
   entry: ColumnWithCards;
   columns: readonly ColumnWithCards[];
@@ -277,6 +567,7 @@ function BoardColumn({
   boardId: string;
   selectedCardId: string | null;
   wiring: Wiring;
+  moving: Moving;
 }) {
   const { column, cards } = entry;
   const headingId = `column-${column.id}`;
@@ -328,22 +619,27 @@ function BoardColumn({
         />
       )}
 
-      {cards.length === 0 ? (
-        <p className={styles.columnEmpty}>No cards in this column.</p>
-      ) : (
-        <ol aria-labelledby={headingId} className={styles.stack} tabIndex={0}>
-          {cards.map((card) => (
-            <li key={card.id}>
-              <BoardCard
-                boardId={boardId}
-                card={card}
-                projectId={projectId}
-                selected={card.id === selectedCardId}
-              />
-            </li>
-          ))}
-        </ol>
-      )}
+      <CardDropZone cards={cards} columnId={column.id} labelledBy={headingId}>
+        {cards.map((card) =>
+          isPendingId(card.id) ? (
+            <PendingCard card={card} key={card.id} />
+          ) : (
+            <DraggableCard
+              boardId={boardId}
+              card={card}
+              instructionsId={moving.instructionsId}
+              key={card.id}
+              lifted={moving.lifted === card.id}
+              onCancel={moving.onCancel}
+              onDrop={moving.onDrop}
+              onLift={() => moving.onLift(card.id)}
+              onNudge={(direction) => moving.onNudge(card.id, direction)}
+              projectId={projectId}
+              selected={card.id === selectedCardId}
+            />
+          ),
+        )}
+      </CardDropZone>
 
       {settled &&
         (adding ? (
@@ -366,55 +662,5 @@ function BoardColumn({
           </button>
         ))}
     </li>
-  );
-}
-
-/**
- * One card, as a link that opens it.
- *
- * A link rather than a button because opening a card *is* a navigation here —
- * it changes the URL and the URL is the state. That also means it works before
- * hydration, opens in a new tab on a modifier-click, and can be copied.
- *
- * `aria-current="true"` on the open card, so the selection is announced rather
- * than only outlined.
- *
- * A card the server has not acknowledged is **not** a link. Its id was invented
- * by this client, so `?card=<that id>` would open a panel for a card that does
- * not exist — and would keep working, confusingly, right up until the refresh
- * replaced the id with a real one.
- */
-function BoardCard({
-  card,
-  projectId,
-  boardId,
-  selected,
-}: {
-  card: Card;
-  projectId: string;
-  boardId: string;
-  selected: boolean;
-}) {
-  if (isPendingId(card.id)) {
-    return (
-      <span className={`${styles.card} ${styles.cardPending}`}>
-        <span className={styles.cardTitle}>{card.title}</span>
-        <span className={styles.cardPendingNote}>Adding…</span>
-      </span>
-    );
-  }
-
-  return (
-    <Link
-      aria-current={selected ? "true" : undefined}
-      className={selected ? `${styles.card} ${styles.cardSelected}` : styles.card}
-      href={cardHref(projectId, boardId, card.id)}
-    >
-      <span className={styles.cardTitle}>{card.title}</span>
-
-      {card.description !== "" && (
-        <span className={styles.cardBody}>{card.description}</span>
-      )}
-    </Link>
   );
 }
