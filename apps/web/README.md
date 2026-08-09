@@ -8,7 +8,8 @@ sign in, sign out, route protection),
 [the signed-in workspace](#the-workspace-projects-boards-and-people) — projects,
 boards and the people in an organization — and
 [the board view](#the-board-view-columns-and-cards), which renders a board's
-columns and cards read-only. Creating and editing cards is #64, drag-and-drop is
+columns and cards and lets you edit them: create, rename, reorder and delete
+columns, and create, edit and delete cards. Dragging a card between columns is
 #65, and the WebSocket client is #9.
 
 ## Commands
@@ -573,6 +574,7 @@ components/projects/                      list, create, rename, archive
 components/boards/                        a project's boards, and one board itself
 components/members/                       list, add
 lib/board/snapshot.ts                     columns × cards, in the API's order
+lib/board/mutations.ts                    what one edit does to that shape
 lib/workspace/routes.ts                   every URL, and why the board one nests
 lib/workspace/rules.ts                    validation mirroring crud.go's limits
 lib/workspace/roles.ts                    who may add, and where the role is read from
@@ -613,10 +615,9 @@ app/api/proxy/*         authenticated pass-through for Client Components
 ## The board view: columns and cards
 
 The core screen. `/app/projects/<id>/boards/<id>` renders a board as columns of
-cards, **read-only** — creating and editing cards is #64, drag-and-drop is #65,
-live updates are #9. There is no disabled "New card" button standing in for
-them; a control that cannot do anything is a promise the screen cannot keep, so
-the page says in words what is missing instead.
+cards and lets you change it. Dragging a card from one column to another is #65
+and live updates are #9, and the note under the board says so in words rather
+than offering a disabled control that cannot do it.
 
 ### The order is the API's, and the client never computes one
 
@@ -677,50 +678,137 @@ a board that loaded fine. An id that names nothing on this board renders a "card
 not found" panel with the board still behind it, without asking the API whose
 card it was.
 
-### Where the Server/Client line falls — #64, #65 and #66 inherit this
+### Where the Server/Client line falls — #65 and #66 inherit this
 
-**The page is the only thing that touches the API or the session.** Everything
-below it is a pure component taking resolved, plain-serialisable props:
+**The page is the only thing that touches the API or the session.** It fetches,
+checks the two 404 cases, groups the responses, and hands plain serialisable
+props to one client boundary:
 
 ```
 page.tsx                     Server Component: four requests, the 404 checks,
                              and the grouping. The only async thing here.
 lib/board/snapshot.ts        pure: columns × cards → the board's shape
-components/boards/board-view.tsx    pure: columns, cards, selection
-components/boards/card-detail.tsx   pure: one card, and the not-found panel
+lib/board/mutations.ts       pure: snapshot + one edit → the next snapshot
+components/boards/board-view.tsx      "use client": the optimistic store, the
+                                      columns, and the detail panel
+components/boards/board-mutation.ts   apply → send → refresh, for one edit
+components/boards/board-controls.tsx  the composers and the column tools
+components/boards/card-detail.tsx     one card, read or editable
 components/boards/board-skeleton.tsx  the loading.tsx fallback
 ```
 
-Today that means the board is fully server-rendered and the browser is sent no
-board code at all. The part that matters for later is the *shape*: `Card` and
-`Column` are strings all the way down (`lib/api/types.ts` keeps timestamps as
-strings for exactly this reason), so making the board interactive is
-`"use client"` at the top of `board-view.tsx` — the props already cross an RSC
-boundary unchanged and `page.tsx` does not move.
+#63 predicted that making the board interactive would be `"use client"` at the
+top of `board-view.tsx` with `page.tsx` unchanged, and #64 confirmed it: the
+props cross the RSC boundary unaltered because `Card` and `Column` are strings
+all the way down. Two things did change in the page, both consequences of a card
+now being deletable — it passes the **raw** `?card=` value down rather than a
+resolved one, and `BoardView` owns the detail panel so that one optimistic store
+covers both a card's tile and the panel that edits it.
 
-Three things to keep when that happens:
+The three rules that came with the boundary, all still in force:
 
-1. **Do not make `page.tsx` a Client Component to get state into it.** The
-   session and the token live on the server; a client page would refetch the
-   board through `/api/proxy` on every mount and give up first paint for
-   nothing.
-2. **Do not fetch from a board component.** One request per column is the
-   failure mode this design exists to avoid, and it starts with one innocent
-   `useEffect`.
-3. **Reorder by asking the server, not by sorting an array.** `POST
-   /cards/:id/move` then re-read. An optimistic local reorder is fine as a
-   *display* while the request is in flight; it must not become the source of
-   truth, or the client has invented the rank ADR 0004 refused to publish.
+1. **`page.tsx` is not a Client Component.** The session and the token live on
+   the server; a client page would refetch the board through `/api/proxy` on
+   every mount and give up first paint for nothing.
+2. **No board component fetches.** One request per column is the failure mode
+   this design exists to avoid, and it starts with one innocent `useEffect`.
+   Writes go out through `/api/proxy` and are followed by `router.refresh()`,
+   so the *read* still happens once, on the server.
+3. **Reorder by asking the server, not by sorting an array.** A column move
+   posts `POST /columns/:id/move` with a neighbour's id and then re-reads. The
+   splice in `lib/board/mutations.ts` is a display held for the duration of the
+   request; it never becomes the source of truth, or the client would have
+   invented the rank ADR 0004 refused to publish.
 
 Selection is a URL rather than state, so there is nothing to lift into a
 provider either.
+
+### Editing: optimistic, and rolled back by construction
+
+Every edit applies on screen immediately, goes out through `/api/proxy`, and
+then either is confirmed by a fresh server render or disappears.
+
+The mechanism is React's
+[`useOptimistic`](https://react.dev/reference/react/useOptimistic), whose store
+lives in `BoardView` and whose reducer is the pure function in
+`lib/board/mutations.ts`. A control calls the setter from inside the transition
+that sends the request, and React holds such a value **only while that
+transition is pending**:
+
+- **Success** — `router.refresh()` runs inside the transition, so it stays
+  pending until the Server Component has re-rendered. The optimistic value is
+  dropped at the moment the real one replaces it, so the board does not flash
+  through its old state on the way to its new one.
+- **Failure** — the transition ends, the prop never changed, and the board is
+  exactly as it was.
+
+**So there is no `undo` function anywhere, and that is the point.** The
+alternative — `useState` plus a hand-written inverse per operation — puts the
+correctness of the failure path in code that only runs when the server refuses,
+which is the path nobody exercises locally. `__tests__/board-editing.test.tsx`
+tests it anyway, for all seven operations, and each of those tests asserts the
+change is on screen *before* the refusal as well as gone after it, so it fails
+against a board that is not optimistic as loudly as against one that never
+reverts.
+
+Two consequences worth knowing:
+
+- **The optimistic store sits above everything that can be deleted.** A control
+  that deletes a column lives inside that column and unmounts the instant the
+  delete applies, so neither the optimistic value nor the failure message can be
+  held there. The failure banner is on the board for the same reason.
+- **A row the server has not acknowledged is not addressable.** Its id was
+  invented by this client (`pending:` prefix), so its tile is rendered as inert
+  text rather than a link to `?card=<invented id>`, and a column in that state is
+  shown without its Edit control.
+
+### The limits are the API's, counted the way Go counts
+
+200 code points on a column name and a card title, 10,000 on a description —
+`maxNameLength` and `maxDescriptionLength` in `apps/api/internal/api/crud.go`.
+Checked before the request rather than after the 400, and never stricter than
+the service: exactly 200 is accepted here because `requiredText` accepts it.
+
+Counted with `codePointLength`, because the API counts with
+`utf8.RuneCountInString` and `String.length` is neither bytes nor code points.
+The `maxLength` attribute is a courtesy stop and goes through `maxLengthFor`,
+which doubles the limit — `maxLength` counts UTF-16 code units, so passing 200
+would stop the browser at 100 emoji and refuse input the API would have taken.
+
+Input is trimmed before it is validated and sent, because the API trims before
+it stores. An empty description clears the field (`allowEmpty: true`); an empty
+title does not (`allowEmpty: false`). A form that changed nothing closes instead
+of submitting, because `PATCH` answers 400 to a body that mentions no field.
+
+**A card edit sends only the fields that changed.** `PATCH /cards/:id` leaves
+out what it is not given, so resending an untouched description would overwrite
+a colleague's edit to it with the copy this page loaded a minute ago.
+
+### Deleting a column says how many cards go with it
+
+`DELETE /columns/:id` cascades to the column's cards, and there is no undo and
+no way to list deleted rows (#49). So the confirmation states the number:
+*"Delete Doing and its 12 cards?"* — because "Are you sure?" is a question
+nobody reads, and the count is the fact that changes the answer.
+
+It is a panel rather than `window.confirm`, which cannot be styled or tested,
+blocks the event loop, and is suppressible browser-wide. Deleting a card is
+confirmed the same way, and on success the panel navigates back to the board
+without `?card=` rather than leaving the URL pointing at a card that is gone.
+
+Unlike `archive-project.tsx`, neither asks you to type a name. That is a
+judgement about proportion — a project is the whole tree and its confirmation
+guards a workspace-wide disappearance, where a column is one list a person can
+see the whole of, with its cost stated in the sentence.
 
 ### States, all of them reachable
 
 | State | What renders |
 | --- | --- |
 | Loading | `loading.tsx` — column-shaped, in the first flush |
-| Empty board | "This board has no columns yet", and what a column is for |
+| Empty board | "This board has no columns yet", what a column is for, and the form that adds the first one |
+| A write the server refused | The change comes off the board, and a focused `role="alert"` says why |
+| A row not yet acknowledged | Drawn dimmed and inert — no link, no Edit — because its id is invented |
 | Empty column | "No cards in this column." in place of the list |
 | Board not found / another tenant's | One 404 sentence covering both, per `crud.go`'s `notFound` |
 | Board in a different project | The same 404 — `board.projectId` is checked against the URL |
