@@ -65,6 +65,12 @@ type (
 	// the user it refers to.
 	ListMembersRow = gen.ListMembersRow
 
+	// GetUserRow is the identity half of a user, as Querier.GetUser returns it:
+	// id, email, display name. No timestamps, because nothing asks for them,
+	// and no column that is not on that list — see query.sql for why the
+	// column list is written out rather than SELECT *.
+	GetUserRow = gen.GetUserRow
+
 	// UpdateProjectParams are the arguments to Querier.UpdateProject. The two
 	// nullable fields are a PATCH, not an oversight: nil means "leave this
 	// column alone", which is what lets one endpoint rename a project without

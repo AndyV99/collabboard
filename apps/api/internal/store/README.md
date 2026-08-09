@@ -100,6 +100,17 @@ transaction's tenant". The WebSocket hub asks it on an interval for every live
 connection, because a connection authorized once outlives the check that
 authorized it — see `internal/realtime/README.md`.
 
+`GetUser` (issue #75) has the same shape and the same reason. `users` is global,
+so its policy is *derived*: `users_visible_via_membership` shows a row only when
+a membership joins it to the current tenant. A tenant-scoped `GetUser` therefore
+returns a colleague, or no row — never a stranger — which is why `GET /me` can
+report the caller's own email and display name without going anywhere near the
+pre-tenant door. It is a narrowing of `ListMembers`, not a new reach:
+`ListMembers` already returns the same two columns for every member.
+`store_test.go`'s `TestGetUserIsBoundedByTheDerivedUsersPolicy` asserts all
+three cases — own row, the user shared between both tenants, and the other
+tenant's member by real primary key.
+
 The query set started out deliberately representative rather than exhaustive —
 enough to exercise the mechanism across the interesting boundaries (a plain
 tenant-scoped list, a child collection reached by parent id, a join from

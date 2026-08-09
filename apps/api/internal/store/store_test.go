@@ -99,6 +99,86 @@ func TestWithTenantSeesOnlyItsOwnTenantsRows(t *testing.T) {
 	}
 }
 
+// TestGetUserIsBoundedByTheDerivedUsersPolicy settles the question issue #75
+// turned on: can a *tenant-scoped* transaction read a user row at all?
+//
+// It can, and the boundary is not the one the other tables have. `users` is
+// global and carries no tenant_id; users_visible_via_membership makes a row
+// visible only when a membership joins it to the current tenant. So the answer
+// is neither "always" nor "never" — a member of this organization is readable
+// by primary key, and anyone else is `no rows`, including a real account with a
+// real id that simply belongs elsewhere.
+//
+// That is the whole reason GET /me does not need the pre-tenant door: the
+// caller is by definition a member of the tenant in their own token, so their
+// own row is on the visible side of this policy.
+func TestGetUserIsBoundedByTheDerivedUsersPolicy(t *testing.T) {
+	ctx := context.Background()
+	pool := newPool(t, 4)
+	superuser := newSuperuserPool(t)
+	fixture := seedFixture(t, superuser)
+	s := store.New(pool)
+
+	for _, tc := range []struct {
+		self  tenantFixture
+		other tenantFixture
+	}{
+		{self: fixture.A, other: fixture.B},
+		{self: fixture.B, other: fixture.A},
+	} {
+		t.Run(tc.self.Label, func(t *testing.T) {
+			err := s.WithTenant(ctx, tc.self.TenantID, func(ctx context.Context, q store.Querier) error {
+				// 1. The tenant's own member, by primary key. This is the /me
+				//    case: the caller reading themselves.
+				own, err := q.GetUser(ctx, tc.self.MemberID)
+				if err != nil {
+					return err
+				}
+
+				t.Logf("tenant %s: GetUser(own member) -> %s / %q", tc.self.Label, own.Email, own.DisplayName)
+
+				if own.ID != tc.self.MemberID || own.Email != tc.self.MemberEmail {
+					t.Errorf("GetUser(own member) = %v, want %s / %s", own, tc.self.MemberID, tc.self.MemberEmail)
+				}
+
+				if own.DisplayName == "" {
+					t.Error("GetUser returned an empty display name; /me would render nothing")
+				}
+
+				// 2. The user who belongs to both organizations. Visible here
+				//    too, because a membership joins them to *this* tenant —
+				//    the policy is about the membership, not about the row.
+				shared, err := q.GetUser(ctx, fixture.SharedUserID)
+				if err != nil {
+					return err
+				}
+
+				t.Logf("tenant %s: GetUser(shared user) -> %s", tc.self.Label, shared.Email)
+
+				if shared.Email != fixture.SharedEmail {
+					t.Errorf("GetUser(shared user) = %v, want %s", shared, fixture.SharedEmail)
+				}
+
+				// 3. The other tenant's member, addressed by their real primary
+				//    key. No row — not their address, and not an error that
+				//    distinguishes "exists elsewhere" from "does not exist".
+				foreign, err := q.GetUser(ctx, tc.other.MemberID)
+
+				t.Logf("tenant %s: GetUser(%s's member id) -> %v", tc.self.Label, tc.other.Label, err)
+
+				if !errors.Is(err, pgx.ErrNoRows) {
+					t.Errorf("GetUser(%s's member) = %v, %v; want pgx.ErrNoRows", tc.other.Label, foreign, err)
+				}
+
+				return nil
+			})
+			if err != nil {
+				t.Fatalf("WithTenant: %v", err)
+			}
+		})
+	}
+}
+
 // TestSameQueryOutsideWithTenantSeesNothing covers the two halves of the bypass
 // question at once, on a pool of exactly one connection so that everything below
 // provably happens on the same Postgres backend.

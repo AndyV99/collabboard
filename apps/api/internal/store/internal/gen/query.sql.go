@@ -429,6 +429,47 @@ func (q *Queries) GetProject(ctx context.Context, projectID uuid.UUID) (Project,
 	return i, err
 }
 
+const getUser = `-- name: GetUser :one
+SELECT
+    u.id,
+    u.email,
+    u.display_name
+FROM users u
+WHERE u.id = $1
+`
+
+type GetUserRow struct {
+	ID          uuid.UUID
+	Email       string
+	DisplayName string
+}
+
+// One user row, read under the current tenant's context (issue #75).
+//
+// Same table and same policy as ListMembers, one row instead of all of them:
+// users has no tenant_id, and users_visible_via_membership makes a row visible
+// only when a membership joins it to the current tenant. So an id naming
+// somebody outside this organization returns *no row* rather than their
+// address, and this query can no more enumerate the global directory than
+// ListMembers can — it is a narrowing of ListMembers, not a new reach.
+//
+// It takes a user id because there is no "current user" GUC to derive one from;
+// app.tenant_id is the only context a transaction carries. What stops it being
+// steered is above it, in exactly the way principal.TenantID is: the one caller
+// (auth.Service.Me, for GET /me) passes the id from the verified access token,
+// and no route, header, query parameter or body field in this service carries a
+// user id at all. See internal/api/auth_bola_test.go.
+//
+// The column list is explicit rather than SELECT *: this reads a global
+// identity, and a future column on `users` should have to be named here before
+// it can travel to a client.
+func (q *Queries) GetUser(ctx context.Context, userID uuid.UUID) (GetUserRow, error) {
+	row := q.db.QueryRow(ctx, getUser, userID)
+	var i GetUserRow
+	err := row.Scan(&i.ID, &i.Email, &i.DisplayName)
+	return i, err
+}
+
 const listBoardsByProject = `-- name: ListBoardsByProject :many
 SELECT id, tenant_id, project_id, name, archived_at, created_at, updated_at
 FROM boards
