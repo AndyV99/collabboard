@@ -211,6 +211,111 @@
   padding: 0.5rem 0.125rem;
 }
 
+/* --- editing (#64) ---------------------------------------------------- */
+
+/*
+ * A card the server has not acknowledged yet.
+ *
+ * Deliberately a `<span>` rather than a link: its id was invented by this
+ * client, so there is nothing at `?card=<id>` to open. It is dimmed rather than
+ * hidden, because the point of an optimistic card is that you can see it.
+ */
+.cardPending {
+  opacity: 0.65;
+  border-style: dashed;
+}
+
+.cardPendingNote {
+  display: block;
+  margin-top: 0.25rem;
+  font-size: 0.75rem;
+  color: var(--muted);
+}
+
+/* A row of small buttons — the column's Edit toggle, move left/right, and the
+ * confirm/cancel pair under every form. `wrap` because two buttons do not fit
+ * side by side in an 18rem column at large text sizes. */
+.toolRow,
+.composerActions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+}
+
+.tools {
+  display: flex;
+  flex-direction: column;
+  gap: 0.75rem;
+  padding: 0.75rem;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--background);
+}
+
+.composer {
+  display: flex;
+  flex-direction: column;
+  gap: 0.625rem;
+}
+
+/*
+ * The quiet affordances: the column's Edit toggle and "+ Add a card".
+ *
+ * Low-contrast until hovered or focused, because there is one per column and
+ * six loud buttons across a board would compete with the cards, which are the
+ * content. The focus ring is the app-wide `:focus-visible` rule, untouched.
+ */
+.toolButton,
+.addCardButton {
+  appearance: none;
+  border: 1px dashed var(--border);
+  border-radius: 8px;
+  background: none;
+  color: var(--muted);
+  font: inherit;
+  font-size: 0.8125rem;
+  padding: 0.375rem 0.5rem;
+  text-align: left;
+  cursor: pointer;
+}
+
+.toolButton {
+  border-style: solid;
+  padding: 0.1875rem 0.5rem;
+  font-size: 0.75rem;
+}
+
+.toolButton:hover,
+.addCardButton:hover {
+  color: var(--foreground);
+  border-color: var(--accent);
+}
+
+/* The trailing "+ Add a column" slot, sized to match a column so the board's
+ * rhythm does not break at its right-hand end. */
+.addColumn {
+  flex: 0 0 18rem;
+  max-width: 18rem;
+}
+
+.addColumnButton {
+  appearance: none;
+  width: 100%;
+  border: 1px dashed var(--border);
+  border-radius: 12px;
+  background: none;
+  color: var(--muted);
+  font: inherit;
+  font-size: 0.875rem;
+  padding: 0.875rem;
+  cursor: pointer;
+}
+
+.addColumnButton:hover {
+  color: var(--foreground);
+  border-color: var(--accent);
+}
+
 /* --- the detail panel ------------------------------------------------- */
 
 .detail {

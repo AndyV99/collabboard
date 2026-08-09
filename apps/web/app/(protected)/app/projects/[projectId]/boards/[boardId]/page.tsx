@@ -3,19 +3,13 @@ import type { Metadata } from "next";
 import { getBoard, getProject, listCardsByBoard, listColumns } from "@/lib/api/endpoints";
 import type { ApiError } from "@/lib/api/errors";
 import { serverApi } from "@/lib/api/server";
-import {
-  columnNameOf,
-  countCards,
-  findCard,
-  groupCardsIntoColumns,
-} from "@/lib/board/snapshot";
+import { countCards, groupCardsIntoColumns } from "@/lib/board/snapshot";
 import { requireSession } from "@/lib/session/require";
 import { describeLoadFailure } from "@/lib/workspace/outcomes";
-import { WORKSPACE_PATH, boardHref, projectHref, selectedCardId } from "@/lib/workspace/routes";
+import { WORKSPACE_PATH, projectHref, selectedCardId } from "@/lib/workspace/routes";
 import { BoardView } from "@/components/boards/board-view";
-import { CardDetail, CardNotOnBoard } from "@/components/boards/card-detail";
 import { PageHeader } from "@/components/workspace/page-header";
-import { EmptyState, LoadError } from "@/components/workspace/states";
+import { LoadError } from "@/components/workspace/states";
 import board from "@/components/boards/board.module.css";
 import styles from "@/components/workspace/workspace.module.css";
 
@@ -73,16 +67,27 @@ export const metadata: Metadata = {
  * it is the difference between a URL that means what it says and one that only
  * usually does.
  *
- * # Where the Server/Client line falls, for #64–#66
+ * # Where the Server/Client line falls, for #65 and #66
  *
  * Here, and only here. This page is the sole thing on the board screen that
- * touches the API or the session; everything below it (`BoardView`,
- * `CardDetail`) is pure and takes resolved, plain-serialisable props. The board
- * is therefore fully server-rendered today with no board code in the browser,
- * and the interactive versions in #64 (create/edit/delete) and #65
- * (drag-and-drop) can put `"use client"` on those components without this file
- * changing shape. `components/boards/board-view.tsx` states the rules that come
- * with that boundary.
+ * touches the API or the session; `BoardView` and everything under it take
+ * resolved, plain-serialisable props and fetch nothing.
+ *
+ * #64 made the board editable and this file did not have to change shape to
+ * allow it — which was the prediction #63 wrote down. `BoardView` gained
+ * `"use client"`, the props crossed the RSC boundary unchanged because `Card`
+ * and `Column` are strings all the way down, and the reads stayed here. The two
+ * real edits were handing down the raw `?card=` value instead of a resolved one
+ * (a card can now be deleted, so "names nothing on this board" has to be
+ * decided where the optimistic board is known) and letting `BoardView` own the
+ * detail panel so that one optimistic store covers the tile and the panel that
+ * edits it.
+ *
+ * Writes do **not** come back through here. A Client Component reaches the API
+ * through `/api/proxy`, which attaches the token server-side, and then calls
+ * `router.refresh()` — so this function re-runs and the board re-renders from
+ * what the server actually stored. `components/boards/board-view.tsx` states
+ * the rest of the rules that come with that boundary.
  */
 export default async function BoardPage({ params, searchParams }: Props) {
   await requireSession();
@@ -172,34 +177,6 @@ export default async function BoardPage({ params, searchParams }: Props) {
   const total = countCards(snapshot);
 
   const openCardId = selectedCardId(query);
-  const openCard = openCardId === null ? null : findCard(cards, openCardId);
-  const closeHref = boardHref(project.id, theBoard.id);
-
-  if (columns.length === 0) {
-    return (
-      <div className={styles.page}>
-        <PageHeader crumbs={crumbs} title={theBoard.name} />
-
-        <EmptyState
-          body={
-            <>
-              <p>
-                A board is columns you move cards between — <em>To do</em>,{" "}
-                <em>Doing</em>, <em>Done</em> is the usual first three, but they are
-                whatever the work actually looks like.
-              </p>
-              <p>
-                Creating them is not built yet: this release renders a board and does
-                not change one. Columns and cards can be created through the API in the
-                meantime.
-              </p>
-            </>
-          }
-          title="This board has no columns yet"
-        />
-      </div>
-    );
-  }
 
   return (
     <div className={board.page}>
@@ -209,34 +186,17 @@ export default async function BoardPage({ params, searchParams }: Props) {
         title={theBoard.name}
       />
 
-      <div
-        className={
-          openCardId === null ? board.layout : `${board.layout} ${board.layoutWithDetail}`
-        }
-      >
-        <div className={board.boardArea}>
-          <BoardView
-            boardId={theBoard.id}
-            projectId={project.id}
-            selectedCardId={openCard?.id ?? null}
-            snapshot={snapshot}
-          />
-        </div>
-
-        {openCardId !== null && (
-          <div className={board.detailArea}>
-            {openCard === null ? (
-              <CardNotOnBoard closeHref={closeHref} />
-            ) : (
-              <CardDetail
-                card={openCard}
-                closeHref={closeHref}
-                columnName={columnNameOf(columns, openCard)}
-              />
-            )}
-          </div>
-        )}
-      </div>
+      {/* The whole interactive surface, including the card detail panel, is one
+       * client boundary. It has to be one rather than two: the panel edits the
+       * same card the board draws a tile for, and two optimistic stores would
+       * show a renamed card in one of them and the old name in the other until
+       * the refresh arrived. See the comment at the top of `board-view.tsx`. */}
+      <BoardView
+        boardId={theBoard.id}
+        projectId={project.id}
+        selectedCardId={openCardId}
+        snapshot={snapshot}
+      />
 
       {snapshot.unplaced.length > 0 && (
         <section className={styles.panel}>
@@ -255,9 +215,11 @@ export default async function BoardPage({ params, searchParams }: Props) {
 
       <p className={styles.sectionNote}>
         Cards appear in the order the server returns them — the rank behind that order
-        is never sent to the browser, by design (ADR 0004). This board is read-only for
-        now: creating and editing cards is issue #64, drag-and-drop is #65, and live
-        updates are #9.
+        is never sent to the browser, by design (ADR 0004), so a column is reordered by
+        naming its new neighbour and re-reading rather than by sorting here. Cards
+        cannot be dragged between columns yet: that is issue #65. Live updates from
+        other people editing this board are #9, so a colleague&rsquo;s change appears
+        on your next reload rather than as it happens.
       </p>
     </div>
   );
