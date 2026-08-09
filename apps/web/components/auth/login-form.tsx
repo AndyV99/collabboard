@@ -18,6 +18,7 @@ import { signUpHref } from "@/lib/auth/routes";
 import { LOGIN_PATH, submitAuth } from "@/lib/auth/submit";
 import { FieldErrorList, FormAlert } from "./form-alert";
 import { TextField } from "./text-field";
+import { WorkspaceRecovery } from "./workspace-recovery";
 import styles from "./auth.module.css";
 
 const FIELD_LABELS: Record<LoginField, string> = {
@@ -42,6 +43,20 @@ const FIELD_LABELS: Record<LoginField, string> = {
  * that one was typed. "That is too short to be one of ours" is a statement about
  * a stored value, and it is useless besides: an account made under an older rule
  * still has to be able to sign in.
+ *
+ * # One outcome is an action, not a sentence
+ *
+ * A bare 403 means the account exists, the password was right, and it belongs to
+ * no organization — a registration that broke between its two transactions. That
+ * used to end in "contact support", which stopped being true when #34 shipped
+ * `POST /api/v1/organizations`. It is now the only `AuthFailureKind` this form
+ * branches on: it renders {@link WorkspaceRecovery}, which creates the missing
+ * workspace and signs the user in. Every other kind renders `failure.message` in
+ * one alert, exactly as before.
+ *
+ * The password this form is holding is what makes that possible, and
+ * `workspace-recovery.tsx` documents that decision rather than this file,
+ * because that is where it is acted on.
  *
  * # Why the form is `noValidate`
  *
@@ -159,11 +174,38 @@ export function LoginForm({ returnTo }: { returnTo: string }) {
         </FormAlert>
       )}
 
-      {listedErrors.length === 0 && failure !== null && (
-        <FormAlert alertRef={alertRef} title="Could not sign you in">
-          <p>{failure.message}</p>
-        </FormAlert>
-      )}
+      {/*
+        The one kind that gets more than a sentence. Every other failure renders
+        exactly as it did before — one alert, `failure.message`, no branch — and
+        that is deliberate: `no_organization` is the only outcome on this screen
+        with an action the user can take, so it is the only one that earns a
+        different shape. See `workspace-recovery.tsx`.
+      */}
+      {listedErrors.length === 0 &&
+        failure !== null &&
+        failure.kind === "no_organization" && (
+          <WorkspaceRecovery
+            alertRef={alertRef}
+            // A getter, not the password itself. The component cannot hold what
+            // it is only handed inside a callback, and the value it reads is
+            // whatever is in the form at the moment of the click.
+            credentials={() => ({ email, password })}
+            message={failure.message}
+            onRateLimited={(seconds) => setBlockedUntil(Date.now() + seconds * 1000)}
+            onSignedIn={() => {
+              router.replace(returnTo);
+              router.refresh();
+            }}
+          />
+        )}
+
+      {listedErrors.length === 0 &&
+        failure !== null &&
+        failure.kind !== "no_organization" && (
+          <FormAlert alertRef={alertRef} title="Could not sign you in">
+            <p>{failure.message}</p>
+          </FormAlert>
+        )}
 
       <form className={styles.form} noValidate onSubmit={handleSubmit}>
         <TextField
