@@ -142,6 +142,7 @@ func newServer(t *testing.T, limits auth.RateLimitConfig) *server {
 	}
 
 	router := api.NewRouter(logger,
+		api.BodyLimits{},
 		api.HealthDeps{},
 		api.AuthDeps{Service: service, Verifier: issuer, Store: dataStore},
 		api.RealtimeDeps{})

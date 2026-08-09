@@ -178,7 +178,10 @@ func runServe(logger *slog.Logger, cfg config.Config) error {
 		return err
 	}
 
-	router := api.NewRouter(logger, api.HealthDeps{
+	router := api.NewRouter(logger, api.BodyLimits{
+		Default:         int64(cfg.HTTP.MaxRequestBytes),
+		Unauthenticated: int64(cfg.HTTP.MaxUnauthenticatedRequestBytes),
+	}, api.HealthDeps{
 		Postgres: pgxPinger{pool: pool},
 		Redis:    redisPinger{client: redisClient},
 	}, authDeps, api.RealtimeDeps{

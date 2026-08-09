@@ -180,6 +180,7 @@ func TestTheDemoPublishEndpointIsGone(t *testing.T) {
 	// The fully wired router — auth, a store, and realtime — so the 404 is the
 	// route table's answer and not a missing dependency's.
 	router := NewRouter(discardLogger(),
+		BodyLimits{},
 		HealthDeps{Postgres: stubPinger{}, Redis: stubPinger{}},
 		AuthDeps{Service: &membershipService{issuer: issuer}, Verifier: issuer, Store: newCRUDStore()},
 		RealtimeDeps{
@@ -218,6 +219,7 @@ func TestTheRealtimeRoutesAreOnlyMountedWhenSupplied(t *testing.T) {
 	}
 
 	without := NewRouter(discardLogger(),
+		BodyLimits{},
 		HealthDeps{Postgres: stubPinger{}, Redis: stubPinger{}},
 		AuthDeps{Service: &membershipService{issuer: issuer}, Verifier: issuer},
 		RealtimeDeps{})
@@ -234,6 +236,7 @@ func TestTheRealtimeRoutesAreOnlyMountedWhenSupplied(t *testing.T) {
 	reached := false
 
 	with := NewRouter(discardLogger(),
+		BodyLimits{},
 		HealthDeps{Postgres: stubPinger{}, Redis: stubPinger{}},
 		AuthDeps{Service: &membershipService{issuer: issuer}, Verifier: issuer},
 		RealtimeDeps{

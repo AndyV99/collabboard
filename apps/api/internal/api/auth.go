@@ -412,8 +412,24 @@ func newSessionResponse(result auth.LoginResult) sessionResponse {
 // failure. The binding error is not echoed: it can quote the submitted body,
 // which for these endpoints means quoting a password back at whoever sent it —
 // and into whatever log or error tracker sits in front of the client.
+//
+// The one error that is distinguished is the body limit's. limitRequestBody
+// wrapped the body in an [http.MaxBytesReader], and a body that runs past the
+// limit fails the *read*, so the failure arrives here as a decode error like any
+// malformed JSON. Left undistinguished it would be a 400, which tells a caller
+// its request was badly formed when in fact it was well formed and too big — and
+// it would hide the one refusal an operator would want to see in the logs as
+// itself. [errors.As] rather than a comparison because the decoder is entitled
+// to wrap what its reader returned.
 func bindJSON(c *gin.Context, target any) bool {
 	if err := c.ShouldBindJSON(target); err != nil {
+		var tooLarge *http.MaxBytesError
+		if errors.As(err, &tooLarge) {
+			abortBodyTooLarge(c)
+
+			return false
+		}
+
 		c.AbortWithStatusJSON(http.StatusBadRequest, errorResponse{Error: "request body is not valid"})
 
 		return false

@@ -216,6 +216,7 @@ func newBOLAFixture(t *testing.T) *bolaFixture {
 	}
 
 	router := NewRouter(discardLogger(),
+		BodyLimits{},
 		HealthDeps{Postgres: stubPinger{}, Redis: stubPinger{}},
 		AuthDeps{Service: service, Verifier: issuer, Store: tenantStore}, RealtimeDeps{})
 
