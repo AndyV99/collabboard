@@ -127,6 +127,32 @@ type HTTPConfig struct {
 
 	ReadHeaderTimeout time.Duration
 	ShutdownTimeout   time.Duration
+
+	// MaxRequestBytes caps a request body on every route. net/http bounds
+	// headers (MaxHeaderBytes) and nothing else, so without this a single POST
+	// can make the process allocate whatever the caller cares to send.
+	//
+	// The default is 256 KiB, chosen against the largest body the field limits
+	// in internal/api permit rather than picked round: a card carries a title of
+	// at most 200 runes and a description of at most 10 000, those limits are
+	// counted in runes *after* decoding, and one rune costs at most 12 bytes of
+	// JSON (an astral character written as an escaped surrogate pair, which is
+	// twelve ASCII bytes for one rune). 10 200 runes is therefore ~120 KiB on
+	// the wire in the worst case, and 256 KiB is twice that.
+	MaxRequestBytes int
+
+	// MaxUnauthenticatedRequestBytes caps a request body on the routes that
+	// answer before anyone has proved who they are — /auth/register, /login,
+	// /refresh, /logout.
+	//
+	// Tighter than MaxRequestBytes on purpose. Those four are the endpoints an
+	// anonymous caller can reach, so they are where an oversized body is most
+	// attractive, and none of them carries anything large: an email is at most
+	// 254 bytes, a password 128, a display name 128 runes, a refresh token is
+	// server-generated and short. 16 KiB is several times the worst case even
+	// with every field escaped character-by-character, and it cuts what an
+	// unauthenticated caller can make this process read by 16x.
+	MaxUnauthenticatedRequestBytes int
 }
 
 // Addr renders the listen address for net/http.
@@ -222,6 +248,10 @@ func Load() (Config, error) {
 			Port:              envInt("HTTP_PORT", 8080, &errs),
 			ReadHeaderTimeout: envDuration("HTTP_READ_HEADER_TIMEOUT", 10*time.Second, &errs),
 			ShutdownTimeout:   envDuration("HTTP_SHUTDOWN_TIMEOUT", 15*time.Second, &errs),
+
+			MaxRequestBytes: envInt("HTTP_MAX_REQUEST_BYTES", DefaultMaxRequestBytes, &errs),
+			MaxUnauthenticatedRequestBytes: envInt(
+				"HTTP_MAX_UNAUTHENTICATED_REQUEST_BYTES", DefaultMaxUnauthenticatedRequestBytes, &errs),
 		},
 		Postgres: PostgresConfig{
 			Host:              envString("POSTGRES_HOST", "localhost"),
@@ -276,11 +306,50 @@ func Load() (Config, error) {
 	cfg.Auth = resolveAuthSecret(cfg.Env, cfg.Auth, &errs)
 	cfg.Realtime.AllowedOrigins = resolveAllowedOrigins(cfg.Env)
 
+	checkBodyLimits(cfg.HTTP, &errs)
+
 	if len(errs) > 0 {
 		return Config{}, fmt.Errorf("invalid configuration: %s", strings.Join(errs, "; "))
 	}
 
 	return cfg, nil
+}
+
+// The request body limits, in bytes. See [HTTPConfig] for how each number was
+// arrived at.
+const (
+	DefaultMaxRequestBytes                = 256 << 10
+	DefaultMaxUnauthenticatedRequestBytes = 16 << 10
+)
+
+// checkBodyLimits refuses a configuration that would switch the limits off.
+//
+// Zero or negative is the setting that matters: an operator reaching for
+// "unlimited" would write it, and internal/api would then have to decide what it
+// meant. It means nothing here — the service does not start — so there is no
+// environment in which the limit is silently absent. The other check is that the
+// unauthenticated limit is the tighter of the two, because the global one is
+// applied first and a looser value below it would never take effect: a limit
+// that is configured and does nothing is worse than one that is not configured.
+func checkBodyLimits(cfg HTTPConfig, errs *[]string) {
+	if cfg.MaxRequestBytes <= 0 {
+		*errs = append(*errs, fmt.Sprintf(
+			"HTTP_MAX_REQUEST_BYTES is %d; it must be a positive number of bytes", cfg.MaxRequestBytes))
+	}
+
+	if cfg.MaxUnauthenticatedRequestBytes <= 0 {
+		*errs = append(*errs, fmt.Sprintf(
+			"HTTP_MAX_UNAUTHENTICATED_REQUEST_BYTES is %d; it must be a positive number of bytes",
+			cfg.MaxUnauthenticatedRequestBytes))
+
+		return
+	}
+
+	if cfg.MaxRequestBytes > 0 && cfg.MaxUnauthenticatedRequestBytes > cfg.MaxRequestBytes {
+		*errs = append(*errs, fmt.Sprintf(
+			"HTTP_MAX_UNAUTHENTICATED_REQUEST_BYTES (%d) exceeds HTTP_MAX_REQUEST_BYTES (%d), so it would never apply",
+			cfg.MaxUnauthenticatedRequestBytes, cfg.MaxRequestBytes))
+	}
 }
 
 // minJWTSecretLength mirrors internal/auth's floor. Duplicated rather than
