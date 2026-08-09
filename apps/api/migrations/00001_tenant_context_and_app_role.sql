@@ -46,7 +46,7 @@ $$;
 -- The application role. Created without a password: credential lifecycle
 -- belongs to the secret store, not to a versioned migration that can never
 -- rotate it. `api provision` sets it from POSTGRES_PASSWORD — see
--- docs/adr/0005-database-role-provisioning.md.
+-- docs/adr/0006-database-role-provisioning.md.
 --
 -- CREATE ROLE is not idempotent and has no IF NOT EXISTS, so it is guarded —
 -- in a deployed environment the role may already have been provisioned out of
@@ -111,7 +111,7 @@ BEGIN
         RAISE EXCEPTION
             'collabboard_app holds %, which makes every row-level security policy in this schema decorative',
             offending
-            USING HINT = 'Provision collabboard_app without those attributes. Migrations run as a non-superuser owner, which PostgreSQL does not allow to clear them. See apps/api/scripts/provision/bootstrap-owner.sql and docs/adr/0005-database-role-provisioning.md.';
+            USING HINT = 'Provision collabboard_app without those attributes. Migrations run as a non-superuser owner, which PostgreSQL does not allow to clear them. See apps/api/scripts/provision/bootstrap-owner.sql and docs/adr/0006-database-role-provisioning.md.';
     END IF;
 END
 $$;

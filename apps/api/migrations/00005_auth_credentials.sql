@@ -142,7 +142,7 @@ BEGIN
         RAISE EXCEPTION
             'collabboard_credentials holds %, so the credential functions it owns would not be bounded by the schema and policy boundaries this migration builds',
             offending
-            USING HINT = 'Provision collabboard_credentials without those attributes. See apps/api/scripts/provision/bootstrap-owner.sql and docs/adr/0005-database-role-provisioning.md.';
+            USING HINT = 'Provision collabboard_credentials without those attributes. See apps/api/scripts/provision/bootstrap-owner.sql and docs/adr/0006-database-role-provisioning.md.';
     END IF;
 END
 $$;

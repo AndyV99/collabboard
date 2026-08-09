@@ -194,7 +194,7 @@ func preflight(ctx context.Context, logger *slog.Logger, db *sql.DB) error {
 	return fmt.Errorf(
 		"%w: connected as %q (rolsuper=%t, rolbypassrls=%t, row-level security enforced=%t). "+
 			"Migrations must run as a dedicated non-superuser owner, or every policy in the schema is decorative for the role that installed it. "+
-			"Provision one with apps/api/scripts/provision/bootstrap-owner.sql and point POSTGRES_MIGRATION_USER at it; see docs/adr/0005-database-role-provisioning.md",
+			"Provision one with apps/api/scripts/provision/bootstrap-owner.sql and point POSTGRES_MIGRATION_USER at it; see docs/adr/0006-database-role-provisioning.md",
 		ErrExemptMigrationRole, role, isSuper, bypassesRLS, rlsEnforced)
 }
 

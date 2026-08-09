@@ -17,7 +17,7 @@
 --
 -- Idempotent: safe to re-run, and re-running rotates the owner's password.
 --
--- See docs/adr/0005-database-role-provisioning.md for the whole role model, and
+-- See docs/adr/0006-database-role-provisioning.md for the whole role model, and
 -- ADR 0001 for why the owner must not be the role the API connects as.
 
 \if :{?owner_password}
@@ -230,7 +230,7 @@ $$;
 -- what makes that work.
 --
 -- It does not set the app role's password. That comes from the secret store by
--- way of POSTGRES_PASSWORD and `api provision`; see ADR 0005.
+-- way of POSTGRES_PASSWORD and `api provision`; see ADR 0006.
 
 SELECT
     r.rolname            AS role,

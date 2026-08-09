@@ -1,4 +1,4 @@
-# 0005. Database role provisioning: a non-superuser schema owner, and app credentials from configuration
+# 0006. Database role provisioning: a non-superuser schema owner, and app credentials from configuration
 
 Date: 2026-08-08
 Status: accepted

@@ -33,7 +33,7 @@
 // [DB.AppDSN] is collabboard_app, the role the API actually serves with. It is
 // the identity almost every test should use, because it is the one a request
 // runs under. See docs/adr/0001-tenant-isolation.md and
-// docs/adr/0005-database-role-provisioning.md, and store/identity_test.go and
+// docs/adr/0006-database-role-provisioning.md, and store/identity_test.go and
 // store/provisioning_test.go, which assert the distinctions in-test rather than
 // trusting this comment.
 //

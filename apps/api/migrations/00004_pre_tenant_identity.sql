@@ -114,7 +114,7 @@ BEGIN
         RAISE EXCEPTION
             'collabboard_identity holds %, so the pre-tenant identity functions it owns would not be bounded by row-level security',
             offending
-            USING HINT = 'Provision collabboard_identity without those attributes. See apps/api/scripts/provision/bootstrap-owner.sql and docs/adr/0005-database-role-provisioning.md.';
+            USING HINT = 'Provision collabboard_identity without those attributes. See apps/api/scripts/provision/bootstrap-owner.sql and docs/adr/0006-database-role-provisioning.md.';
     END IF;
 END
 $$;

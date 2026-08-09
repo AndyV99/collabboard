@@ -52,7 +52,7 @@ go run ./cmd/api                     # serve on :8080
 owns the schema — while the server connects as `POSTGRES_USER`, which must be
 `collabboard_app`. Those two are deliberately different roles, and neither is
 the cluster's superuser: see `docs/adr/0001-tenant-isolation.md` and
-`docs/adr/0005-database-role-provisioning.md`. `api migrate` refuses to run as a
+`docs/adr/0006-database-role-provisioning.md`. `api migrate` refuses to run as a
 role row-level security is not enforced against, before it applies anything.
 
 `api provision` sets the app role's password to `POSTGRES_PASSWORD`. Migration

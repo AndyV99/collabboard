@@ -25,7 +25,7 @@
 // nothing for a second implementation to do: the injection happens outside the
 // process, which is what keeps the secret out of the image, out of the task
 // definition and out of this repository. See
-// docs/adr/0005-database-role-provisioning.md.
+// docs/adr/0006-database-role-provisioning.md.
 //
 // # Ordering
 //

@@ -1,6 +1,6 @@
 -- Constrain the role the migrations themselves run as.
 --
--- See issue #14 and docs/adr/0005-database-role-provisioning.md.
+-- See issue #14 and docs/adr/0006-database-role-provisioning.md.
 --
 -- Every other migration constrains a role the application uses. This one
 -- constrains the role that applies migrations, which until now was whatever the
@@ -84,7 +84,7 @@ BEGIN
                 is_bypass,
                 (SELECT c.relowner::regrole::text FROM pg_catalog.pg_class c WHERE c.oid = 'public.users'::regclass)
             ),
-            HINT = 'Provision a dedicated non-superuser owner and point POSTGRES_MIGRATION_USER at it: apps/api/scripts/provision/bootstrap-owner.sql. See docs/adr/0005-database-role-provisioning.md.';
+            HINT = 'Provision a dedicated non-superuser owner and point POSTGRES_MIGRATION_USER at it: apps/api/scripts/provision/bootstrap-owner.sql. See docs/adr/0006-database-role-provisioning.md.';
 END
 $$;
 -- +goose StatementEnd
