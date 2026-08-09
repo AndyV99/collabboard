@@ -1,7 +1,9 @@
+import Link from "next/link";
 import type { ReactNode } from "react";
 
 import type { Organization } from "@/lib/api/types";
 import type { Viewer } from "@/lib/session/viewer";
+import { MEMBERS_PATH, WORKSPACE_PATH } from "@/lib/workspace/routes";
 import { SignOutButton } from "./sign-out-button";
 import styles from "./app-shell.module.css";
 
@@ -29,7 +31,29 @@ export function AppShell({
   return (
     <div className={styles.shell}>
       <header className={styles.header}>
-        <span className={styles.brand}>CollabBoard</span>
+        <Link className={styles.brand} href={WORKSPACE_PATH}>
+          CollabBoard
+        </Link>
+
+        {/*
+          The two top-level destinations. A `<nav>` with an accessible name
+          because the page below has its own breadcrumb navigation, and
+          "navigation" twice in a screen reader's landmark list tells nobody
+          which is which.
+
+          Neither link is marked as current here: this component is rendered by
+          the layout, which is not told the URL, and reading `usePathname()`
+          would make the whole shell a Client Component to underline one word.
+          The breadcrumb on each page carries `aria-current` instead.
+        */}
+        <nav aria-label="Workspace" className={styles.nav}>
+          <Link className={styles.navLink} href={WORKSPACE_PATH}>
+            Projects
+          </Link>
+          <Link className={styles.navLink} href={MEMBERS_PATH}>
+            People
+          </Link>
+        </nav>
 
         <div className={styles.workspace}>
           <span className={styles.workspaceLabel} id="workspace-label">
