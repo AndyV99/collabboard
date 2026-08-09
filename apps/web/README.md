@@ -182,13 +182,124 @@ Option 2 is the answer for the WebSocket client (issue #9), which a Route
 Handler cannot proxy. Either way the variable stays server-only and the
 build-once/promote model holds.
 
+Option 1 is what `app/api/proxy/[...path]/route.ts` implements — see
+[Sessions and the API client](#sessions-and-the-api-client).
+
+## Sessions and the API client
+
+**The browser never holds a token.** `POST /api/v1/auth/login` returns an access
+token and a 14-day refresh token in its body; a Route Handler on *this* origin
+reads that body and puts both into `httpOnly` cookies. Client JavaScript cannot
+read them, and nothing this app returns to a browser contains one.
+
+The reasoning, the options rejected, and the honest limits are in
+[ADR 0007](../../docs/adr/0007-web-session-storage.md). This section is the rule
+every screen follows.
+
+### The boundary, in one table
+
+| You are writing | Use | Can it refresh? |
+| --- | --- | --- |
+| A Server Component | `serverApi` from `lib/api/server.ts` | No — `proxy.ts` already did |
+| A Server Action or Route Handler | `mutableServerApi` from `lib/api/server.ts` | Yes |
+| A Client Component | `browserApi()` from `lib/api/browser.ts` | Yes, via `/api/auth/refresh` |
+
+All three take the same values from `lib/api/endpoints.ts` and return the same
+`ApiResult<T>`, so a call reads identically either side of the line.
+
+**Prefer a Server Component.** It has the session already, costs no round trip,
+and ships no fetching code to the browser. Fetch there and pass plain data down
+as props. Reach for a Client Component when the interaction demands it — drag and
+drop, live updates — not to fetch.
+
+**Never import `lib/session/*` or `lib/api/server.ts` from a Client Component.**
+They import `next/headers`, so the build fails rather than shipping them. That
+failure is the boundary being enforced, not a problem to work around.
+
+### Why a Server Component cannot refresh
+
+`cookies().set()` is illegal during rendering — the response has already begun.
+The API *rotates* refresh tokens, so a refresh whose successor cannot be stored
+spends the session's credential and throws the replacement away: one render would
+cost the user their session. `serverApi` therefore returns `unauthorized` instead,
+and `proxy.ts` — Next 16's renamed middleware, which runs before the render and
+*can* set cookies — is what keeps the token fresh. By the time a page renders the
+access token is fresh or absent, never expired-but-renewable.
+
+`proxy.ts` is excluded from `/api/*`: those handlers refresh for themselves, and
+two refreshers on one request would spend the same token twice.
+
+### Errors are values
+
+```ts
+const result = await serverApi(endpoints.getBoard(boardId));
+
+if (!result.ok) {
+  switch (result.error.kind) {
+    case "not_found":    return <BoardMissing />;   // also "another tenant's"
+    case "forbidden":    return <NoAccess />;
+    case "conflict":     return <Stale />;          // a stale drag, usually
+    case "rate_limited": return <TryLater seconds={result.error.retryAfterSeconds} />;
+    case "unauthorized": return <SignedOut />;
+    default:             return <Unavailable />;    // server_error | network | malformed
+  }
+}
+```
+
+Nothing throws for a failure the server described. `result.error.message` is safe
+to show: it is the API's own message or a local default, never a stack trace and
+never the body of a 5xx.
+
+Note `not_found`: the API answers 404 for another tenant's object on purpose, so
+it must not be read as "exists but is not yours".
+
+### Signing out is a state, not a navigation
+
+Nothing in this layer redirects. A failed refresh clears the cookies and every
+call returns `unauthorized`; the browser client reports it through
+`onSignedOut(...)`. Where to send an unauthenticated visitor is the screen's
+decision, made once, in one place — a redirect issued from inside a fetch helper
+runs on every path including the sign-in page, which is how that becomes a loop.
+
+### Adding an endpoint
+
+1. Add the type and its parser to `lib/api/types.ts`. Parsers are hand-written on
+   purpose: the API publishes no OpenAPI document, and a generated client's types
+   are a cast that would let a misconfigured `API_URL` render `undefined`.
+2. Add the `Endpoint` to `lib/api/endpoints.ts`, path relative to `/api/v1`.
+3. If a Client Component needs it, check its first path segment is in
+   `PROXIED_ROOTS` (`lib/api/proxy-route.ts`). That list is an allowlist, and
+   `auth` is deliberately absent — `/api/proxy/auth/login` would hand a browser a
+   refresh token.
+
+### Files
+
+```
+lib/api/errors.ts       ApiResult / ApiError, and the status → kind mapping
+lib/api/types.ts        payload types + runtime parsers
+lib/api/endpoints.ts    the endpoint catalogue, transport-agnostic
+lib/api/http.ts         the one place a request is sent
+lib/api/authenticated.ts  401 → single-flight refresh → one retry (no framework)
+lib/api/server.ts       serverApi (read-only) and mutableServerApi
+lib/api/browser.ts      the Client Component client, via /api/proxy
+lib/session/cookies.ts  the three cookies and their attributes
+lib/session/refresh.ts  single-flight + the post-rotation grace window
+lib/session/origin.ts   the same-origin (CSRF) check
+proxy.ts                refreshes before the render
+app/api/auth/*          login, register, refresh, logout, session, organization
+app/api/proxy/*         authenticated pass-through for Client Components
+```
+
 ## Layout
 
 ```
 app/                 routes (App Router). page.tsx is the health placeholder,
-                     healthz/route.ts is the readiness signal.
+                     healthz/route.ts is the readiness signal, api/ holds the
+                     session Route Handlers and the authenticated proxy.
 components/          presentational components, kept pure so they are unit testable
-lib/                 API client helpers, the readiness policy, the structured logger
+lib/                 the API client and session layer, the readiness policy,
+                     the structured logger
+proxy.ts             pre-render session refresh (Next 16's renamed middleware)
 instrumentation.ts   server startup hook: validates + logs the resolved API_URL
 Dockerfile           multi-stage build of the deployable image (context: repo root)
 __tests__/           vitest + React Testing Library
