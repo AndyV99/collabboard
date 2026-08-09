@@ -59,6 +59,21 @@ import { useBoardMutation } from "./board-mutation";
  * somewhere nobody asked for, which is worse than asking. So the card goes back,
  * the board refreshes, and the message says what happened and what to do — the
  * intent is handed back to the person who has it rather than guessed at.
+ *
+ * # A refusal cancels what was queued behind it
+ *
+ * The same argument, one step further, and it is the part that is easy to miss.
+ * A queued move was computed against a board with its predecessor applied, so
+ * once the predecessor is refused it is a claim about a state the server never
+ * reached. Worse, it usually *carries* its predecessor: drag a card to Done and
+ * then nudge it down within Done, and the second move names Done too — so
+ * letting it through after the first was refused performs the very move the user
+ * has just been told did not happen, and makes the message a lie.
+ *
+ * So a refusal resolves the chain false, and everything still waiting on it is
+ * abandoned without a request and without a second message. One failure, one
+ * explanation, and a board that then re-reads: the user is looking at the truth
+ * and can say what they want again.
  */
 
 /**
@@ -104,19 +119,29 @@ export function useCardMoves(
    * A ref rather than state because nothing renders from it: it orders requests
    * and never appears on screen. Entries are removed as they settle, so this
    * holds only the cards with a move actually in flight — usually none.
+   *
+   * Each promise resolves **true if that move was accepted**. A false travels
+   * down the rest of the chain, so a card's queued moves are abandoned the
+   * moment one of them is refused — see below for why that is not merely
+   * tidiness.
    */
-  const inFlight = useRef(new Map<string, Promise<void>>());
+  const inFlight = useRef(new Map<string, Promise<boolean>>());
 
   return useCallback(
     (move: CardMove) => {
       const previous = inFlight.current.get(move.cardId);
 
-      let release!: () => void;
-      const mine = new Promise<void>((resolve) => {
-        release = resolve;
+      let settle!: (accepted: boolean) => void;
+      const mine = new Promise<boolean>((resolve) => {
+        settle = resolve;
       });
 
       inFlight.current.set(move.cardId, mine);
+
+      // Read by `onSettled`, which runs after whichever of the two callbacks
+      // below fired. A move that was abandoned at the gate sets neither, and
+      // false is the right answer for it too.
+      let accepted = false;
 
       run({
         change: { kind: "card.moved", ...move },
@@ -126,8 +151,11 @@ export function useCardMoves(
         }),
         subject: "move this card",
         gate: previous === undefined ? undefined : () => previous,
+        onSuccess: () => {
+          accepted = true;
+        },
         onSettled: () => {
-          release();
+          settle(accepted);
 
           // Only if nobody queued behind this one, or the tail that is still
           // waiting would be dropped and the move after it would not be ordered.

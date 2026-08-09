@@ -331,27 +331,23 @@ export function DraggableCard({
     }
   });
 
+  /**
+   * Picking the card up and putting it down are **not** handled here.
+   *
+   * They are on `onClick`, because that is the event an activation produces —
+   * and a keypress is only one of the things that produce it. NVDA and JAWS in
+   * browse mode activate a button by calling `click()`; so do Dragon and Voice
+   * Control on "click Move Alpha", and so does a VoiceOver or TalkBack
+   * double-tap. Handling Enter here and calling `preventDefault` would swallow
+   * the click the browser was about to synthesise and leave this button doing
+   * nothing at all for every one of them — on touch with a screen reader
+   * running, where the drag is unusable too, that is no way to move a card.
+   *
+   * So Enter and Space are deliberately left alone to become a click. This
+   * handles only the keys that have no activation meaning.
+   */
   function handleKeyDown(event: React.KeyboardEvent<HTMLButtonElement>) {
-    const nudges: Record<string, CardDirection> = {
-      ArrowUp: "up",
-      ArrowDown: "down",
-      ArrowLeft: "left",
-      ArrowRight: "right",
-    };
-
     if (!lifted) {
-      if (event.key === "Enter" || event.key === " ") {
-        event.preventDefault();
-        onLift();
-      }
-
-      return;
-    }
-
-    if (event.key === "Enter" || event.key === " ") {
-      event.preventDefault();
-      onDrop();
-
       return;
     }
 
@@ -362,7 +358,12 @@ export function DraggableCard({
       return;
     }
 
-    const direction = nudges[event.key];
+    const direction: CardDirection | undefined = {
+      ArrowUp: "up" as const,
+      ArrowDown: "down" as const,
+      ArrowLeft: "left" as const,
+      ArrowRight: "right" as const,
+    }[event.key];
 
     if (direction !== undefined) {
       // Or the column's own scroller answers the arrow key and the card the
@@ -397,6 +398,11 @@ export function DraggableCard({
             onCancel();
           }
         }}
+        // A toggle, which is what `aria-pressed` promises: pressed means the
+        // arrow keys are moving this card, and activating it again puts the
+        // card down. Reachable by click, by Enter or Space, and by whatever an
+        // assistive technology does to press a button.
+        onClick={() => (lifted ? onDrop() : onLift())}
         onKeyDown={handleKeyDown}
         ref={(node) => {
           gripRef.current = node;
@@ -411,6 +417,10 @@ export function DraggableCard({
       <Link
         aria-current={selected ? "true" : undefined}
         className={selected ? `${styles.card} ${styles.cardSelected}` : styles.card}
+        // An anchor with an href is draggable by default, so a mouse drag
+        // begun on the title would race the browser's own link drag — URL ghost
+        // image and all — against the sensor listening on the row.
+        draggable={false}
         href={cardHref(projectId, boardId, card.id)}
       >
         <span className={styles.cardTitle}>{card.title}</span>

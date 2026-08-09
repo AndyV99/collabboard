@@ -83,8 +83,13 @@ export type BoardMutationInput<T> = {
    * costs feel nothing; what it buys is ordering. #65 chains a card's moves on
    * one of these so that two drags of the same card reach the server in the
    * order the user made them — see `card-moves.ts`.
+   *
+   * **Resolving `false` abandons the request**, silently: no message, and the
+   * optimistic change drops on its own when the transition ends. That is how a
+   * queue disowns the work stacked up behind something that failed, which would
+   * otherwise be sent against a board state the server never reached.
    */
-  gate?: () => Promise<unknown>;
+  gate?: () => Promise<boolean | void>;
   /**
    * Ran once the server has answered, before the refresh and whatever the
    * answer was. Releasing a {@link gate} belongs here.
@@ -131,13 +136,20 @@ export function useBoardMutation(
       onSettled,
     }: BoardMutationInput<T>) => {
       startTransition(async () => {
-        applyChange(change);
-
         try {
+          // Inside the `try` so that the `finally` covers it. It is the one
+          // statement that could throw before the gate is released, and the
+          // cost of that would be a card nobody can move again for the life of
+          // the page: the release never runs, so every later move of it waits
+          // on a promise that will not settle.
+          applyChange(change);
+
           // Before the request, after the paint. Whatever this waits for, the
           // optimistic change is already on screen — which is what makes
           // serialising a card's moves free at the interaction layer.
-          await gate?.();
+          if ((await gate?.()) === false) {
+            return;
+          }
 
           const result = await api(endpoint);
 

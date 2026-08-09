@@ -409,12 +409,17 @@ function without(cards: readonly Card[], cardId: string): Card[] {
 /**
  * Whether a move would leave the card exactly where it already is.
  *
- * Worth its own function because two of the three callers need it for different
- * reasons. A drag that ends where it started should not spend a request and a
- * whole-board re-read on a no-op; and `after_card_id` equal to the moving card's
- * own id is a **409** rather than a no-op, because `MoveCard`'s anchor CTE
- * excludes the moving row, so the anchor matches nothing. That one is not a
- * theoretical case — it is what "drop the card on itself" computes to.
+ * A drag that ends where it started should not spend a request and a whole-board
+ * re-read on a no-op, and a keyboard move that walks back to where it began
+ * should not either.
+ *
+ * The `afterCardId === cardId` guard is a backstop rather than a live case:
+ * neither producer can emit it, because both resolve anchors against a list the
+ * moving card has been lifted out of, and {@link cardDropTarget} refuses a card
+ * dropped on itself before it gets that far. It stays because the consequence
+ * of a third producer getting it wrong is not a no-op but a **409** —
+ * `MoveCard`'s anchor CTE excludes the moving row, so the anchor matches
+ * nothing — and a guard is cheaper than that lesson.
  */
 export function isRedundantMove(snapshot: BoardSnapshot, move: CardMove): boolean {
   if (move.afterCardId === move.cardId) {
@@ -483,7 +488,22 @@ export function cardNudge(
     return { cardId, columnId: entry.column.id, afterCardId: anchorAt(rest, to - 1) };
   }
 
-  const to = direction === "left" ? at.column - 1 : at.column + 1;
+  // Stepping rather than adding one, because a column the server has not
+  // acknowledged is passed over rather than landed in. Its id was invented by
+  // this client and is not a uuid, so naming it as `column_id` is a 400 — the
+  // same reason `anchorAt` walks back past unacknowledged cards. It is worth
+  // stepping rather than refusing: a column being created is at the end of the
+  // board, so refusing would make the *settled* column beyond it unreachable.
+  const step = direction === "left" ? -1 : 1;
+  let to = at.column + step;
+
+  while (
+    to >= 0 &&
+    to < snapshot.columns.length &&
+    isPendingId(snapshot.columns[to].column.id)
+  ) {
+    to += step;
+  }
 
   if (to < 0 || to >= snapshot.columns.length) {
     return undefined;
@@ -539,7 +559,11 @@ export function cardDropTarget(
   if ("column" in over) {
     const into = snapshot.columns.find((entry) => entry.column.id === over.column);
 
-    if (into === undefined) {
+    // A column the server has not acknowledged is a drop zone the board draws
+    // but cannot address: its id came from `pendingId()` and the API answers
+    // 400 to a `column_id` that is not a uuid. Refusing here rather than in the
+    // component covers the pointer and the keyboard at once.
+    if (into === undefined || isPendingId(into.column.id)) {
       return undefined;
     }
 
@@ -560,7 +584,7 @@ export function cardDropTarget(
     entry.cards.some((card) => card.id === over.card),
   );
 
-  if (into === undefined) {
+  if (into === undefined || isPendingId(into.column.id)) {
     return undefined;
   }
 

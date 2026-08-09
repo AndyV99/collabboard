@@ -182,11 +182,22 @@ function grip(title: string) {
   return screen.getByRole("button", { name: `Move ${title}` });
 }
 
-/** Lifts a card with the keyboard, as pressing Enter on its grip does. */
+/**
+ * Picks a card up, and puts it down.
+ *
+ * A **click**, not a keydown, because that is what the grip listens for and
+ * that is the whole point: Enter and Space are left to become a click so that
+ * the assistive technologies which activate a button by calling `click()` —
+ * screen readers in browse mode, voice control, a VoiceOver double-tap — reach
+ * the same code. Driving this with `keyDown` would test a path no user has.
+ */
 function lift(title: string) {
-  fireEvent.keyDown(grip(title), { key: "Enter" });
+  fireEvent.click(grip(title));
 }
 
+const drop = lift;
+
+/** An arrow key or Escape, which are the only keys the grip handles itself. */
 function press(title: string, key: string) {
   fireEvent.keyDown(grip(title), { key });
 }
@@ -231,7 +242,7 @@ describe("what a move puts on the wire", () => {
 
     lift("Zebra");
     press("Zebra", "ArrowDown");
-    press("Zebra", "Enter");
+    drop("Zebra");
 
     await waitFor(() => expect(fetchStub).toHaveBeenCalled());
 
@@ -256,7 +267,7 @@ describe("what a move puts on the wire", () => {
 
     lift("Alpha");
     press("Alpha", "ArrowLeft");
-    press("Alpha", "Enter");
+    drop("Alpha");
 
     await waitFor(() => expect(fetchStub).toHaveBeenCalled());
 
@@ -274,7 +285,7 @@ describe("what a move puts on the wire", () => {
 
     lift("Kilo");
     press("Kilo", "ArrowUp");
-    press("Kilo", "Enter");
+    drop("Kilo");
 
     await waitFor(() => expect(fetchStub).toHaveBeenCalled());
 
@@ -292,7 +303,7 @@ describe("what a move puts on the wire", () => {
 
     lift("Alpha");
     press("Alpha", "ArrowRight");
-    press("Alpha", "Enter");
+    drop("Alpha");
 
     await waitFor(() => expect(fetchStub).toHaveBeenCalled());
 
@@ -315,7 +326,7 @@ describe("what a move puts on the wire", () => {
     press("Zebra", "ArrowDown");
     press("Zebra", "ArrowDown");
     press("Zebra", "ArrowLeft");
-    press("Zebra", "Enter");
+    drop("Zebra");
 
     await waitFor(() => expect(fetchStub).toHaveBeenCalled());
 
@@ -351,7 +362,7 @@ describe("what a move puts on the wire", () => {
     lift("Zebra");
     press("Zebra", "ArrowDown");
     press("Zebra", "ArrowUp");
-    press("Zebra", "Enter");
+    drop("Zebra");
 
     expect(fetchStub).not.toHaveBeenCalled();
   });
@@ -366,7 +377,7 @@ describe("the board while the server is deciding", () => {
 
     lift("Zebra");
     press("Zebra", "ArrowDown");
-    press("Zebra", "Enter");
+    drop("Zebra");
 
     await waitFor(() => expect(order("Doing")).toEqual(["Kilo", "Zebra", "Alpha"]));
 
@@ -382,7 +393,7 @@ describe("the board while the server is deciding", () => {
 
     lift("Alpha");
     press("Alpha", "ArrowLeft");
-    press("Alpha", "Enter");
+    drop("Alpha");
 
     await waitFor(() => expect(order("To do")).toEqual(["Mike", "Alpha"]));
     expect(order("Doing")).toEqual(["Zebra", "Kilo"]);
@@ -399,7 +410,7 @@ describe("the board while the server is deciding", () => {
 
     lift("Zebra");
     press("Zebra", "ArrowDown");
-    press("Zebra", "Enter");
+    drop("Zebra");
 
     await waitFor(() => expect(refresh).toHaveBeenCalled());
 
@@ -436,7 +447,7 @@ describe("two moves of one card, both in flight", () => {
     // Zebra down one: first → second, so it lands after Kilo.
     lift("Zebra");
     press("Zebra", "ArrowDown");
-    press("Zebra", "Enter");
+    drop("Zebra");
 
     await waitFor(() => expect(fetchStub).toHaveBeenCalledTimes(1));
 
@@ -444,7 +455,7 @@ describe("two moves of one card, both in flight", () => {
     // from the board with the first move already applied, so it names Alpha.
     lift("Zebra");
     press("Zebra", "ArrowDown");
-    press("Zebra", "Enter");
+    drop("Zebra");
 
     await waitFor(() => expect(order("Doing")).toEqual(["Kilo", "Alpha", "Zebra"]));
 
@@ -484,11 +495,11 @@ describe("two moves of one card, both in flight", () => {
 
     lift("Zebra");
     press("Zebra", "ArrowDown");
-    press("Zebra", "Enter");
+    drop("Zebra");
 
     lift("Mike");
     press("Mike", "ArrowRight");
-    press("Mike", "Enter");
+    drop("Mike");
 
     await waitFor(() => expect(fetchStub).toHaveBeenCalledTimes(2));
 
@@ -498,6 +509,42 @@ describe("two moves of one card, both in flight", () => {
     settle(0, 200, { card: cardBody("card-3", "c-doing", "Zebra") });
     settle(1, 200, { card: cardBody("card-4", "c-doing", "Mike") });
     await waitFor(() => expect(refresh).toHaveBeenCalledTimes(2));
+  });
+
+  it("abandons the moves queued behind one the server refused", async () => {
+    // The subtle half of the queue. A queued move was computed against a board
+    // with its predecessor applied, and it usually *carries* that predecessor:
+    // move a card into Done and then nudge it within Done, and the second move
+    // names Done too. Sending it after the first was refused would perform the
+    // move the user has just been told did not happen.
+    const { fetchStub, settle } = concurrent();
+
+    vi.stubGlobal("fetch", fetchStub);
+    renderBoard();
+
+    lift("Alpha");
+    press("Alpha", "ArrowRight");
+    drop("Alpha");
+
+    await waitFor(() => expect(fetchStub).toHaveBeenCalledTimes(1));
+    expect(sentBody(fetchStub, 0)).toEqual({
+      column_id: "c-done",
+      after_card_id: null,
+    });
+
+    // Queued behind the first, while it is still unanswered.
+    lift("Alpha");
+    press("Alpha", "ArrowUp");
+    drop("Alpha");
+
+    settle(0, 409, { error: "after_card_id is not a card in that column" });
+
+    await waitFor(() => expect(screen.queryByRole("alert")).not.toBeNull());
+
+    // The second never goes out, and there is one explanation rather than two.
+    expect(fetchStub).toHaveBeenCalledTimes(1);
+    await waitFor(() => expect(order("Doing")).toEqual(["Zebra", "Kilo", "Alpha"]));
+    expect(screen.getAllByRole("alert")).toHaveLength(1);
   });
 
   it("lets a card be moved again after one of its moves was refused", async () => {
@@ -510,7 +557,7 @@ describe("two moves of one card, both in flight", () => {
 
     lift("Zebra");
     press("Zebra", "ArrowDown");
-    press("Zebra", "Enter");
+    drop("Zebra");
 
     await waitFor(() => expect(fetchStub).toHaveBeenCalledTimes(1));
     settle(0, 409, { error: "after_card_id is not a card in that column" });
@@ -519,7 +566,7 @@ describe("two moves of one card, both in flight", () => {
 
     lift("Zebra");
     press("Zebra", "ArrowDown");
-    press("Zebra", "Enter");
+    drop("Zebra");
 
     await waitFor(() => expect(fetchStub).toHaveBeenCalledTimes(2));
 
@@ -537,7 +584,7 @@ describe("a stale anchor", () => {
 
     lift("Alpha");
     press("Alpha", "ArrowUp");
-    press("Alpha", "Enter");
+    drop("Alpha");
 
     // On screen first, so this fails against a board that was never optimistic
     // as loudly as against one that never puts the card back.
@@ -569,7 +616,7 @@ describe("a stale anchor", () => {
 
     lift("Alpha");
     press("Alpha", "ArrowUp");
-    press("Alpha", "Enter");
+    drop("Alpha");
 
     await waitFor(() => expect(order("Doing")).toEqual(["Zebra", "Alpha", "Kilo"]));
 
@@ -622,7 +669,7 @@ describe("saying where the card went", () => {
 
     lift("Zebra");
     press("Zebra", "ArrowDown");
-    press("Zebra", "Enter");
+    drop("Zebra");
     expect(announced()).toMatch(/Zebra moved\. Doing, 2 of 3\./);
 
     lift("Kilo");
@@ -641,7 +688,7 @@ describe("saying where the card went", () => {
     renderBoard();
 
     lift("Kilo");
-    press("Kilo", "Enter");
+    drop("Kilo");
 
     expect(announced()).toMatch(/Kilo was not moved\. Doing, 2 of 3\./);
     expect(fetchStub).not.toHaveBeenCalled();
@@ -665,6 +712,95 @@ describe("saying where the card went", () => {
 
     expect(moveRegion().textContent).not.toBe(first);
     expect(announced()).toMatch(/cannot move up from here/);
+  });
+});
+
+describe("the grip, as a control", () => {
+  it("is activated by a click, not only by a physical keypress", () => {
+    // The grip handles no Enter or Space of its own, so that the browser's
+    // synthesised click gets through. That click is the only thing a screen
+    // reader in browse mode, a voice-control command, or a VoiceOver double-tap
+    // produces — handling the keydown and calling preventDefault would leave
+    // this button inert for every one of them, which on touch is the whole
+    // feature gone.
+    const fetchStub = respond(200);
+
+    vi.stubGlobal("fetch", fetchStub);
+    renderBoard();
+
+    fireEvent.click(grip("Zebra"));
+
+    expect(grip("Zebra")).toHaveAttribute("aria-pressed", "true");
+    expect(announced()).toMatch(/Zebra lifted\./);
+  });
+
+  it("reports itself pressed only while the card is held", () => {
+    const fetchStub = respond(200);
+
+    vi.stubGlobal("fetch", fetchStub);
+    renderBoard();
+
+    expect(grip("Zebra")).toHaveAttribute("aria-pressed", "false");
+
+    lift("Zebra");
+    expect(grip("Zebra")).toHaveAttribute("aria-pressed", "true");
+
+    press("Zebra", "Escape");
+    expect(grip("Zebra")).toHaveAttribute("aria-pressed", "false");
+  });
+
+  it("keeps the focus on the grip when the card changes column", () => {
+    // The bug this guards was invisible to every other test and cost a real
+    // browser session to find: moving a card into another column re-parents its
+    // row, so React unmounts the grip and focus falls to the document. Every
+    // key after the one that crossed the column then landed nowhere, and the
+    // move was announced correctly and never sent.
+    const fetchStub = respond(200);
+
+    vi.stubGlobal("fetch", fetchStub);
+    renderBoard();
+
+    grip("Alpha").focus();
+    lift("Alpha");
+    press("Alpha", "ArrowLeft");
+
+    expect(order("To do")).toEqual(["Mike", "Alpha"]);
+    expect(document.activeElement).toBe(grip("Alpha"));
+
+    // And the next key still reaches it, which is the fact that actually broke.
+    press("Alpha", "ArrowUp");
+    expect(order("To do")).toEqual(["Alpha", "Mike"]);
+  });
+
+  it("gives the move up when focus leaves for another control", () => {
+    const fetchStub = respond(200);
+
+    vi.stubGlobal("fetch", fetchStub);
+    renderBoard();
+
+    lift("Zebra");
+    press("Zebra", "ArrowDown");
+    fireEvent.focusOut(grip("Zebra"), { relatedTarget: document.body });
+
+    expect(announced()).toMatch(/Move cancelled\./);
+    expect(grip("Zebra")).toHaveAttribute("aria-pressed", "false");
+    expect(fetchStub).not.toHaveBeenCalled();
+  });
+
+  it("does not give it up when focus goes nowhere, which is a re-parent", () => {
+    // A null `relatedTarget` is the grip being unmounted as the card moves
+    // column — the effect above is mid-repair. Cancelling on it would end every
+    // cross-column move in the act of making it.
+    const fetchStub = respond(200);
+
+    vi.stubGlobal("fetch", fetchStub);
+    renderBoard();
+
+    lift("Zebra");
+    fireEvent.focusOut(grip("Zebra"), { relatedTarget: null });
+
+    expect(grip("Zebra")).toHaveAttribute("aria-pressed", "true");
+    expect(announced()).not.toMatch(/cancelled/);
   });
 });
 

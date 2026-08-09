@@ -220,24 +220,26 @@ export function BoardView({
    * preview — the card would otherwise hover over a list that has not made room
    * for it — so that one is drawn here.
    */
-  function handleDragOver(report: DragReport): void {
-    const target = cardDropTarget(shown, report.cardId, report.over, report.past);
+  // `drag`, not `report`: `report` is this component's failure channel, and
+  // shadowing it here would hide it from the two functions likeliest to need it.
+  function handleDragOver(drag: DragReport): void {
+    const target = cardDropTarget(shown, drag.cardId, drag.over, drag.past);
 
-    if (target === undefined || target.columnId === columnIdOf(shown, report.cardId)) {
+    if (target === undefined || target.columnId === columnIdOf(shown, drag.cardId)) {
       return;
     }
 
     setProposal(target);
   }
 
-  function handleDrop(report: DragReport | null): void {
+  function handleDrop(drag: DragReport | null): void {
     const heldCard = dragging;
     const heldMove = proposal;
 
     setDragging(null);
     setProposal(null);
 
-    if (report === null) {
+    if (drag === null) {
       // Let go outside every column. The card goes back — and says so, for
       // anyone who cannot watch it go back.
       if (heldCard !== null) {
@@ -256,9 +258,16 @@ export function BoardView({
     // because `after_card_id` equal to the moving card's own id is a 409. The
     // proposal is what the user is looking at, and it is what they meant.
     const target =
-      cardDropTarget(shown, report.cardId, report.over, report.past) ?? heldMove;
+      cardDropTarget(shown, drag.cardId, drag.over, drag.past) ?? heldMove;
 
     if (target === null) {
+      // Picked up and put back down inside its own column, which is the drag
+      // that changes nothing. Announced for the same reason the keyboard's
+      // version of it is: silence is indistinguishable from a broken control.
+      if (heldCard !== null) {
+        say(`${titleOf(heldCard)} was not moved. ${whereIs(board, heldCard)}`);
+      }
+
       return;
     }
 

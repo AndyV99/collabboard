@@ -500,6 +500,55 @@ describe("cardNudge — the keyboard reaching every placement", () => {
   });
 });
 
+describe("a column the server has not acknowledged is not a destination", () => {
+  // The mirror of the pending-*card* rule, and the more dangerous half: an
+  // anchor that is a `pending:` id can be walked back from, but a `column_id`
+  // that is one has nowhere to fall back to and goes straight onto the wire as
+  // a 400. The board draws a pending column with a live drop zone, so this is
+  // reachable by pressing ArrowRight — not a theoretical hole.
+  const invented = pendingId();
+
+  it("refuses to nudge a card into one", () => {
+    const inLast = applyBoardChange(SNAPSHOT, {
+      kind: "card.moved",
+      cardId: "card-1",
+      columnId: "c-3",
+      afterCardId: null,
+    });
+    const board = applyBoardChange(inLast, {
+      kind: "column.created",
+      column: column(invented, "Being created"),
+    });
+
+    expect(cardNudge(board, "card-1", "right")).toBeUndefined();
+  });
+
+  it("refuses to drop a card into one", () => {
+    const board = applyBoardChange(SNAPSHOT, {
+      kind: "column.created",
+      column: column(invented, "Being created"),
+    });
+
+    expect(cardDropTarget(board, "card-1", { column: invented }, false)).toBeUndefined();
+  });
+
+  it("steps over one to reach the settled column beyond it", () => {
+    // Refusing outright would be the easy fix and the wrong one: it would make
+    // a real column unreachable for as long as someone else's new one sat
+    // between them.
+    const board = groupCardsIntoColumns(
+      [column("c-1", "One"), column(invented, "Being created"), column("c-2", "Two")],
+      [card("only", "c-1", "Only")],
+    );
+
+    expect(cardNudge(board, "only", "right")).toEqual({
+      cardId: "only",
+      columnId: "c-2",
+      afterCardId: null,
+    });
+  });
+});
+
 describe("cardDropTarget — the pointer's landing place", () => {
   it("lands after the card it was dragged down onto", () => {
     // Zebra is first, dragged onto Alpha which is third: the sortable strategy
