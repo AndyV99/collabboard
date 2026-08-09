@@ -51,6 +51,27 @@ export const MAX_EMAIL_BYTES = 254;
 export type FieldError = string | undefined;
 
 /**
+ * A `maxLength` attribute that cannot be stricter than a code-point limit.
+ *
+ * `maxLength` counts **UTF-16 code units**; every limit in this file counts
+ * **code points**, because the API counts runes with `utf8.RuneCountInString`.
+ * The two agree for Latin text and disagree for anything outside the BMP: a
+ * 200-emoji title is 200 code points and 400 code units, so `maxLength={200}`
+ * would stop the browser at 100 emoji — refusing input `requiredText` accepts.
+ *
+ * A code point is at most two code units, so twice the limit is the smallest
+ * value that can never be the stricter of the two. The attribute stays what
+ * `components/workspace/fields.tsx` says it is — a courtesy stop against a
+ * runaway paste — and {@link validateName} and friends remain the rule.
+ *
+ * The forms written before #64 pass the limit itself. Filed as its own issue
+ * rather than corrected here, because it is a bug in three other screens.
+ */
+export function maxLengthFor(codePoints: number): number {
+  return codePoints * 2;
+}
+
+/**
  * A name every create form and the rename form share.
  *
  * Mirrors `requiredText(c, "name", ..., maxNameLength)`. `subject` is the word
@@ -84,6 +105,56 @@ export function validateDescription(value: string): FieldError {
   }
 
   return undefined;
+}
+
+/**
+ * A card's title.
+ *
+ * Mirrors `requiredText(c, "title", req.Title, maxNameLength)` in
+ * `apps/api/internal/api/cards.go` — the *same* 200 code points a name gets,
+ * because `maxNameLength` is one constant serving both. It is a separate
+ * function from {@link validateName} only so the copy can say "title", which is
+ * what the field is called on screen and in the API's own 400.
+ *
+ * `PATCH /cards/:id` is stricter than the create path in one way worth knowing:
+ * `optionalText(..., allowEmpty: false)` means a title sent as `""` is a 400
+ * ("title cannot be empty") rather than a no-op, so the same check has to run
+ * before an edit as before a create.
+ */
+export function validateCardTitle(value: string): FieldError {
+  const trimmed = value.trim();
+
+  if (trimmed === "") {
+    return "Give the card a title.";
+  }
+
+  if (codePointLength(trimmed) > MAX_NAME_CODE_POINTS) {
+    return `Card titles can be at most ${MAX_NAME_CODE_POINTS} characters.`;
+  }
+
+  return undefined;
+}
+
+/**
+ * Whether a card edit would say anything.
+ *
+ * `patchCardHandler` answers 400 for a body that mentions neither field ("at
+ * least one of title or description is required"), so submitting an untouched
+ * card would collect an error for doing nothing.
+ *
+ * The comparison is against the *trimmed* input because the API trims before it
+ * stores: a title with a trailing space added is not a change the server would
+ * record, so offering to save it would produce a write that changes nothing and
+ * a board that re-renders identically.
+ */
+export function cardChanged(
+  current: { title: string; description: string },
+  next: { title: string; description: string },
+): boolean {
+  return (
+    current.title !== next.title.trim() ||
+    current.description !== next.description.trim()
+  );
 }
 
 /**
