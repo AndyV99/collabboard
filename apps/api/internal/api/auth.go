@@ -34,7 +34,7 @@ type AuthService interface {
 	Refresh(ctx context.Context, refreshToken string) (auth.LoginResult, error)
 	Logout(ctx context.Context, refreshToken string) error
 	SwitchOrganization(ctx context.Context, principal auth.Principal, target uuid.UUID) (auth.LoginResult, error)
-	Organizations(ctx context.Context, principal auth.Principal) ([]auth.Organization, error)
+	Me(ctx context.Context, principal auth.Principal) (auth.MeResult, error)
 	AddMember(ctx context.Context, in auth.AddMemberInput) (auth.AddMemberResult, error)
 }
 
@@ -126,8 +126,24 @@ type sessionResponse struct {
 	Organization organizationBody `json:"organization"`
 }
 
+// meResponse is what GET /me returns: who the caller is, and where they can
+// act.
+//
+// email and display_name were added by issue #75 and are purely additive — no
+// existing field changed name, type or meaning, so a client written against the
+// previous shape keeps working. They are here rather than only on
+// GET /members because naming the signed-in person is a property of the
+// session, and reading the whole member list to find one row is O(members) work
+// and a read of every colleague's address to render your own.
+//
+// They are deliberately *not* on [sessionResponse] as well. That struct is also
+// what /auth/refresh returns, so putting identity in it would mean a client
+// could hold a name from a token rotation minutes old; the issue raises the
+// option and calls it a bigger decision, and it is left to be made separately.
 type meResponse struct {
 	UserID        string             `json:"user_id"`
+	Email         string             `json:"email"`
+	DisplayName   string             `json:"display_name"`
 	Role          string             `json:"role"`
 	SessionID     string             `json:"session_id"`
 	Organization  organizationBody   `json:"organization"`
@@ -316,13 +332,21 @@ func switchOrganizationHandler(logger *slog.Logger, service AuthService) gin.Han
 	}
 }
 
-// meHandler reports the authenticated principal and the organizations it could
-// act in.
+// meHandler reports the authenticated caller — their own identity, and the
+// organizations they could act in.
 //
-// The organization list comes from the principal's user id, never from a
-// parameter — the underlying pre-tenant function does not authorize, so passing
-// an id from a request would turn this into a membership-disclosure endpoint.
-// ADR 0002 says so explicitly, and this is the handler it was talking about.
+// Both halves come from the principal's user id, never from a parameter. The
+// pre-tenant function behind the organization list does not authorize, and the
+// tenant-scoped read behind the identity authorizes only as far as the current
+// organization, so an id taken from a request would turn this into a
+// disclosure endpoint. ADR 0002 says so explicitly, and this is the handler it
+// was talking about. There is no route parameter, header, query parameter or
+// body field on this endpoint at all — GET /me takes nothing.
+//
+// The email and display name are the caller's own, read from their own `users`
+// row under their own tenant context (issue #75). Returning them here is not a
+// widening: GET /members already returns the same two fields for every member
+// of the organization to anyone holding this token.
 func meHandler(logger *slog.Logger, service AuthService) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		principal, ok := principalFrom(c)
@@ -332,15 +356,19 @@ func meHandler(logger *slog.Logger, service AuthService) gin.HandlerFunc {
 			return
 		}
 
-		organizations, err := service.Organizations(c.Request.Context(), principal)
+		me, err := service.Me(c.Request.Context(), principal)
 		if err != nil {
 			writeAuthError(c, logger, err)
 
 			return
 		}
 
+		organizations := me.Organizations
+
 		body := meResponse{
 			UserID:        principal.UserID.String(),
+			Email:         me.Profile.Email,
+			DisplayName:   me.Profile.DisplayName,
 			Role:          principal.Role,
 			SessionID:     principal.SessionID.String(),
 			Organizations: make([]organizationBody, 0, len(organizations)),

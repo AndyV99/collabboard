@@ -175,6 +175,35 @@ func (q fakeTenantQuerier) CreateMembership(_ context.Context, arg store.CreateM
 	}, nil
 }
 
+// GetUser models users_visible_via_membership, not the users table.
+//
+// The row exists globally in fakeStore.usersByID, and this returns it only when
+// a membership joins it to the transaction's tenant — which is exactly what the
+// policy does, and exactly what makes "/me reads the caller's own row, and
+// cannot read anyone else's" a claim these tests can settle without a
+// container.
+func (q fakeTenantQuerier) GetUser(_ context.Context, userID uuid.UUID) (store.GetUserRow, error) {
+	q.store.mu.Lock()
+	defer q.store.mu.Unlock()
+
+	var member bool
+
+	for _, existing := range q.store.memberships[userID] {
+		if existing.OrganizationID == q.tenantID {
+			member = true
+
+			break
+		}
+	}
+
+	user, known := q.store.usersByID[userID]
+	if !member || !known {
+		return store.GetUserRow{}, store.ErrNoRows
+	}
+
+	return store.GetUserRow{ID: user.ID, Email: user.Email, DisplayName: user.DisplayName}, nil
+}
+
 // GetMembership answers only for the transaction's own tenant, exactly as the
 // policy on memberships does — which is what makes "a caller holding a token
 // for an organization they were removed from is refused" testable here.
