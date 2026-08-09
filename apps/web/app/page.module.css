@@ -29,3 +29,39 @@
   color: var(--muted);
   line-height: 1.6;
 }
+
+.actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.75rem;
+  margin-top: 0.75rem;
+}
+
+.primary {
+  font-size: 0.9375rem;
+  font-weight: 600;
+  color: var(--accent-foreground);
+  background: var(--accent);
+  border-radius: 8px;
+  padding: 0.5625rem 1rem;
+  text-decoration: none;
+}
+
+.primary:hover {
+  background: var(--accent-hover);
+}
+
+.secondary {
+  font-size: 0.9375rem;
+  font-weight: 600;
+  color: var(--foreground);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 0.5rem 1rem;
+  text-decoration: none;
+}
+
+.secondary:hover {
+  border-color: var(--muted);
+}

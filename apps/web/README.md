@@ -2,9 +2,10 @@
 
 Next.js (App Router, React Server Components) front end for CollabBoard.
 
-Currently the app shell only: a single placeholder route that server-side
-fetches `GET /healthz` from the Go API and renders its status. Board UI, auth,
-and the WebSocket client land in later issues.
+What exists: a public landing page that server-side fetches `GET /healthz` from
+the Go API, the [authentication screens](#the-authentication-screens) (register,
+sign in, sign out, route protection), and a signed-in shell. Project, board and
+card UI is issues #62 and #63; the WebSocket client is #9.
 
 ## Commands
 
@@ -280,7 +281,169 @@ runs on every path including the sign-in page, which is how that becomes a loop.
    path work: `..` survives `encodeURIComponent` and is normalised away by
    `fetch`, which is how an allowed root reaches `/auth/*` anyway.
 
+## The authentication screens
+
+Four routes, and one rule for each of them:
+
+| Route | What it is | Session |
+| --- | --- | --- |
+| `/` | Public landing + API health | Read, never required |
+| `/login` | Sign in | Redirects **away** if you have one |
+| `/register` | Create an account and its workspace | Redirects **away** if you have one |
+| `/app` | The signed-in placeholder | Required |
+
+`app/(auth)/` and `app/(protected)/` are route groups, so the URLs above have no
+segment for them. Which group a file is in *is* its access rule.
+
+### Route protection lives in one layout
+
+`app/(protected)/layout.tsx` calls `requireSession()`, which redirects to
+`/login?next=<where they were going>` when there is no session. One call covers
+the whole subtree, so a page added under that group is protected because of
+where its file is rather than because somebody remembered a check.
+
+Nothing in `lib/session` or `proxy.ts` redirects — ADR 0007 is explicit about
+why, and the short version is that a redirect issued from a fetch helper runs on
+the sign-in page too. The screens decide.
+
+**A layout is not told its own URL**, though, and the redirect needs one. So
+`proxy.ts` stamps the requested path onto the request as `x-collabboard-path`
+and `currentRequestPath()` reads it back. Two things keep that from being a
+hole: the proxy `set`s rather than appends, on every path, so a client-supplied
+copy is overwritten; and the value is only ever read through `safeReturnPath`,
+which accepts a same-origin absolute path and turns everything else — `//evil`,
+`/\evil`, `javascript:`, a control character — into `/app`. Sign-in with a
+`next` parameter is the most valuable open redirect a site has, so it gets a
+whitelist of shapes rather than a blacklist.
+
+### Do not undo the API's work on enumeration
+
+`apps/api` answers an unknown address and a wrong password with the same status,
+the same message, and the same one argon2id derivation — issue #35 went to real
+trouble for the last part. The screens keep it:
+
+- **One message for 401**, naming neither field, written in `lib/auth/outcomes.ts`
+  rather than relayed, so a server-side string changing cannot change the
+  promise the sign-in screen makes.
+- **The sign-up link under the form is unconditional.** A link that appeared only
+  when the address was unknown is the same disclosure wearing a friendlier hat.
+- **Sign-in validates presence only.** "Too short to be one of ours" is a
+  statement about a stored value, and an account made under an older rule still
+  has to be able to sign in.
+
+Registration *does* disclose, with a 409, and that is the API's deliberate trade
+(the alternative needs a mailer this service does not have). The screen relays it
+plainly and offers sign-in.
+
+Measured on this machine against a real API, 60 interleaved samples each through
+`POST /api/auth/login`: wrong-password median 21.16 ms, unknown-address median
+20.95 ms — a 0.21 ms difference against a 2.6 ms spread within either series.
+
+### Rules mirror the API, and are not stricter
+
+`lib/auth/rules.ts` holds every client-side check, and every one of them exists
+in `apps/api/internal/auth`. Twelve characters minimum, 128 maximum, no
+composition rules — because that is what the service enforces, and a client-side
+rule the server would have accepted is a rejection with no authority behind it.
+
+Two details worth keeping:
+
+- **Lengths are counted the way Go counts them.** `len(password)` is bytes and
+  `utf8.RuneCountInString` is code points; `String.length` is neither. A naive
+  `.length >= 12` rejects a 24-byte emoji password the API is happy with.
+- **The forms carry `noValidate`.** The browser's `type="email"` constraint is
+  stricter than the API's "an `@` with something before it", so constraint
+  validation is off and these rules decide. `type="email"` stays for the keyboard
+  and the autofill.
+
+The one check that is *not* in the Go service is "at least one character before
+the `@`", which is in the database: `users.email` carries
+`CHECK (position('@' IN email) > 1)`, so `@example.com` passes validation and
+fails the insert as a 500. Filed as #76.
+
+### What the UI does about the half-registered account (#34)
+
+`Register` in `apps/api` commits the user and its password in one transaction and
+the organization and membership in a second, so a failure between them leaves an
+account that can authenticate and has nowhere to be. It is reachable, it is not
+compensated, and the screens treat it as a real state rather than an
+impossibility. It surfaces in two places:
+
+**Signing in gets a 403.** The form does not show "email or password is
+incorrect" — the credentials were right — and does not offer a retry. It says
+the account exists, is not attached to a workspace, that signing up again will
+not fix it, and to contact support. The last two sentences are the important
+ones: the natural reaction to any other message is to re-register, which collects
+a 409 on the address that already exists.
+
+**Registration gets a 5xx**, and nothing in the response says whether an account
+was created — it could be that, or a failure before the user row, or a lost
+response. So the copy does not claim to know. It gives the instruction that is
+correct in all three cases: try signing in, do not sign up again.
+
+Both are reproducible. Delete a membership row and sign in as that user, which
+is exactly the state a failure between the two transactions leaves:
+
+```sql
+delete from memberships m using users u
+ where u.id = m.user_id and u.email = '<address>';
+```
+
+### Everything else worth knowing
+
+- **The browser posts to `/api/auth/*`, never to the Go API.** `app/api/proxy`
+  refuses the `auth` prefix, so there is no path from client JavaScript to
+  `POST /auth/login` and no way to be handed a refresh token by asking.
+- **`POST /auth/register` returns no tokens**, so the sign-up form posts twice:
+  register, then login. When the second call fails — a 429 is the likely one,
+  since both count against the same per-address budget — the screen says the
+  account was created and points at sign-in, because telling the user to try
+  again would send them into a 409.
+- **`429` is respected.** `Retry-After` disables the submit button until it
+  elapses. Every refused attempt still counts against the budget, so retrying
+  early lengthens the block.
+- **403 is ambiguous and is disambiguated.** This app's own CSRF guard also
+  answers 403; it marks its refusals with `x-collabboard-refusal`, which
+  `relayApiError` never sets. Without that the sign-in form would have to match
+  on message text, which would make the copy load-bearing.
+- **The shell reads the signed-in user's name from `GET /members`.** The session
+  cookie has a user id and an organization, and `GET /me` adds a role and a
+  session id — neither has a display name or an address. Listing every member to
+  render one name is heavier than the job deserves; filed as #75. Every failure
+  degrades to "Signed in" rather than redirecting, because `serverApi` cannot
+  clear a cookie and a redirect from there would loop against `/login`, which
+  bounces anyone who has one.
+
+### Accessibility, as implemented
+
+- A `<label for>` on every input, never a placeholder standing in for one, and an
+  `autocomplete` token on each so password managers recognise the forms.
+- A failed submit renders an error summary with `role="alert"`, moves focus to
+  it, and lists each problem as a link to the input it is about.
+- Fields carry `aria-invalid` and an `aria-describedby` covering both the hint
+  and the error, so focusing one announces what is wrong with it.
+- One focus ring, declared once in `globals.css` on `:focus-visible`, using an
+  outline with an offset so it cannot reflow the page.
+- Sign-out is a `<button>`, not a link: a GET that ends a session is one Next's
+  own link prefetching would perform on the user's behalf.
+
 ### Files
+
+```
+app/(auth)/             /login and /register, plus the card they sit in
+app/(protected)/        the signed-in shell; being in here is the access rule
+components/auth/        the two forms, the labelled field, the error summary
+components/app-shell.tsx  the signed-in frame (pure; takes resolved props)
+lib/auth/rules.ts       validation, mirroring apps/api's numbers exactly
+lib/auth/outcomes.ts    status → copy, including the enumeration-safe wording
+lib/auth/routes.ts      the paths, and safeReturnPath's open-redirect check
+lib/auth/submit.ts      posting a form to /api/auth/*
+lib/session/require.ts  requireSession(): the one redirect in the app
+lib/session/request-path.ts  how a layout learns which URL it is rendering
+lib/session/viewer.ts   the signed-in user's name, via GET /members
+```
+
+### Session layer files
 
 ```
 lib/api/errors.ts       ApiResult / ApiError, and the status → kind mapping
@@ -301,13 +464,15 @@ app/api/proxy/*         authenticated pass-through for Client Components
 ## Layout
 
 ```
-app/                 routes (App Router). page.tsx is the health placeholder,
+app/                 routes (App Router). page.tsx is the public landing page,
+                     (auth)/ and (protected)/ are the two access rules,
                      healthz/route.ts is the readiness signal, api/ holds the
                      session Route Handlers and the authenticated proxy.
 components/          presentational components, kept pure so they are unit testable
-lib/                 the API client and session layer, the readiness policy,
-                     the structured logger
-proxy.ts             pre-render session refresh (Next 16's renamed middleware)
+lib/                 the API client and session layer, the auth screens' rules
+                     and copy, the readiness policy, the structured logger
+proxy.ts             pre-render session refresh + the requested-path stamp
+                     (Next 16's renamed middleware)
 instrumentation.ts   server startup hook: validates + logs the resolved API_URL
 Dockerfile           multi-stage build of the deployable image (context: repo root)
 __tests__/           vitest + React Testing Library

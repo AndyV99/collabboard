@@ -7,6 +7,11 @@
   --ok: #147a3d;
   --degraded: #9a5b00;
   --down: #b3261e;
+  --accent: #1f4fd8;
+  --accent-hover: #1a41b3;
+  --accent-foreground: #ffffff;
+  --danger-surface: #fdf2f1;
+  --notice-surface: #f4f7ff;
 }
 
 @media (prefers-color-scheme: dark) {
@@ -19,6 +24,11 @@
     --ok: #4ade80;
     --degraded: #fbbf24;
     --down: #f87171;
+    --accent: #7f9dff;
+    --accent-hover: #9db3ff;
+    --accent-foreground: #0a0a0a;
+    --danger-surface: #24100f;
+    --notice-surface: #101728;
   }
 }
 
@@ -53,4 +63,24 @@ body {
 code {
   font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
   font-size: 0.9em;
+}
+
+a {
+  color: var(--accent);
+}
+
+/*
+ * One focus ring for the whole app, and it is never removed.
+ *
+ * `:focus-visible` rather than `:focus` so a mouse click on a button does not
+ * paint one, and an outline with an offset rather than a border so it cannot
+ * change layout — a focus style that reflows the page is a focus style people
+ * turn off. The keyboard pass through the auth forms depends on this being
+ * visible on inputs, buttons and links alike, which is why it is declared once
+ * here instead of per component.
+ */
+:where(a, button, input, select, textarea, [tabindex]):focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+  border-radius: 2px;
 }
