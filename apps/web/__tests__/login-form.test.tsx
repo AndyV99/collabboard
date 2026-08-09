@@ -250,8 +250,14 @@ describe("on failure", () => {
     const summary = await screen.findByRole("alert");
 
     expect(summary).toHaveTextContent(/not attached to a workspace/i);
-    expect(summary).toHaveTextContent(/contact support/i);
     expect(summary).not.toHaveTextContent(/password is incorrect/i);
+
+    // #34 replaced the support ticket with a self-service path, so the screen
+    // offers the fix rather than an address to write to.
+    expect(summary).not.toHaveTextContent(/contact support/i);
+    expect(
+      screen.getByRole("button", { name: "Create workspace and sign in" }),
+    ).toBeEnabled();
   });
 
   it("does not read our own CSRF refusal as a missing workspace", async () => {
@@ -277,6 +283,397 @@ describe("on failure", () => {
     submit();
 
     expect(await screen.findByRole("alert")).toHaveTextContent(/could not reach the server/i);
+  });
+});
+
+/**
+ * A `fetch` stand-in that answers per path, and records what it was sent.
+ *
+ * The recovery flow makes two requests to two different Route Handlers, so a
+ * single-response stub cannot express it. `calls` is what the assertions about
+ * "the user did not retype anything" are actually made against: the second
+ * request has to carry the credentials from the first without the test ever
+ * filling a field again.
+ */
+type Reply = { status: number; body: unknown; headers?: Record<string, string> };
+
+function routes(replies: Record<string, Reply>) {
+  const calls: { path: string; body: Record<string, unknown> }[] = [];
+
+  const fetchImpl = vi.fn<FetchStub>(async (input, init) => {
+    calls.push({ path: input, body: JSON.parse(String(init?.body)) });
+
+    const reply = replies[input];
+
+    if (reply === undefined) {
+      throw new Error(`the form posted to an unstubbed path: ${input}`);
+    }
+
+    return new Response(JSON.stringify(reply.body), {
+      status: reply.status,
+      headers: { "content-type": "application/json", ...reply.headers },
+    });
+  });
+
+  return { fetchImpl, calls };
+}
+
+const CREATED = {
+  status: 201,
+  body: { user_id: "u1", organization: { id: "o1", name: "Acme", slug: "acme", role: "owner" } },
+};
+
+const STRANDED = {
+  status: 403,
+  body: { error: "this account does not belong to an organization" },
+};
+
+/**
+ * Gets to the state the recovery affordance appears in: a bare 403 on sign-in.
+ *
+ * Login stays 403 throughout, so the follow-up sign-in after a successful
+ * creation also fails. That keeps the component mounted and assertable; the
+ * test that cares about the happy path stubs login to change its answer.
+ */
+async function reachStrandedAccount(recoveryReply: Reply) {
+  const { fetchImpl, calls } = routes({
+    "/api/auth/login": STRANDED,
+    "/api/auth/first-organization": recoveryReply,
+  });
+
+  vi.stubGlobal("fetch", fetchImpl);
+  render(<LoginForm returnTo="/app" />);
+  fill("Email address", "orphan@example.com");
+  fill("Password", "correct horse battery");
+  submit();
+
+  await screen.findByRole("button", { name: "Create workspace and sign in" });
+
+  return { fetchImpl, calls };
+}
+
+/**
+ * Waits for the recovery request and returns it.
+ *
+ * Keyed on the path rather than on a call count, because a successful creation
+ * is followed by a sign-in attempt — so the total is 2 or 3 depending on the
+ * stub, and asserting a length is a race between the two.
+ */
+async function recoveryRequest(calls: { path: string; body: Record<string, unknown> }[]) {
+  await waitFor(() =>
+    expect(calls.some((call) => call.path === "/api/auth/first-organization")).toBe(true),
+  );
+
+  return calls.find((call) => call.path === "/api/auth/first-organization")!;
+}
+
+function recover(): void {
+  fireEvent.submit(
+    screen
+      .getByRole("button", { name: "Create workspace and sign in" })
+      .closest("form")!,
+  );
+}
+
+describe("recovering an account that has no workspace", () => {
+  it("creates the workspace with what was already typed, and asks for nothing again", async () => {
+    const { calls } = await reachStrandedAccount(CREATED);
+
+    // Note what the test does *not* do between the failed sign-in and this
+    // click: no `fill`. The credentials on the wire below can only have come
+    // from what the user typed into the sign-in form.
+    recover();
+
+    const created = await recoveryRequest(calls);
+
+    expect(created.body.email).toBe("orphan@example.com");
+    expect(created.body.password).toBe("correct horse battery");
+    // Blank name omitted, so the API applies its own default rather than this
+    // app duplicating it.
+    expect(created.body).not.toHaveProperty("organization_name");
+  });
+
+  it("never asks for the password a second time", async () => {
+    await reachStrandedAccount(CREATED);
+
+    // One password box on the screen, the one that already has the password in
+    // it. A recovery screen that re-prompted would have two. Queried off the
+    // DOM rather than by label, because "Show password" on the reveal toggle
+    // matches a label query for /password/ too.
+    expect(document.querySelectorAll("input[type='password']")).toHaveLength(1);
+    expect(screen.getByLabelText("Password")).toHaveValue("correct horse battery");
+  });
+
+  it("signs the user in and navigates once the workspace exists", async () => {
+    // Login answers 403 first and 200 second: the same endpoint, a different
+    // answer once the account has somewhere to be. That is the whole point of
+    // the flow, so the stub models it rather than pretending login is static.
+    let loginCalls = 0;
+
+    const fetchImpl = vi.fn<FetchStub>(async (input) => {
+      if (input === "/api/auth/first-organization") {
+        return new Response(JSON.stringify(CREATED.body), {
+          status: 201,
+          headers: { "content-type": "application/json" },
+        });
+      }
+
+      loginCalls += 1;
+
+      return loginCalls === 1
+        ? new Response(JSON.stringify(STRANDED.body), {
+            status: 403,
+            headers: { "content-type": "application/json" },
+          })
+        : new Response(JSON.stringify({ user_id: "u1" }), {
+            status: 200,
+            headers: { "content-type": "application/json" },
+          });
+    });
+
+    vi.stubGlobal("fetch", fetchImpl);
+    render(<LoginForm returnTo="/app?tab=inbox" />);
+    fill("Email address", "orphan@example.com");
+    fill("Password", "correct horse battery");
+    submit();
+
+    await screen.findByRole("button", { name: "Create workspace and sign in" });
+    recover();
+
+    await waitFor(() => expect(replace).toHaveBeenCalledWith("/app?tab=inbox"));
+    expect(refresh).toHaveBeenCalled();
+    expect(loginCalls).toBe(2);
+  });
+
+  it("sends a workspace name when one is given", async () => {
+    const { calls } = await reachStrandedAccount(CREATED);
+
+    fill(/workspace name/i, "  Acme Ltd  ");
+    recover();
+
+    expect((await recoveryRequest(calls)).body.organization_name).toBe("Acme Ltd");
+  });
+
+  it("keeps every field the user filled when the creation fails", async () => {
+    // The explicit acceptance criterion, and the most annoying way to get this
+    // wrong: a failure that empties the form makes the user retype a password
+    // to try again.
+    await reachStrandedAccount({
+      status: 500,
+      body: { error: "internal server error" },
+    });
+
+    fill(/workspace name/i, "Acme Ltd");
+    recover();
+
+    await waitFor(() =>
+      expect(screen.getByRole("alert")).toHaveTextContent(/could not reach the server/i),
+    );
+
+    expect(screen.getByLabelText("Email address")).toHaveValue("orphan@example.com");
+    expect(screen.getByLabelText("Password")).toHaveValue("correct horse battery");
+    expect(screen.getByLabelText(/workspace name/i)).toHaveValue("Acme Ltd");
+    // And the button is still there to press again.
+    expect(screen.getByRole("button", { name: "Create workspace and sign in" })).toBeEnabled();
+  });
+
+  it("reports a 429 as a wait rather than as a generic failure", async () => {
+    // This route is charged against the sign-in budget, before the credential
+    // is even checked, so a user who just failed a few sign-ins can be refused
+    // on their first click here. "Something went wrong" would be the wrong
+    // answer when the real one is "wait 15 minutes".
+    await reachStrandedAccount({
+      status: 429,
+      body: { error: "too many attempts, try again later" },
+      headers: { "retry-after": "900" },
+    });
+
+    recover();
+
+    await waitFor(() =>
+      expect(screen.getByRole("alert")).toHaveTextContent(/about 15 minutes/),
+    );
+    expect(screen.getByRole("alert")).not.toHaveTextContent(/something went wrong/i);
+
+    // Both buttons spend the same budget, so both stop. Retrying either one
+    // early only lengthens the block.
+    expect(screen.getByRole("button", { name: "Create workspace and sign in" })).toBeDisabled();
+    expect(screen.getByRole("button", { name: "Sign in" })).toBeDisabled();
+  });
+
+  it("treats a 409 as resolved and points at signing in, not as an error", async () => {
+    await reachStrandedAccount({
+      status: 409,
+      body: { error: "this account already belongs to an organization" },
+    });
+
+    recover();
+
+    // Re-queried rather than captured, because resolving swaps the alert for a
+    // different element and a captured node would be detached by now.
+    await waitFor(() =>
+      expect(screen.getByRole("alert")).toHaveTextContent(/already has a workspace/i),
+    );
+    expect(screen.getByRole("alert")).toHaveTextContent(/sign in below/i);
+
+    // Nothing left to create, so the form goes away — a second attempt would
+    // only collect the same 409.
+    expect(
+      screen.queryByRole("button", { name: "Create workspace and sign in" }),
+    ).not.toBeInTheDocument();
+    // The sign-in form is untouched and one press away.
+    expect(screen.getByLabelText("Password")).toHaveValue("correct horse battery");
+  });
+
+  it("says the workspace was created when only the follow-up sign-in failed", async () => {
+    // The dangerous state: the workspace exists but the session does not. If
+    // this looked like a total failure the user would press the button again
+    // and collect a 409.
+    let loginCalls = 0;
+
+    const fetchImpl = vi.fn<FetchStub>(async (input) => {
+      if (input === "/api/auth/first-organization") {
+        return new Response(JSON.stringify(CREATED.body), {
+          status: 201,
+          headers: { "content-type": "application/json" },
+        });
+      }
+
+      loginCalls += 1;
+
+      return loginCalls === 1
+        ? new Response(JSON.stringify(STRANDED.body), {
+            status: 403,
+            headers: { "content-type": "application/json" },
+          })
+        : new Response(JSON.stringify({ error: "too many attempts, try again later" }), {
+            status: 429,
+            headers: { "content-type": "application/json", "retry-after": "60" },
+          });
+    });
+
+    vi.stubGlobal("fetch", fetchImpl);
+    render(<LoginForm returnTo="/app" />);
+    fill("Email address", "orphan@example.com");
+    fill("Password", "correct horse battery");
+    submit();
+
+    await screen.findByRole("button", { name: "Create workspace and sign in" });
+    recover();
+
+    await waitFor(() =>
+      expect(screen.getByRole("alert")).toHaveTextContent(/your workspace was created/i),
+    );
+    expect(screen.getByRole("alert")).toHaveTextContent(/about 1 minute/);
+    expect(screen.getByRole("alert")).toHaveTextContent(/do not create another/i);
+    expect(replace).not.toHaveBeenCalled();
+  });
+
+  it("refuses an over-long workspace name without reaching the network", async () => {
+    // Mirrors the cap the sign-up form applies. `organization_name` is unbounded
+    // server-side (#67), so this is a client-side mitigation rather than the
+    // fix — and it is counted in code points, because the API counts runes and
+    // `String.length` counts UTF-16 units.
+    const { calls } = await reachStrandedAccount(CREATED);
+    const before = calls.length;
+
+    fill(/workspace name/i, "🔐".repeat(129));
+    recover();
+
+    const alert = await screen.findByRole("alert");
+
+    await waitFor(() => expect(alert).toHaveTextContent(/at most 128 characters/i));
+    expect(calls).toHaveLength(before);
+    expect(screen.getByLabelText(/workspace name/i)).toHaveAttribute("aria-invalid", "true");
+  });
+
+  it("clears the name error as the name is shortened", async () => {
+    await reachStrandedAccount(CREATED);
+
+    fill(/workspace name/i, "🔐".repeat(129));
+    recover();
+    await screen.findByRole("alert");
+
+    fill(/workspace name/i, "Acme");
+
+    await waitFor(() =>
+      expect(screen.getByLabelText(/workspace name/i)).toHaveAttribute("aria-invalid", "false"),
+    );
+  });
+
+  it("does not spend a rate-limit slot when the password box was emptied", async () => {
+    // Both boxes stay editable while the button is on screen, and the API
+    // charges the shared sign-in budget before it checks the credential — so an
+    // empty password must not become a request.
+    const { calls } = await reachStrandedAccount(CREATED);
+    const before = calls.length;
+
+    fill("Password", "");
+    recover();
+
+    const alert = await screen.findByRole("alert");
+
+    await waitFor(() => expect(alert).toHaveTextContent(/both needed/i));
+    expect(calls).toHaveLength(before);
+    // And the address is still there — nothing was discarded.
+    expect(screen.getByLabelText("Email address")).toHaveValue("orphan@example.com");
+  });
+
+  it("does not offer recovery for a CSRF refusal, which is also a 403", async () => {
+    vi.stubGlobal(
+      "fetch",
+      respond(403, { error: "This request did not come from this site." }, {
+        "x-collabboard-refusal": "cross-origin",
+      }),
+    );
+    render(<LoginForm returnTo="/app" />);
+    fill("Email address", "andy@example.com");
+    fill("Password", "correct horse battery");
+    submit();
+
+    await screen.findByRole("alert");
+
+    expect(
+      screen.queryByRole("button", { name: "Create workspace and sign in" }),
+    ).not.toBeInTheDocument();
+  });
+
+  it("leaves every other failure kind rendering exactly one plain sentence", async () => {
+    vi.stubGlobal("fetch", respond(401, { error: "invalid email or password" }));
+    render(<LoginForm returnTo="/app" />);
+    fill("Email address", "andy@example.com");
+    fill("Password", "wrong password here");
+    submit();
+
+    const alert = await screen.findByRole("alert");
+
+    expect(alert).toHaveTextContent("Email or password is incorrect.");
+    expect(screen.queryByLabelText(/workspace name/i)).not.toBeInTheDocument();
+  });
+});
+
+describe("where the password does not go", () => {
+  it("never leaves memory: not storage, not a cookie, not a URL", async () => {
+    // The decision this feature turns on. The password is held across the
+    // transition in React state — where a controlled input already held it —
+    // and nowhere a later reader could find it.
+    const { calls } = await reachStrandedAccount(CREATED);
+
+    recover();
+    await recoveryRequest(calls);
+
+    const secret = "correct horse battery";
+
+    expect(window.localStorage.length).toBe(0);
+    expect(window.sessionStorage.length).toBe(0);
+    expect(document.cookie).not.toContain(secret);
+    expect(window.location.href).not.toContain(secret);
+
+    // It travels as a JSON body and only as a JSON body — never a query string.
+    for (const call of calls) {
+      expect(call.path).not.toContain(secret);
+      expect(call.path).not.toContain("password");
+    }
   });
 });
 
