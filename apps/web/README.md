@@ -4,10 +4,12 @@ Next.js (App Router, React Server Components) front end for CollabBoard.
 
 What exists: a public landing page that server-side fetches `GET /healthz` from
 the Go API, the [authentication screens](#the-authentication-screens) (register,
-sign in, sign out, route protection), and
+sign in, sign out, route protection),
 [the signed-in workspace](#the-workspace-projects-boards-and-people) — projects,
-boards and the people in an organization. The board *view* — columns and cards —
-is issue #63; the WebSocket client is #9.
+boards and the people in an organization — and
+[the board view](#the-board-view-columns-and-cards), which renders a board's
+columns and cards read-only. Creating and editing cards is #64, drag-and-drop is
+#65, and the WebSocket client is #9.
 
 ## Commands
 
@@ -453,7 +455,7 @@ Four routes under `/app`, all behind `app/(protected)/layout.tsx`:
 | --- | --- |
 | `/app` | The organization's projects, and the form that creates one |
 | `/app/projects/<id>` | One project: its boards, rename, archive |
-| `/app/projects/<id>/boards/<id>` | One board — **a placeholder**; #63 renders it |
+| `/app/projects/<id>/boards/<id>` | One board: its columns and cards — see [the board view](#the-board-view-columns-and-cards) |
 | `/app/members` | Everyone in the organization, and the add-member form |
 
 ### State lives in the URL, so a reload and a paste both work
@@ -568,8 +570,9 @@ components/workspace/fields.tsx           labelled input/textarea/select (ids ar
 components/workspace/states.tsx           empty, error and loading states
 components/workspace/page-header.tsx      title, lede and breadcrumbs
 components/projects/                      list, create, rename, archive
-components/boards/                        list, create
+components/boards/                        a project's boards, and one board itself
 components/members/                       list, add
+lib/board/snapshot.ts                     columns × cards, in the API's order
 lib/workspace/routes.ts                   every URL, and why the board one nests
 lib/workspace/rules.ts                    validation mirroring crud.go's limits
 lib/workspace/roles.ts                    who may add, and where the role is read from
@@ -584,6 +587,10 @@ call made only to render one name (#75, #78). Because that await is *above* ever
 `loading.tsx`, the segment fallbacks cannot paint until it resolves — on a slow
 API the whole signed-in area waits on a request none of the pages need. #78
 deletes that call, which removes the problem rather than working around it.
+
+It is also why a board page makes **five** API requests and not four: four of
+its own, plus that one. The five are constant — a board with 240 cards makes the
+same five as an empty one.
 
 ### Session layer files
 
@@ -602,6 +609,140 @@ proxy.ts                refreshes before the render
 app/api/auth/*          login, register, refresh, logout, session, organization
 app/api/proxy/*         authenticated pass-through for Client Components
 ```
+
+## The board view: columns and cards
+
+The core screen. `/app/projects/<id>/boards/<id>` renders a board as columns of
+cards, **read-only** — creating and editing cards is #64, drag-and-drop is #65,
+live updates are #9. There is no disabled "New card" button standing in for
+them; a control that cannot do anything is a promise the screen cannot keep, so
+the page says in words what is missing instead.
+
+### The order is the API's, and the client never computes one
+
+This is the rule the whole screen is built around, and
+[ADR 0004](../../docs/adr/0004-card-ordering.md) is why. A card's rank is a
+server-allocated `numeric` that appears in **no response** and is accepted by
+**no endpoint**; `apps/api` returns cards already ordered
+(`ORDER BY column_id, position, id`) and that sequence *is* the answer.
+
+So `lib/board/snapshot.ts` groups the flat cards list into columns in a single
+pass that preserves input order, and there is no comparison anywhere in it.
+There is nothing to sort by even if you wanted to: `created_at` is
+second-precision and stops matching the board the moment anyone drags anything,
+and `title` is not an order at all.
+
+If a change here ever reaches for `.sort()`, the bug is upstream — either the
+API's `ORDER BY` is wrong or the request was not the one the screen needed.
+
+The reason this matters beyond correctness is #65. Drag-and-drop posts
+`{"column_id": …, "after_card_id": …}` — an *anchor*, a claim about one row —
+and an anchor is only meaningful against the list the server actually has. A
+client carrying its own ordering model would be computing anchors against a list
+nobody else agrees with, and a stale anchor is a 409 rather than a wrong-looking
+success.
+
+### Three requests for the whole board, never one per card
+
+`GET /boards/:id`, `GET /boards/:id/columns`, `GET /boards/:id/cards`, plus
+`GET /projects/:id` for the breadcrumb. All four in one `Promise.all`, because
+none depends on another's answer — the tempting "read the board, then read its
+contents only if it exists" is a waterfall that doubles time to first paint on
+every successful load to save two requests on the rare failing one.
+
+`GET /boards/:id/cards` returns the entire board, so the request count does not
+move with the number of cards. Measured against the production build and a real
+API: a 240-card board renders in a median 15 ms (TTFB 10 ms) and makes the same
+five API requests as a five-card one. 284 kB of HTML, 25 kB over the wire
+compressed.
+
+Only `GET /boards/:id` distinguishes a board that does not exist from one that
+does. The two list endpoints answer `200 []` for an unknown board id, because
+they filter by `board_id` inside row-level security rather than resolving the
+board first — which is what makes an empty cards list mean "empty board" and
+makes 404 the board request's business alone. Firing them for a board the caller
+cannot see leaks nothing for the same reason.
+
+### The open card is a search parameter
+
+`?card=<id>`, not a route of its own. A card is a detail of the board and the
+board stays on screen behind it; a `/cards/<id>` route would either lose that
+context or need intercepting routes to fake keeping it, and the fake comes apart
+on exactly the reload or pasted link the URL exists to survive.
+
+It also costs no request. The board already fetched every card, so opening one
+is a lookup in memory — `GET /cards/:id` would be a round trip for bytes the
+page is holding, and it would put the detail panel one network failure away from
+a board that loaded fine. An id that names nothing on this board renders a "card
+not found" panel with the board still behind it, without asking the API whose
+card it was.
+
+### Where the Server/Client line falls — #64, #65 and #66 inherit this
+
+**The page is the only thing that touches the API or the session.** Everything
+below it is a pure component taking resolved, plain-serialisable props:
+
+```
+page.tsx                     Server Component: four requests, the 404 checks,
+                             and the grouping. The only async thing here.
+lib/board/snapshot.ts        pure: columns × cards → the board's shape
+components/boards/board-view.tsx    pure: columns, cards, selection
+components/boards/card-detail.tsx   pure: one card, and the not-found panel
+components/boards/board-skeleton.tsx  the loading.tsx fallback
+```
+
+Today that means the board is fully server-rendered and the browser is sent no
+board code at all. The part that matters for later is the *shape*: `Card` and
+`Column` are strings all the way down (`lib/api/types.ts` keeps timestamps as
+strings for exactly this reason), so making the board interactive is
+`"use client"` at the top of `board-view.tsx` — the props already cross an RSC
+boundary unchanged and `page.tsx` does not move.
+
+Three things to keep when that happens:
+
+1. **Do not make `page.tsx` a Client Component to get state into it.** The
+   session and the token live on the server; a client page would refetch the
+   board through `/api/proxy` on every mount and give up first paint for
+   nothing.
+2. **Do not fetch from a board component.** One request per column is the
+   failure mode this design exists to avoid, and it starts with one innocent
+   `useEffect`.
+3. **Reorder by asking the server, not by sorting an array.** `POST
+   /cards/:id/move` then re-read. An optimistic local reorder is fine as a
+   *display* while the request is in flight; it must not become the source of
+   truth, or the client has invented the rank ADR 0004 refused to publish.
+
+Selection is a URL rather than state, so there is nothing to lift into a
+provider either.
+
+### States, all of them reachable
+
+| State | What renders |
+| --- | --- |
+| Loading | `loading.tsx` — column-shaped, in the first flush |
+| Empty board | "This board has no columns yet", and what a column is for |
+| Empty column | "No cards in this column." in place of the list |
+| Board not found / another tenant's | One 404 sentence covering both, per `crud.go`'s `notFound` |
+| Board in a different project | The same 404 — `board.projectId` is checked against the URL |
+| Columns or cards failed | The header and breadcrumb stay; the failure is about the contents |
+| API unreachable | "The server did not answer", with a retry — one 10 s timeout, not four, because the requests are parallel |
+| `?card=` names nothing here | A "card not found" panel, board still behind it |
+
+### One layout note
+
+`components/boards/board.module.css` is the one screen that does not use
+`workspace.module.css`. The rest of the signed-in app is a document — a single
+column inside a 60rem measure — and the board is a horizontally scrolling region
+of fixed-width columns, each with its own vertical scroller so that 240 cards
+scroll inside a column rather than making the page 240 rows tall. Sharing
+`.card` between a link tile in a responsive grid and a card in a dense stack
+would mean bending the class every other screen already uses.
+
+Two accessibility details that are load-bearing rather than decorative: each
+column's card list is an `<ol>` because the order is the board's meaning, and it
+carries `tabindex="0"` because a scroll container with no focusable child is
+unreachable without a pointer — which is every column whose cards run past the
+fold.
 
 ## Layout
 

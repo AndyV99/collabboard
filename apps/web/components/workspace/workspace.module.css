@@ -223,6 +223,16 @@ a.card:hover {
   color: var(--foreground);
 }
 
+/*
+ * Two paragraphs in a panel body read as one until they are spaced. This used
+ * to be scoped to `.disclosureBody`, where the archive warning was the only
+ * multi-paragraph panel; the board's empty state is the second, and the rule was
+ * never specific to disclosures in the first place.
+ */
+.panelBody p + p {
+  margin-top: 0.75rem;
+}
+
 .steps {
   display: flex;
   flex-direction: column;
@@ -427,10 +437,6 @@ a.card:hover {
 
 .disclosureDanger > .disclosureBody {
   border-top-color: var(--down);
-}
-
-.disclosureBody .panelBody p + p {
-  margin-top: 0.75rem;
 }
 
 /* --- messages --------------------------------------------------------- */

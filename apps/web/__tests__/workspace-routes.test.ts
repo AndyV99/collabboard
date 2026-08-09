@@ -4,12 +4,14 @@
 
 import { describe, expect, it } from "vitest";
 
-import { formatDate } from "@/lib/workspace/format";
+import { formatDate, formatDateTime } from "@/lib/workspace/format";
 import {
   MEMBERS_PATH,
   WORKSPACE_PATH,
   boardHref,
+  cardHref,
   projectHref,
+  selectedCardId,
 } from "@/lib/workspace/routes";
 
 describe("workspace routes", () => {
@@ -29,6 +31,21 @@ describe("workspace routes", () => {
     expect(boardHref("p/1", "b?x=1")).toBe("/app/projects/p%2F1/boards/b%3Fx%3D1");
   });
 
+  it("opens a card on its board rather than at a URL of its own", () => {
+    // A card is a detail of the board, and the board stays on screen behind it.
+    // As a search parameter the selection is still addressable, reloadable and
+    // shareable, and it costs no request — the board already has every card.
+    expect(cardHref("p-1", "b-1", "c-1")).toBe(
+      "/app/projects/p-1/boards/b-1?card=c-1#card",
+    );
+  });
+
+  it("encodes a card id into the query rather than letting it add parameters", () => {
+    expect(cardHref("p-1", "b-1", "c-1&card=c-2")).toBe(
+      "/app/projects/p-1/boards/b-1?card=c-1%26card%3Dc-2#card",
+    );
+  });
+
   it("keeps every workspace URL under the protected group's path", () => {
     // Route protection is `app/(protected)/layout.tsx` and it covers a subtree.
     // A workspace URL that escaped /app would be a page with no session check.
@@ -37,9 +54,27 @@ describe("workspace routes", () => {
       MEMBERS_PATH,
       projectHref("p-1"),
       boardHref("p-1", "b-1"),
+      cardHref("p-1", "b-1", "c-1"),
     ]) {
       expect(href.startsWith("/app")).toBe(true);
     }
+  });
+});
+
+describe("selectedCardId", () => {
+  it("reads the open card out of the query", () => {
+    expect(selectedCardId({ card: "c-1" })).toBe("c-1");
+  });
+
+  it("is null when no card is open", () => {
+    expect(selectedCardId({})).toBeNull();
+    expect(selectedCardId({ card: "" })).toBeNull();
+  });
+
+  it("refuses to pick one when the URL names two", () => {
+    // `?card=a&card=b` is not a request this screen can honour, and obeying
+    // half of it would leave the URL no longer describing what is on screen.
+    expect(selectedCardId({ card: ["c-1", "c-2"] })).toBeNull();
   });
 });
 
@@ -62,5 +97,18 @@ describe("formatDate", () => {
     expect(formatDate("")).toBeNull();
     expect(formatDate(null)).toBeNull();
     expect(formatDate(undefined)).toBeNull();
+  });
+});
+
+describe("formatDateTime", () => {
+  it("names the zone, because the time is not the reader's", () => {
+    // A card's created and updated are often minutes apart, so the card detail
+    // needs the minute — and an unqualified "14:32" would read as local time.
+    expect(formatDateTime("2026-08-09T14:32:00Z")).toBe("9 Aug 2026, 14:32 UTC");
+  });
+
+  it("returns null rather than 'Invalid Date'", () => {
+    expect(formatDateTime("not a date")).toBeNull();
+    expect(formatDateTime(null)).toBeNull();
   });
 });
