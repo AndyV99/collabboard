@@ -18,6 +18,33 @@
  *   most important entry not on the list.
  * - **`ws`** — a WebSocket upgrade cannot be proxied through a Route Handler
  *   anyway, and issue #9's client connects with a token passed to it as a prop.
+ *
+ * # Why dot segments are refused rather than escaped
+ *
+ * `encodeURIComponent("..")` is `".."` — `.` is unreserved, so percent-encoding
+ * does not neutralise it — and the URL parser inside `fetch` removes dot
+ * segments when it resolves the string. So an allowlisted first segment followed
+ * by `..` walks straight back out of it:
+ *
+ *     ["cards", "..", "auth", "organization"]
+ *       → "/cards/../auth/organization"
+ *       → http://api/api/v1/auth/organization
+ *
+ * which is `POST /auth/organization` — an endpoint that answers with a refresh
+ * token in its body. The allowlist would have "passed" and the browser would
+ * have been handed the one credential this whole design exists to keep from it.
+ *
+ * Hence two independent guards below: no segment may be `.`, `..` or empty, and
+ * the assembled path must still begin with the root that was allowed. The second
+ * is the one that survives someone later deciding the first is too strict.
+ *
+ * # The allowlist checks the first segment only
+ *
+ * `/projects/<id>/anything` is forwarded even though `lib/api/endpoints.ts`
+ * never builds such a path — the API answers 404 for routes it does not have,
+ * and enumerating full path shapes here would mean maintaining the route table
+ * twice. What the list constrains is which *surface* a browser can reach, and
+ * with dot segments refused, the first segment is the whole surface.
  */
 
 import type { ApiError } from "./errors";
@@ -43,27 +70,49 @@ export const PROXIED_METHODS: ReadonlySet<string> = new Set([
 
 export type ProxyTarget =
   | { allowed: true; path: string }
-  | { allowed: false; reason: "empty_path" | "not_allowed" };
+  | { allowed: false; reason: "empty_path" | "not_allowed" | "dot_segment" };
+
+/**
+ * Segments that must never appear, whatever they are wrapped in.
+ *
+ * Compared after decoding, so `%2E%2E` and `..` are the same thing here — which
+ * is the point, since Next hands these over already decoded.
+ */
+const DOT_SEGMENTS = new Set([".", ".."]);
 
 /**
  * Turns the catch-all segments into a path on the API's v1 surface.
  *
  * Segments arrive already percent-decoded from Next, so they are re-encoded on
  * the way out: a segment containing `/` or `?` must not be able to change the
- * shape of the URL that gets built.
+ * shape of the URL that gets built. Dot segments are refused rather than encoded
+ * — see the module comment for why encoding them does not work.
  */
 export function proxyTarget(segments: readonly string[], search = ""): ProxyTarget {
   if (segments.length === 0 || segments[0] === "") {
     return { allowed: false, reason: "empty_path" };
   }
 
-  if (!PROXIED_ROOTS.has(segments[0])) {
+  const root = segments[0];
+
+  if (!PROXIED_ROOTS.has(root)) {
     return { allowed: false, reason: "not_allowed" };
   }
 
-  const path = segments.map((segment) => encodeURIComponent(segment)).join("/");
+  if (segments.some((segment) => segment === "" || DOT_SEGMENTS.has(segment))) {
+    return { allowed: false, reason: "dot_segment" };
+  }
 
-  return { allowed: true, path: `/${path}${search}` };
+  const path = `/${segments.map((segment) => encodeURIComponent(segment)).join("/")}`;
+
+  // The second guard, independent of the first. Whatever the segments turned
+  // out to be, the path we are about to send must still address the surface
+  // that was allowed. If this ever fails, the check above has a hole in it.
+  if (path !== `/${root}` && !path.startsWith(`/${root}/`)) {
+    return { allowed: false, reason: "dot_segment" };
+  }
+
+  return { allowed: true, path: `${path}${search}` };
 }
 
 /**

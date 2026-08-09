@@ -54,6 +54,12 @@ export type AuthenticatedCallOptions = {
    */
   onSignedOut?: () => void;
   fetchImpl?: typeof fetch;
+  /**
+   * Cancels the API requests. Deliberately *not* passed to the refresh: that
+   * request is shared with every other caller waiting on the same single-flight,
+   * and one caller giving up must not abort a rotation the others are relying
+   * on. A caller that aborts mid-recovery waits out the refresh and then stops.
+   */
   signal?: AbortSignal;
 };
 
@@ -71,13 +77,33 @@ export async function authenticatedCall<T>(
 ): Promise<ApiResult<T>> {
   const canRefresh = options.onRefreshed !== undefined && options.refreshToken !== null;
 
+  // One refresh per call, counted rather than assumed.
+  //
+  // Without this flag the up-front branch below and the 401-recovery branch are
+  // independent, and both spend `options.refreshToken` — which after the first
+  // one is the *pre-rotation* value, and therefore a replay the API revokes the
+  // session for. The grace window in lib/session/refresh.ts hides it most of the
+  // time, which is exactly what makes it worth a flag rather than a comment.
+  // Found in review.
+  let spentRefreshToken = false;
+
+  const refreshOnce = async (): Promise<string | null> => {
+    if (spentRefreshToken) {
+      return null;
+    }
+
+    spentRefreshToken = true;
+
+    return tryRefresh(options);
+  };
+
   // No access token but a refresh token we are allowed to spend: refresh first
   // rather than sending a request we know will 401. This is the ordinary path
   // for a browser whose access cookie expired between page loads.
   let accessToken = options.accessToken;
 
   if ((accessToken === null || accessToken === "") && canRefresh) {
-    const refreshed = await tryRefresh(options);
+    const refreshed = await refreshOnce();
 
     if (refreshed === null) {
       return unauthorized();
@@ -101,13 +127,14 @@ export async function authenticatedCall<T>(
     return first;
   }
 
-  const rotated = await tryRefresh(options);
+  const rotated = await refreshOnce();
 
   if (rotated === null) {
-    // Either the session is over (cookies already cleared by `onSignedOut`) or
-    // the refresh endpoint was unreachable. Both leave the caller with the
-    // original 401, which is the honest answer: this request did not succeed
-    // and we could not make it succeed.
+    // Either the session is over (cookies already cleared by `onSignedOut`), the
+    // refresh endpoint was unreachable, or this call already spent its one
+    // refresh. All three leave the caller with the original 401, which is the
+    // honest answer: this request did not succeed and we could not make it
+    // succeed.
     return first;
   }
 

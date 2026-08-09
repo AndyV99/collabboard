@@ -13,6 +13,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import {
   __resetInFlightForTests,
+  GRACE_MAX_ENTRIES,
   GRACE_MS,
   graceCount,
   inFlightCount,
@@ -37,6 +38,25 @@ function jsonResponse(body: unknown, status = 200): Response {
     status,
     headers: { "content-type": "application/json" },
   });
+}
+
+/**
+ * A clock the test moves by hand.
+ *
+ * The grace window is measured from when a refresh *settles*, so a test that
+ * wants to reason about it has to control the same clock the module reads —
+ * injecting only a start time leaves `remember` on the wall clock and the
+ * assertions become meaningless without failing.
+ */
+function frozenClock(start = 1_000_000) {
+  let value = start;
+
+  return {
+    read: () => value,
+    advance: (ms: number) => {
+      value += ms;
+    },
+  };
 }
 
 /** A fetch that does not settle until `release()` is called. */
@@ -150,22 +170,24 @@ describe("refreshSession", () => {
     // Without the grace window it spends that token a second time, the API sees
     // a replay, and the session is revoked out from under everyone.
     const fetchImpl = vi.fn(async () => jsonResponse(session("new-access", "new-refresh")));
-    const start = 1_000_000;
+    const clock = frozenClock();
 
-    const first = await refreshSession(
-      "spent-token",
-      { baseUrl: BASE, fetchImpl: fetchImpl as never },
-      start,
-    );
+    const first = await refreshSession("spent-token", {
+      baseUrl: BASE,
+      fetchImpl: fetchImpl as never,
+      clock: clock.read,
+    });
 
     expect(inFlightCount()).toBe(0);
     expect(graceCount()).toBe(1);
 
-    const straggler = await refreshSession(
-      "spent-token",
-      { baseUrl: BASE, fetchImpl: fetchImpl as never },
-      start + 1_000,
-    );
+    clock.advance(1_000);
+
+    const straggler = await refreshSession("spent-token", {
+      baseUrl: BASE,
+      fetchImpl: fetchImpl as never,
+      clock: clock.read,
+    });
 
     expect(fetchImpl).toHaveBeenCalledTimes(1);
     expect(straggler).toEqual(first);
@@ -173,14 +195,14 @@ describe("refreshSession", () => {
 
   it("stops answering from the grace window once it expires", async () => {
     const fetchImpl = vi.fn(async () => jsonResponse(session("a", "b")));
-    const start = 1_000_000;
+    const clock = frozenClock();
+    const deps = { baseUrl: BASE, fetchImpl: fetchImpl as never, clock: clock.read };
 
-    await refreshSession("t", { baseUrl: BASE, fetchImpl: fetchImpl as never }, start);
-    await refreshSession(
-      "t",
-      { baseUrl: BASE, fetchImpl: fetchImpl as never },
-      start + GRACE_MS + 1,
-    );
+    await refreshSession("t", deps);
+
+    clock.advance(GRACE_MS + 1);
+
+    await refreshSession("t", deps);
 
     expect(fetchImpl).toHaveBeenCalledTimes(2);
   });
@@ -189,14 +211,14 @@ describe("refreshSession", () => {
     const fetchImpl = vi.fn(async () =>
       jsonResponse({ error: "session is no longer valid" }, 401),
     );
-    const start = 1_000_000;
+    const clock = frozenClock();
+    const deps = { baseUrl: BASE, fetchImpl: fetchImpl as never, clock: clock.read };
 
-    await refreshSession("dead", { baseUrl: BASE, fetchImpl: fetchImpl as never }, start);
-    const second = await refreshSession(
-      "dead",
-      { baseUrl: BASE, fetchImpl: fetchImpl as never },
-      start + 500,
-    );
+    await refreshSession("dead", deps);
+
+    clock.advance(500);
+
+    const second = await refreshSession("dead", deps);
 
     expect(fetchImpl).toHaveBeenCalledTimes(1);
     expect(second.status).toBe("rejected");
@@ -206,42 +228,83 @@ describe("refreshSession", () => {
     const fetchImpl = vi.fn(async () => {
       throw new TypeError("fetch failed");
     });
-    const start = 1_000_000;
+    const clock = frozenClock();
+    const deps = { baseUrl: BASE, fetchImpl: fetchImpl as never, clock: clock.read };
 
-    await refreshSession("t", { baseUrl: BASE, fetchImpl: fetchImpl as never }, start);
+    await refreshSession("t", deps);
 
     expect(graceCount()).toBe(0);
 
-    await refreshSession(
-      "t",
-      { baseUrl: BASE, fetchImpl: fetchImpl as never },
-      start + 100,
-    );
+    clock.advance(100);
+
+    await refreshSession("t", deps);
+
+    expect(fetchImpl).toHaveBeenCalledTimes(2);
+  });
+
+  it("measures the grace window from when the refresh settled, not when it started", async () => {
+    // The window used to be computed from the call's start, so the refresh's own
+    // round trip was subtracted from it: a refresh taking 8s left 2s of grace,
+    // and with REQUEST_TIMEOUT_MS equal to GRACE_MS a slow one left none. That
+    // inverts the intent — stragglers pile up during a *slow* refresh, which is
+    // exactly when the window would have been smallest.
+    const clock = frozenClock();
+    const fetchImpl = vi.fn(async () => {
+      // The request itself takes eight seconds.
+      clock.advance(8_000);
+
+      return jsonResponse(session("new-access", "new-refresh"));
+    });
+    const deps = { baseUrl: BASE, fetchImpl: fetchImpl as never, clock: clock.read };
+
+    await refreshSession("slow", deps);
+
+    // A straggler arriving 8.5s after the burst began — but only 0.5s after the
+    // rotation actually happened — must still be answered from the window.
+    clock.advance(500);
+
+    const straggler = await refreshSession("slow", deps);
+
+    expect(fetchImpl).toHaveBeenCalledTimes(1);
+    expect(straggler.status).toBe("refreshed");
+
+    // And it still expires, measured from the settle time.
+    clock.advance(GRACE_MS);
+
+    await refreshSession("slow", deps);
 
     expect(fetchImpl).toHaveBeenCalledTimes(2);
   });
 
   it("prunes expired entries rather than growing forever", async () => {
     const fetchImpl = vi.fn(async () => jsonResponse(session("a", "b")));
-    const start = 1_000_000;
+    const clock = frozenClock();
+    const deps = { baseUrl: BASE, fetchImpl: fetchImpl as never, clock: clock.read };
 
     for (let i = 0; i < 5; i += 1) {
-      await refreshSession(
-        `token-${i}`,
-        { baseUrl: BASE, fetchImpl: fetchImpl as never },
-        start,
-      );
+      await refreshSession(`token-${i}`, deps);
     }
 
     expect(graceCount()).toBe(5);
 
-    await refreshSession(
-      "later",
-      { baseUrl: BASE, fetchImpl: fetchImpl as never },
-      start + GRACE_MS + 1,
-    );
+    clock.advance(GRACE_MS + 1);
+
+    await refreshSession("later", deps);
 
     expect(graceCount()).toBe(1);
+  });
+
+  it("caps the remembered outcomes so a busy process cannot grow unboundedly", async () => {
+    const fetchImpl = vi.fn(async () => jsonResponse(session("a", "b")));
+    const clock = frozenClock();
+    const deps = { baseUrl: BASE, fetchImpl: fetchImpl as never, clock: clock.read };
+
+    // All at the same instant, so nothing is evicted by expiry — only by the cap.
+    for (let i = 0; i < GRACE_MAX_ENTRIES + 25; i += 1) {
+      await refreshSession(`token-${i}`, deps);
+    }
+
+    expect(graceCount()).toBeLessThanOrEqual(GRACE_MAX_ENTRIES);
   });
 
   it("treats a 401 as the session being over", async () => {

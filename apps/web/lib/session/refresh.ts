@@ -54,8 +54,7 @@
  * property of the deployed image, and #69 covers it too.
  */
 
-import { apiBaseUrl } from "@/lib/api";
-import { API_V1_PREFIX, sendRequest } from "@/lib/api/http";
+import { apiV1BaseUrl, sendRequest } from "@/lib/api/http";
 import { type SessionTokens, parseSessionTokens } from "@/lib/api/types";
 import { logEvent } from "@/lib/log";
 
@@ -77,6 +76,11 @@ export type RefreshOutcome =
 export type RefreshDeps = {
   fetchImpl?: typeof fetch;
   baseUrl?: string;
+  /**
+   * Read whenever a time is needed. Injectable so a test can make a refresh take
+   * eight seconds without taking eight seconds.
+   */
+  clock?: () => number;
 };
 
 /**
@@ -104,7 +108,7 @@ const inFlight = new Map<string, Promise<RefreshOutcome>>();
 export const GRACE_MS = 10_000;
 
 /** Upper bound on remembered outcomes, so a busy process cannot grow unboundedly. */
-const GRACE_MAX_ENTRIES = 1000;
+export const GRACE_MAX_ENTRIES = 1000;
 
 type GraceEntry = { outcome: RefreshOutcome; expiresAt: number };
 
@@ -135,8 +139,9 @@ export function graceCount(): number {
 export function refreshSession(
   refreshToken: string,
   deps: RefreshDeps = {},
-  now: number = Date.now(),
+  now: number = (deps.clock ?? Date.now)(),
 ): Promise<RefreshOutcome> {
+  const clock = deps.clock ?? Date.now;
   const existing = inFlight.get(refreshToken);
 
   if (existing !== undefined) {
@@ -160,7 +165,14 @@ export function refreshSession(
     (outcome) => {
       // Recorded before the in-flight entry is dropped, so there is no instant
       // in which a latecomer finds neither and starts a replay.
-      remember(refreshToken, outcome, now);
+      //
+      // The clock is read *here*, not at entry. Measuring the window from when
+      // the refresh started would subtract its own round trip from it — and a
+      // slow refresh is precisely when stragglers pile up, so the window would
+      // be smallest exactly when it is needed most. With REQUEST_TIMEOUT_MS
+      // equal to GRACE_MS, a slow-but-successful refresh left no grace at all.
+      // Found in review.
+      remember(refreshToken, outcome, clock());
       inFlight.delete(refreshToken);
 
       return outcome;
@@ -219,7 +231,7 @@ async function performRefresh(
   let baseUrl: string;
 
   try {
-    baseUrl = deps.baseUrl ?? `${apiBaseUrl()}${API_V1_PREFIX}`;
+    baseUrl = deps.baseUrl ?? apiV1BaseUrl();
   } catch (error) {
     // A malformed API_URL. `instrumentation.ts` normally kills the process at
     // boot for this, so reaching it means the boot check was bypassed. It is

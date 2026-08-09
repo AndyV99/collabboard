@@ -12,6 +12,16 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 
 const jar = new Map<string, { value: string; options: Record<string, unknown> }>();
 
+/**
+ * The request headers a handler sees.
+ *
+ * Controllable on purpose. The original version of this mock always returned an
+ * empty `Headers`, which is structurally why nothing noticed that a client could
+ * forge `x-collabboard-session` and be believed — see the forged-header tests
+ * below.
+ */
+let requestHeaders = new Headers();
+
 vi.mock("next/headers", () => ({
   cookies: async () => ({
     get: (name: string) => {
@@ -23,7 +33,7 @@ vi.mock("next/headers", () => ({
       jar.set(name, { value, options });
     },
   }),
-  headers: async () => new Headers(),
+  headers: async () => requestHeaders,
 }));
 
 const {
@@ -33,14 +43,20 @@ const {
   encodeMetadata,
   metadataFromTokens,
 } = await import("@/lib/session/cookies");
+const { FORWARDED_SESSION_HEADER, encodeForwardedSession } = await import(
+  "@/lib/session/forward"
+);
 const { __resetInFlightForTests } = await import("@/lib/session/refresh");
 const { POST: login } = await import("@/app/api/auth/login/route");
+const { POST: register } = await import("@/app/api/auth/register/route");
 const { POST: refresh } = await import("@/app/api/auth/refresh/route");
 const { POST: logout } = await import("@/app/api/auth/logout/route");
 const { GET: sessionRoute } = await import("@/app/api/auth/session/route");
+const { POST: switchOrg } = await import("@/app/api/auth/organization/route");
 const { GET: proxyGet, POST: proxyPost } = await import(
   "@/app/api/proxy/[...path]/route"
 );
+const proxyModule = await import("@/proxy");
 
 const REFRESH_TOKEN = "opaque-refresh-token-nobody-should-see";
 const ACCESS_TOKEN = "header.payload.signature";
@@ -97,6 +113,7 @@ function seedSession() {
 
 beforeEach(() => {
   jar.clear();
+  requestHeaders = new Headers();
   __resetInFlightForTests();
   vi.unstubAllGlobals();
 });
@@ -467,5 +484,222 @@ describe("/api/proxy", () => {
     const response = await proxyGet(get("/api/proxy/projects"), context(["projects"]));
 
     expect(response.headers.get("cache-control")).toBe("no-store");
+  });
+
+  it("cannot be walked out of an allowed root with a dot segment", async () => {
+    // The end-to-end form of the traversal: an allowlisted first segment, then
+    // "..", resolving to POST /auth/organization — which answers with a refresh
+    // token in its body. Asserted on the URL that would actually leave, not on
+    // the reason code.
+    seedSession();
+
+    const urls: string[] = [];
+
+    vi.stubGlobal("fetch", (async (url: string) => {
+      urls.push(new URL(url).pathname);
+
+      return json({ ok: true });
+    }) as unknown as typeof fetch);
+
+    const attempts = [
+      ["projects", "..", "auth", "organization"],
+      ["cards", "..", "auth", "login"],
+      ["boards", "..", "auth", "refresh"],
+    ];
+
+    for (const path of attempts) {
+      const response = await proxyPost(
+        post(`/api/proxy/${path.join("/")}`, { organization_id: "o1" }),
+        context(path),
+      );
+
+      expect(response.status).toBe(404);
+    }
+
+    expect(urls).toEqual([]);
+  });
+
+  it("relays an unusable 200 as a 502 rather than a 200 with an error body", async () => {
+    // `malformed` keeps the upstream status, and the upstream status here is a
+    // success — a gateway's HTML page, or API_URL pointing at another service.
+    // Relaying it verbatim would produce `200 {"error": ...}`, which every
+    // client in this repo reads as a success.
+    seedSession();
+
+    vi.stubGlobal("fetch", (async () =>
+      new Response("<html>hello</html>", {
+        status: 200,
+        headers: { "content-type": "text/html" },
+      })) as typeof fetch);
+
+    const response = await proxyGet(get("/api/proxy/projects"), context(["projects"]));
+
+    expect(response.status).toBe(502);
+  });
+});
+
+describe("the forwarded session header is not a credential", () => {
+  const context = (path: string[]) => ({ params: Promise.resolve({ path }) });
+
+  function forged(): string {
+    return encodeForwardedSession({
+      accessToken: "a-leaked-15-minute-access-token",
+      metadata: {
+        userId: "attacker",
+        organization: { id: "o1", name: "n", slug: "s", role: "owner" },
+        accessExpiresAt: Date.now() + 600_000,
+      },
+    });
+  }
+
+  it("does not let a forged header mint a session at /api/auth/organization", async () => {
+    // The escalation this closes: POST /auth/organization answers with a *new*
+    // 14-day refresh token, and the handler writes it into a cookie. Trusting an
+    // unsigned request header here turned any leaked access token into a
+    // long-lived cookie session.
+    const fetchImpl = vi.fn();
+
+    vi.stubGlobal("fetch", fetchImpl);
+    requestHeaders = new Headers({ [FORWARDED_SESSION_HEADER]: forged() });
+
+    const response = await switchOrg(
+      post("/api/auth/organization", { organization_id: "o1" }),
+    );
+
+    expect(response.status).toBe(401);
+    expect(fetchImpl).not.toHaveBeenCalled();
+    expect(jar.size).toBe(0);
+  });
+
+  it("does not let a forged header authenticate a proxied request", async () => {
+    const fetchImpl = vi.fn();
+
+    vi.stubGlobal("fetch", fetchImpl);
+    requestHeaders = new Headers({ [FORWARDED_SESSION_HEADER]: forged() });
+
+    const response = await proxyGet(get("/api/proxy/me"), context(["me"]));
+
+    expect(response.status).toBe(401);
+    expect(fetchImpl).not.toHaveBeenCalled();
+  });
+
+  it("is stripped before it reaches any handler, because proxy.ts runs on /api/*", () => {
+    // The second, independent control. A path proxy.ts does not run on is a path
+    // where a client can supply its own header, so the matcher itself is part of
+    // the security property and is asserted as one.
+    const pattern = new RegExp(`^${proxyModule.config.matcher[0]}$`);
+
+    expect(pattern.test("/api/auth/organization")).toBe(true);
+    expect(pattern.test("/api/proxy/me")).toBe(true);
+    expect(pattern.test("/boards/b1")).toBe(true);
+    expect(pattern.test("/_next/static/chunk.js")).toBe(false);
+  });
+});
+
+describe("POST /api/auth/register", () => {
+  it("relays the created account and starts no session", async () => {
+    vi.stubGlobal("fetch", (async () =>
+      json(
+        {
+          user_id: "u1",
+          email: "a@b.c",
+          display_name: "A",
+          organization: SESSION_BODY.organization,
+        },
+        201,
+      )) as typeof fetch);
+
+    const response = await register(
+      post("/api/auth/register", {
+        email: "a@b.c",
+        password: "x",
+        display_name: "A",
+      }),
+    );
+
+    expect(response.status).toBe(201);
+    // Registration does not log anyone in — the API returns no tokens, and this
+    // handler does not invent a session from the response.
+    expect(jar.size).toBe(0);
+  });
+
+  it("relays a duplicate address as a 409", async () => {
+    vi.stubGlobal("fetch", (async () =>
+      json({ error: "email is already registered" }, 409)) as typeof fetch);
+
+    const response = await register(
+      post("/api/auth/register", { email: "a@b.c", password: "x", display_name: "A" }),
+    );
+
+    expect(response.status).toBe(409);
+  });
+
+  it("rejects an incomplete body without a round trip", async () => {
+    const fetchImpl = vi.fn();
+
+    vi.stubGlobal("fetch", fetchImpl);
+
+    expect(
+      (await register(post("/api/auth/register", { email: "a@b.c", password: "x" })))
+        .status,
+    ).toBe(400);
+    expect(fetchImpl).not.toHaveBeenCalled();
+  });
+});
+
+describe("POST /api/auth/organization", () => {
+  it("writes all three cookies, because the API issues a whole new session", async () => {
+    seedSession();
+
+    vi.stubGlobal("fetch", (async () =>
+      json({
+        ...SESSION_BODY,
+        access_token: "new-access",
+        refresh_token: "new-refresh",
+      })) as typeof fetch);
+
+    const response = await switchOrg(
+      post("/api/auth/organization", { organization_id: "o2" }),
+    );
+    const body = await response.text();
+
+    expect(response.status).toBe(200);
+    expect(body).not.toContain("new-refresh");
+    expect(jar.get(REFRESH_COOKIE)?.value).toBe("new-refresh");
+    expect(jar.get(ACCESS_COOKIE)?.value).toBe("new-access");
+    expect(jar.get(SESSION_COOKIE)?.options.httpOnly).toBe(true);
+  });
+
+  it("relays a non-member as a 403 and changes nothing", async () => {
+    seedSession();
+
+    vi.stubGlobal("fetch", (async () =>
+      json({ error: "not a member of that organization" }, 403)) as typeof fetch);
+
+    const response = await switchOrg(
+      post("/api/auth/organization", { organization_id: "someone-elses" }),
+    );
+
+    expect(response.status).toBe(403);
+    expect(jar.get(REFRESH_COOKIE)?.value).toBe(REFRESH_TOKEN);
+  });
+
+  it("refuses a cross-site request", async () => {
+    seedSession();
+
+    const fetchImpl = vi.fn();
+
+    vi.stubGlobal("fetch", fetchImpl);
+
+    const response = await switchOrg(
+      new NextRequest("http://localhost:3000/api/auth/organization", {
+        method: "POST",
+        headers: { "sec-fetch-site": "cross-site" },
+        body: JSON.stringify({ organization_id: "o2" }),
+      }),
+    );
+
+    expect(response.status).toBe(403);
+    expect(fetchImpl).not.toHaveBeenCalled();
   });
 });

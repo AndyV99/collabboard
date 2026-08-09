@@ -93,6 +93,62 @@ describe("proxyTarget", () => {
     });
   });
 
+  it("refuses a dot segment, which encoding does NOT neutralise", () => {
+    // The hole this closes: encodeURIComponent("..") is "..", and the URL parser
+    // inside fetch removes dot segments when it resolves the string. So an
+    // allowlisted root followed by ".." walked straight back out of it and
+    // reached POST /auth/organization — which answers with a refresh token.
+    for (const segments of [
+      ["projects", "..", "auth", "organization"],
+      ["cards", "..", "..", "auth", "login"],
+      ["boards", ".", "..", "auth", "refresh"],
+      ["projects", "..", ""],
+    ]) {
+      expect(proxyTarget(segments)).toEqual({
+        allowed: false,
+        reason: "dot_segment",
+      });
+    }
+  });
+
+  it("still allows a segment that merely contains dots", () => {
+    // "..foo" and "a.b" are ordinary ids, not traversal.
+    expect(proxyTarget(["cards", "a.b"]).allowed).toBe(true);
+    expect(proxyTarget(["cards", "..foo"]).allowed).toBe(true);
+    expect(proxyTarget(["cards", "...."]).allowed).toBe(true);
+  });
+
+  it("guarantees the resolved URL stays on the allowed root", () => {
+    // The property, asserted through the same URL parser fetch uses — so this
+    // fails if any future encoding change reopens the traversal, whatever the
+    // reason code says.
+    const attempts = [
+      ["projects", "..", "auth", "organization"],
+      ["cards", "%2E%2E", "auth", "login"],
+      ["cards", "../../auth/login"],
+      ["boards", "b1", "cards"],
+    ];
+
+    for (const segments of attempts) {
+      const target = proxyTarget(segments);
+
+      if (!target.allowed) {
+        continue;
+      }
+
+      const resolved = new URL(`http://api.test/api/v1${target.path}`);
+
+      // The invariant: after the URL parser has had its way with dot segments,
+      // the request still addresses the surface that was allowed. That is what
+      // makes "/api/v1/auth/organization" unreachable — it does not start with
+      // "/api/v1/projects". A segment that merely looks like traversal once
+      // encoded ("%252E%252E") is fine: it addresses a literal child of the
+      // root, which the API answers 404 for.
+      expect(resolved.pathname.startsWith(`/api/v1/${segments[0]}`)).toBe(true);
+      expect(resolved.pathname.startsWith("/api/v1/auth")).toBe(false);
+    }
+  });
+
   it("keeps a query string for future list filters", () => {
     expect(proxyTarget(["projects"], "?archived=true")).toEqual({
       allowed: true,

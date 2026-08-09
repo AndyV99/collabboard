@@ -98,6 +98,26 @@ attaches the bearer token server-side. It carries an allowlist of resource roots
 `POST /auth/login` or `/auth/refresh` and therefore no way for a browser to be
 handed a refresh token by asking.
 
+The allowlist alone was not sufficient, and review caught why. `encodeURIComponent("..")`
+is `".."` — percent-encoding does not neutralise a dot segment — and the URL
+parser inside `fetch` removes dot segments when it resolves the string. So an
+allowed first segment followed by `..` walked back out of it:
+`/api/proxy/projects/../auth/organization` reached `POST /auth/organization`,
+which answers with a refresh token in its body. Dot segments are now refused
+outright, and the assembled path is independently re-checked against the root
+that was allowed.
+
+**Nothing a client can send participates in deciding who it is.** The
+`x-collabboard-session` header that `proxy.ts` uses to hand a just-refreshed
+token to a render is unsigned — it proves shape, not provenance — so it is
+guarded twice. `proxy.ts` strips any inbound copy on *every* path, `/api/*`
+included; and the two readers are separate functions, so a Route Handler reads
+cookies only and never the header. Review found this too: with `/api/*` outside
+the matcher, a client could send its own header to `POST /api/auth/organization`
+and be handed a 14-day refresh cookie in exchange for a leaked 15-minute access
+token. Either control alone closes it; both are present because the first one
+was silently wrong once already.
+
 **One refresh at a time, and a grace window on the token that was spent.**
 Concurrent callers holding the same refresh token share one request. That alone
 turned out not to be enough: the end-to-end run for #59 produced one refresh
@@ -107,6 +127,15 @@ replayed it. A settled outcome is therefore remembered against the spent token
 for ten seconds. This is the grace window a rotating-token implementation
 conventionally puts on the server, implemented on the client side so that no API
 change is needed.
+
+Two corrections from review, both of which made the window smaller than it
+looked. It is measured from when the refresh *settled*, not from when it was
+requested — measuring from the start subtracts the refresh's own round trip, and
+with the request timeout equal to the window a slow refresh left no grace at all,
+precisely when the most stragglers are queued behind it. And a single call now
+spends the refresh token at most once: the "no access token, refresh first" path
+and the "401, refresh and retry" path were independent, so a request that 401'd
+after an up-front refresh presented the pre-rotation token a second time.
 
 **CSRF is defended twice.** `SameSite=Lax` stops the browser attaching session
 cookies to a cross-site POST; `lib/session/origin.ts` additionally requires

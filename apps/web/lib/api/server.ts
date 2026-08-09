@@ -22,17 +22,15 @@
 
 import { cookies } from "next/headers";
 
-import { apiBaseUrl } from "@/lib/api";
 import { clearSessionCookies, writeSessionCookies } from "@/lib/session/cookies";
-import { getRefreshToken, getServerSession } from "@/lib/session/server";
+import {
+  getRefreshToken,
+  getRenderSession,
+  getServerSession,
+} from "@/lib/session/server";
 import { authenticatedCall } from "./authenticated";
 import type { ApiResult } from "./errors";
-import { API_V1_PREFIX, type ApiCall, type Endpoint } from "./http";
-
-/** Base URL of the API's v1 surface, resolved from `API_URL` at call time. */
-export function apiV1BaseUrl(): string {
-  return `${apiBaseUrl()}${API_V1_PREFIX}`;
-}
+import { type ApiCall, type Endpoint, apiV1BaseUrl } from "./http";
 
 /**
  * Calls the API as the current user, without refreshing.
@@ -42,7 +40,9 @@ export function apiV1BaseUrl(): string {
 export const serverApi: ApiCall = async <T,>(
   endpoint: Endpoint<T>,
 ): Promise<ApiResult<T>> => {
-  const session = await getServerSession();
+  // The render reader: it prefers the token `proxy.ts` just minted over the
+  // request's cookies, which on a just-refreshed request are the old ones.
+  const session = await getRenderSession();
 
   return authenticatedCall(endpoint, {
     baseUrl: apiV1BaseUrl(),
@@ -65,6 +65,9 @@ export const serverApi: ApiCall = async <T,>(
 export const mutableServerApi: ApiCall = async <T,>(
   endpoint: Endpoint<T>,
 ): Promise<ApiResult<T>> => {
+  // Cookies only. A Route Handler is reached directly by a client, so nothing a
+  // client can set may participate in deciding who it is — see the comment on
+  // `getRenderSession`.
   const session = await getServerSession();
   const refreshToken = await getRefreshToken();
   const jar = await cookies();

@@ -204,6 +204,12 @@ every screen follows.
 | A Server Action or Route Handler | `mutableServerApi` from `lib/api/server.ts` | Yes |
 | A Client Component | `browserApi()` from `lib/api/browser.ts` | Yes, via `/api/auth/refresh` |
 
+Reading the session directly follows the same split: `getRenderSession()` in a
+Server Component, `getServerSession()` anywhere a client reaches you directly.
+The difference is that the render one trusts the header `proxy.ts` uses to pass a
+just-refreshed token forward, and that header is unsigned — so a Route Handler,
+which a client can call, must not consult it.
+
 All three take the same values from `lib/api/endpoints.ts` and return the same
 `ApiResult<T>`, so a call reads identically either side of the line.
 
@@ -270,7 +276,9 @@ runs on every path including the sign-in page, which is how that becomes a loop.
 3. If a Client Component needs it, check its first path segment is in
    `PROXIED_ROOTS` (`lib/api/proxy-route.ts`). That list is an allowlist, and
    `auth` is deliberately absent — `/api/proxy/auth/login` would hand a browser a
-   refresh token.
+   refresh token. Do not relax the dot-segment refusal in `proxyTarget` to make a
+   path work: `..` survives `encodeURIComponent` and is normalised away by
+   `fetch`, which is how an allowed root reaches `/auth/*` anyway.
 
 ### Files
 

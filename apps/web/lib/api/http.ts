@@ -8,6 +8,7 @@
  * function stays testable without any of it.
  */
 
+import { apiBaseUrl } from "@/lib/api";
 import {
   type ApiResult,
   err,
@@ -27,6 +28,18 @@ import {
  * definition of the route, two bases.
  */
 export const API_V1_PREFIX = "/api/v1";
+
+/**
+ * Base URL of the API's v1 surface, resolved from `API_URL` at call time.
+ *
+ * It lives here rather than next to the server transport because
+ * `lib/api/server.ts` imports `next/headers`, which makes it unusable from
+ * `lib/session/refresh.ts` and from `proxy.ts`. Three private copies of this
+ * one-line expression is how they drift apart.
+ */
+export function apiV1BaseUrl(): string {
+  return `${apiBaseUrl()}${API_V1_PREFIX}`;
+}
 
 /**
  * Upper bound on a single API request.
@@ -49,7 +62,9 @@ export type HttpMethod = "GET" | "POST" | "PATCH" | "DELETE";
  * error rather than a value the UI would go on to render as `undefined`.
  *
  * `expectNoContent` marks the endpoints that answer 204 (`DELETE /cards/:id`,
- * `POST /auth/logout`). Their `parse` is never called.
+ * `POST /auth/logout`). Their `parse` is called with `undefined` rather than
+ * skipped, which is what lets the proxy's pass-through parser tell an empty
+ * response from a JSON `null` one.
  */
 export type Endpoint<T> = {
   method: HttpMethod;
@@ -68,8 +83,6 @@ export type SendOptions = {
   baseUrl: string;
   /** Bearer token, when the endpoint is authenticated. */
   accessToken?: string;
-  /** Extra headers. Used by the browser transport for CSRF-adjacent hints. */
-  headers?: Record<string, string>;
   /** Injectable for tests; defaults to the global `fetch`. */
   fetchImpl?: typeof fetch;
   /** Overrides {@link REQUEST_TIMEOUT_MS}. */
@@ -97,10 +110,7 @@ export async function sendRequest<T>(
   const fetchImpl = options.fetchImpl ?? fetch;
   const url = `${options.baseUrl}${endpoint.path}`;
 
-  const headers: Record<string, string> = {
-    accept: "application/json",
-    ...options.headers,
-  };
+  const headers: Record<string, string> = { accept: "application/json" };
 
   if (options.accessToken !== undefined && options.accessToken !== "") {
     headers.authorization = `Bearer ${options.accessToken}`;

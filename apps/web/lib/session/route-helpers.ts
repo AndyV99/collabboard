@@ -8,7 +8,7 @@
 
 import type { NextRequest } from "next/server";
 
-import type { ApiError } from "@/lib/api/errors";
+import { type ApiError, relayStatus } from "@/lib/api/errors";
 import { logEvent } from "@/lib/log";
 import { checkSameOrigin } from "./origin";
 
@@ -90,12 +90,11 @@ export async function readJsonBody(request: Request): Promise<unknown | undefine
  * Turns an {@link ApiError} from the Go API into a response for our own client.
  *
  * The status is preserved so the browser client's error mapping is identical
- * whether the call went through here or through `/api/proxy`. A transport
- * failure has no status of its own and becomes 502 — "we could not reach the
- * thing behind us" — rather than 500, which would claim the fault is ours.
+ * whether the call went through here or through `/api/proxy` — except where
+ * preserving it would be a lie, which {@link relayStatus} handles.
  */
 export function relayApiError(error: ApiError): Response {
-  const status = error.status ?? 502;
+  const status = relayStatus(error);
   const headers =
     error.retryAfterSeconds === undefined
       ? undefined

@@ -22,10 +22,26 @@
  * serve its own browser. Anything else should talk to the Go API directly with
  * a bearer token, where CSRF is not a concept because there are no cookies.
  *
- * `Host`/`X-Forwarded-Host` are not consulted: both are attacker-controllable
- * in the general case. `request.nextUrl.origin` is what Next resolved the
- * request to, which is the same value the browser used to decide whether to
- * send the cookies.
+ * # What `requestOrigin` is, and is not
+ *
+ * Callers pass `request.nextUrl.origin`, and it is worth being exact about what
+ * that is: Next derives it from the request line plus `Host`/`X-Forwarded-Host`.
+ * It is **not** an independently trusted value. So the `Origin` branch compares
+ * a client-supplied header against a client-supplied host, and on its own it
+ * would stop nobody who could set both.
+ *
+ * That branch is a compatibility fallback, not the control. The control is
+ * `Sec-Fetch-Site`, which every current browser sends and no page script can
+ * forge, plus `SameSite=Lax` on the cookies themselves — and an attacker who can
+ * set arbitrary request headers is not running in a browser and has no cookies
+ * to ride on in the first place.
+ *
+ * Two consequences worth knowing before changing this. Behind a TLS-terminating
+ * proxy that does not set `X-Forwarded-Proto`, `nextUrl.origin` is `http://…`
+ * while the browser sends `Origin: https://…`, and the fallback would refuse a
+ * legitimate request; today `Sec-Fetch-Site` answers first, so it never runs.
+ * And if a stronger guarantee is ever wanted, the fix is a configured canonical
+ * origin, not a different header.
  */
 
 /** Why a request was refused. Ends up in a log line, so it is a closed set. */

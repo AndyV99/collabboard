@@ -177,6 +177,11 @@ export function browserApi(options: BrowserApiOptions = {}): ApiCall {
 export async function signOut(options: BrowserApiOptions = {}): Promise<void> {
   const fetchImpl = options.fetchImpl ?? fetch;
 
+  // Detach any refresh already in flight. Its cookies are about to be cleared,
+  // so whatever it resolves to is about a session that no longer exists — and a
+  // caller joining it afterwards would be told the session is live.
+  pendingRefresh = null;
+
   try {
     await fetchImpl(LOGOUT_ENDPOINT, {
       method: "POST",

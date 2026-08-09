@@ -56,7 +56,10 @@ export async function resolveProxySession(
     return { kind: "unchanged" };
   }
 
-  const outcome = await refreshSession(stored.refreshToken, deps);
+  // `now` is forwarded rather than left to default, so a test that injects an
+  // artificial clock for the staleness check above does not silently fall back
+  // to wall-clock time for the grace window below.
+  const outcome = await refreshSession(stored.refreshToken, deps, now);
 
   switch (outcome.status) {
     case "refreshed":

@@ -12,9 +12,8 @@
  * refresh token is itself the credential.
  */
 
-import { apiBaseUrl } from "@/lib/api";
 import type { ApiResult } from "@/lib/api/errors";
-import { API_V1_PREFIX, sendRequest } from "@/lib/api/http";
+import { apiV1BaseUrl, sendRequest } from "@/lib/api/http";
 import {
   type RegisteredUser,
   type SessionTokens,
@@ -22,10 +21,6 @@ import {
   parseRegisteredUser,
   parseSessionTokens,
 } from "@/lib/api/types";
-
-function baseUrl(): string {
-  return `${apiBaseUrl()}${API_V1_PREFIX}`;
-}
 
 /** `POST /auth/register`. Creates the account and its first organization. */
 export function register(input: {
@@ -51,7 +46,7 @@ export function register(input: {
       },
       parse: parseRegisteredUser,
     },
-    { baseUrl: baseUrl() },
+    { baseUrl: apiV1BaseUrl() },
   );
 }
 
@@ -67,7 +62,7 @@ export function login(input: {
       body: { email: input.email, password: input.password },
       parse: parseSessionTokens,
     },
-    { baseUrl: baseUrl() },
+    { baseUrl: apiV1BaseUrl() },
   );
 }
 
@@ -81,7 +76,7 @@ export function logout(refreshToken: string): Promise<ApiResult<null>> {
       parse: parseEmpty,
       expectNoContent: true,
     },
-    { baseUrl: baseUrl() },
+    { baseUrl: apiV1BaseUrl() },
   );
 }
 
@@ -104,6 +99,6 @@ export function switchOrganization(
       body: { organization_id: organizationId },
       parse: parseSessionTokens,
     },
-    { baseUrl: baseUrl(), accessToken },
+    { baseUrl: apiV1BaseUrl(), accessToken },
   );
 }

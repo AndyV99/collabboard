@@ -206,3 +206,19 @@ export function networkError(): ApiError {
 export function malformedError(status: number): ApiError {
   return { kind: "malformed", message: DEFAULT_MESSAGES.malformed, status };
 }
+
+/**
+ * The status to answer our own callers with when relaying an {@link ApiError}.
+ *
+ * `error.status` is the *upstream* status, and it is not always a failure one:
+ * a `malformed` error keeps the 200 that carried the unparseable body. Relaying
+ * that verbatim would produce `200 {"error": "..."}`, which every client in this
+ * repo would read as a success. Anything below 400 becomes 502 — "the thing
+ * behind us answered, and we could not use it" — and a transport failure, which
+ * has no status at all, becomes the same.
+ */
+export function relayStatus(error: ApiError): number {
+  const status = error.status;
+
+  return status === null || status < 400 ? 502 : status;
+}

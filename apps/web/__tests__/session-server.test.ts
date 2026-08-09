@@ -39,7 +39,9 @@ const {
 const { FORWARDED_SESSION_HEADER, encodeForwardedSession } = await import(
   "@/lib/session/forward"
 );
-const { getRefreshToken, getServerSession } = await import("@/lib/session/server");
+const { getRefreshToken, getRenderSession, getServerSession } = await import(
+  "@/lib/session/server"
+);
 const { mutableServerApi, serverApi } = await import("@/lib/api/server");
 const { __resetInFlightForTests } = await import("@/lib/session/refresh");
 const endpoints = await import("@/lib/api/endpoints");
@@ -80,7 +82,40 @@ describe("getServerSession", () => {
     expect(session?.organization).toEqual(ORG);
   });
 
+  it("ignores the forwarded header, because a Route Handler can be sent one", async () => {
+    // The header is unsigned — it proves shape, not provenance. Only the render
+    // reader consults it, so a handler that reaches for the wrong function does
+    // not silently accept a client's word for who it is.
+    state.cookies.set(ACCESS_COOKIE, "cookie-access");
+    state.cookies.set(SESSION_COOKIE, encodeMetadata(metadataFromTokens(tokens("x"))));
+    state.headers.set(
+      FORWARDED_SESSION_HEADER,
+      encodeForwardedSession({
+        accessToken: "forged",
+        metadata: metadataFromTokens(tokens("forged")),
+      }),
+    );
+
+    expect((await getServerSession())?.accessToken).toBe("cookie-access");
+  });
+
+  it("answers nothing at all when only a forged header is present", async () => {
+    state.headers.set(
+      FORWARDED_SESSION_HEADER,
+      encodeForwardedSession({
+        accessToken: "forged",
+        metadata: metadataFromTokens(tokens("forged")),
+      }),
+    );
+
+    expect(await getServerSession()).toBeNull();
+  });
+});
+
+describe("getRenderSession", () => {
   it("prefers the token the proxy just minted over the stale cookie", async () => {
+    // On a request where proxy.ts refreshed, the request's cookies are the old
+    // ones — the new ones are on a response the browser has not seen yet.
     state.cookies.set(ACCESS_COOKIE, "stale-cookie-access");
     state.cookies.set(SESSION_COOKIE, encodeMetadata(metadataFromTokens(tokens("x"))));
     state.headers.set(
@@ -91,7 +126,14 @@ describe("getServerSession", () => {
       }),
     );
 
-    expect((await getServerSession())?.accessToken).toBe("just-refreshed");
+    expect((await getRenderSession())?.accessToken).toBe("just-refreshed");
+  });
+
+  it("falls back to the cookies when the proxy did not refresh", async () => {
+    state.cookies.set(ACCESS_COOKIE, "cookie-access");
+    state.cookies.set(SESSION_COOKIE, encodeMetadata(metadataFromTokens(tokens("x"))));
+
+    expect((await getRenderSession())?.accessToken).toBe("cookie-access");
   });
 
   it("exposes no refresh token on the session type", async () => {

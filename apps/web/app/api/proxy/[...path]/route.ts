@@ -20,8 +20,8 @@ import type { NextRequest } from "next/server";
 import { cookies } from "next/headers";
 
 import { authenticatedCall } from "@/lib/api/authenticated";
-import type { Endpoint, HttpMethod } from "@/lib/api/http";
-import { apiV1BaseUrl } from "@/lib/api/server";
+import { relayStatus } from "@/lib/api/errors";
+import { type Endpoint, type HttpMethod, apiV1BaseUrl } from "@/lib/api/http";
 import {
   PROXIED_METHODS,
   methodHasBody,
@@ -62,8 +62,13 @@ async function handle(request: NextRequest, context: Context): Promise<Response>
     return jsonError(405, "Method not allowed.");
   }
 
-  // GET is exempt: it changes nothing, and a JSON response cannot be read
-  // cross-origin without CORS headers this app never sends.
+  // GET is exempt. Not because it "changes nothing" — a GET that 401s does
+  // rotate the refresh token on its way to answering — but because there is
+  // nothing to gain by forging one: a cross-site subresource GET does not carry
+  // the cookies (SameSite=Lax), so it arrives unauthenticated, and the one shape
+  // that does carry them, a top-level navigation, cannot read the JSON back.
+  // The rotation is idempotent from the user's point of view and leaves them
+  // signed in.
   if (method !== "GET") {
     const refused = guardOrigin(request);
 
@@ -79,9 +84,10 @@ async function handle(request: NextRequest, context: Context): Promise<Response>
     logEvent("warn", "proxy refused a path", {
       event: "web.proxy.refused",
       reason: target.reason,
-      // The first segment only. The full path can carry ids, and this line is
-      // about which surface was attempted, not which object.
-      root: segments[0] ?? "",
+      // The first segment only, truncated. The full path can carry ids, this
+      // line is about which surface was attempted rather than which object, and
+      // the value is client-controlled and unbounded.
+      root: (segments[0] ?? "").slice(0, 64),
     });
 
     return jsonError(404, "Not found.");
@@ -114,7 +120,7 @@ async function handle(request: NextRequest, context: Context): Promise<Response>
   });
 
   if (!result.ok) {
-    const status = result.error.status ?? 502;
+    const status = relayStatus(result.error);
     const headers: Record<string, string> = { "cache-control": "no-store" };
 
     if (result.error.retryAfterSeconds !== undefined) {

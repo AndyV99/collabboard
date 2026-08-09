@@ -263,6 +263,31 @@ describe("authenticatedCall", () => {
     expect(api.resourceCalls()).toBe(1);
   });
 
+  it("spends the refresh token ONCE even when the post-refresh request 401s", async () => {
+    // The up-front refresh and the 401-recovery used to be independent, so this
+    // path refreshed twice — and the second attempt presented the pre-rotation
+    // token, which the API treats as a replay and revokes the session for. The
+    // grace window masks it most of the time, which is what made it worth a flag
+    // rather than a comment.
+    const api = fakeApi();
+
+    // The session is revoked between the refresh and the retry, so the freshly
+    // issued access token does not work either.
+    api.setLiveToken("a-token-nobody-will-ever-hold");
+
+    const result = await authenticatedCall(endpoints.listProjects(), {
+      baseUrl: BASE,
+      accessToken: null,
+      refreshToken: "r",
+      onRefreshed: vi.fn(),
+      fetchImpl: api.fetchImpl,
+    });
+
+    expect(result.ok === false && result.error.kind).toBe("unauthorized");
+    expect(api.refreshCalls()).toBe(1);
+    expect(api.resourceCalls()).toBe(1);
+  });
+
   it("answers 401 without a round trip when there is no session", async () => {
     const fetchImpl = vi.fn();
 

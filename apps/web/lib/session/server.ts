@@ -32,16 +32,45 @@ export type ServerSession = {
 };
 
 /**
- * The current session, or null when there is none.
+ * The current session as recorded in the cookies, or null when there is none.
  *
- * Prefers the header `proxy.ts` forwards over the cookies, because on a request
- * where the proxy just refreshed, the request's cookies are the *old* ones —
- * the new ones are on the response the browser has not received yet.
+ * **This is the one to use in a Route Handler.** It reads cookies and nothing
+ * else, so no request header a client can set participates in the answer.
  *
  * Returns null rather than throwing when there is no session: "signed out" is a
  * state a page renders, not an exception.
  */
 export async function getServerSession(): Promise<ServerSession | null> {
+  const stored = readSessionCookies(await cookies());
+
+  if (stored.accessToken === null || stored.metadata === null) {
+    return null;
+  }
+
+  return sessionFrom(stored.accessToken, stored.metadata);
+}
+
+/**
+ * The current session for a *render*, preferring what `proxy.ts` just minted.
+ *
+ * On a request where the proxy refreshed, the request's cookies are the old
+ * ones — the new ones are on a response the browser has not received yet — so a
+ * render has to be told out of band. That is the only reason
+ * {@link FORWARDED_SESSION_HEADER} exists.
+ *
+ * # Why this is a second function rather than a branch in the first
+ *
+ * The header is unsigned: `decodeForwardedSession` checks shape, not provenance.
+ * `proxy.ts` strips any inbound copy on every path, which is what makes trusting
+ * it sound — but that is one control, and it was briefly not true (the matcher
+ * excluded `/api/`, so a client could send its own header to a Route Handler and
+ * be believed; via `POST /api/auth/organization` that upgraded a 15-minute
+ * access token into a 14-day cookie session). Splitting the two readers means a
+ * Route Handler does not depend on the strip being right, and the strip does not
+ * depend on every handler remembering to. Found in review; both controls are now
+ * asserted by tests.
+ */
+export async function getRenderSession(): Promise<ServerSession | null> {
   const forwarded = decodeForwardedSession(
     (await headers()).get(FORWARDED_SESSION_HEADER),
   );
@@ -50,13 +79,7 @@ export async function getServerSession(): Promise<ServerSession | null> {
     return sessionFrom(forwarded.accessToken, forwarded.metadata);
   }
 
-  const stored = readSessionCookies(await cookies());
-
-  if (stored.accessToken === null || stored.metadata === null) {
-    return null;
-  }
-
-  return sessionFrom(stored.accessToken, stored.metadata);
+  return getServerSession();
 }
 
 function sessionFrom(accessToken: string, metadata: SessionMetadata): ServerSession {

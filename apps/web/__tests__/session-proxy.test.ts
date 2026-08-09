@@ -209,18 +209,60 @@ describe("proxy", () => {
     expect(code).toMatch(/NextResponse\.next/);
   });
 
-  it("does not run on this app's own API routes", () => {
-    // One refresher per request. The Route Handlers refresh for themselves; if
-    // this ran there too, both would spend the same refresh token and the second
-    // spend would be a replay the API revokes the session for.
+  it("runs on this app's own API routes, so it can strip the session header", () => {
+    // It must run there — a path this does not run on is a path where a client
+    // can supply its own x-collabboard-session and be believed. What it must not
+    // do there is refresh, which the next test covers.
     const matcher = proxyConfig.matcher[0];
     const pattern = new RegExp(`^${matcher}$`);
 
-    expect(pattern.test("/api/auth/refresh")).toBe(false);
-    expect(pattern.test("/api/proxy/projects")).toBe(false);
-    expect(pattern.test("/_next/static/chunk.js")).toBe(false);
+    expect(pattern.test("/api/auth/refresh")).toBe(true);
+    expect(pattern.test("/api/proxy/projects")).toBe(true);
     expect(pattern.test("/boards/b1")).toBe(true);
     expect(pattern.test("/")).toBe(true);
+    // Build output carries no session and must not wait on anything.
+    expect(pattern.test("/_next/static/chunk.js")).toBe(false);
+    expect(pattern.test("/_next/image")).toBe(false);
+  });
+
+  it("does not refresh on /api/* or /healthz, only strips", async () => {
+    // One refresher per request. The Route Handlers refresh for themselves; if
+    // this refreshed there too, both would spend the same refresh token and the
+    // second spend is a replay the API revokes the session for. /healthz is
+    // excluded so a readiness probe cannot put an API round trip in front of
+    // itself.
+    const fetchImpl = vi.fn();
+
+    vi.stubGlobal("fetch", fetchImpl);
+
+    for (const path of ["/api/auth/refresh", "/api/proxy/me", "/healthz"]) {
+      const request = new NextRequest(`http://localhost:3000${path}`);
+
+      request.cookies.set(REFRESH_COOKIE, "expired-but-valid");
+
+      const response = await proxy(request);
+
+      expect(response.headers.getSetCookie()).toHaveLength(0);
+    }
+
+    expect(fetchImpl).not.toHaveBeenCalled();
+
+    vi.unstubAllGlobals();
+  });
+
+  it("strips a forged session header on an API route", async () => {
+    const forgedHeader = encodeForwardedSession({
+      accessToken: "forged.token",
+      metadata: metadataFromTokens(TOKENS),
+    });
+
+    const request = new NextRequest("http://localhost:3000/api/proxy/me", {
+      headers: { [FORWARDED_SESSION_HEADER]: forgedHeader },
+    });
+
+    const response = await proxy(request);
+
+    expect(response.headers.get(FORWARDED_SESSION_HEADER)).toBeNull();
   });
 
   it("passes a fresh session through untouched", async () => {

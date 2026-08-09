@@ -18,13 +18,23 @@
  * happens. By the time a page renders, the access token is either fresh or
  * absent — never expired-but-renewable.
  *
- * # Two things it deliberately does not do
+ * # It runs everywhere, but only refreshes on page requests
  *
- * **It does not run on `/api/*`.** Those are this app's own Route Handlers, and
- * they refresh for themselves when they get a 401. If this ran there too, both
- * would spend the same refresh token — the handler reads the request's cookies,
- * which are the pre-refresh ones — and the second spend is a replay that revokes
- * the session. One refresher per request.
+ * **It does not refresh on `/api/*`.** Those are this app's own Route Handlers,
+ * and they refresh for themselves when they get a 401. If this refreshed there
+ * too, both would spend the same refresh token — the handler reads the request's
+ * cookies, which are the pre-refresh ones — and the second spend is a replay that
+ * revokes the session. One refresher per request.
+ *
+ * **It still runs on `/api/*`, to strip {@link FORWARDED_SESSION_HEADER}.** That
+ * header is unauthenticated by construction: it is base64 JSON with no signature,
+ * because the only thing that was ever supposed to write it is this file. Leaving
+ * `/api/*` out of the matcher meant a client could send its own, and
+ * `getServerSession()` would believe it — which turns any leaked 15-minute access
+ * token into a 14-day cookie session by way of `POST /api/auth/organization`.
+ * Stripping unconditionally, on every path, is what makes "only this file writes
+ * that header" true rather than merely intended. Found in review; the test is in
+ * `__tests__/auth-routes.test.ts`.
  *
  * **It never redirects.** Signing out is a state, not a navigation: the cookies
  * are cleared and the render sees no session. Where an unauthenticated visitor
@@ -51,11 +61,26 @@ import {
 } from "@/lib/session/forward";
 import { resolveProxySession } from "@/lib/session/proxy-session";
 
+/**
+ * Paths that get the header strip and nothing else.
+ *
+ * `/api/` because those handlers refresh for themselves. `/healthz` because a
+ * readiness probe must not be able to put an API round trip in front of itself —
+ * see the reasoning in `lib/readiness.ts` about what "ready" means here.
+ */
+function strippedOnly(pathname: string): boolean {
+  return pathname.startsWith("/api/") || pathname === "/healthz";
+}
+
 export default async function proxy(request: NextRequest): Promise<NextResponse> {
   // Always start from headers with any client-supplied session header removed,
-  // on every path and whatever the outcome. A render must only ever see one this
-  // file wrote.
+  // on every path and whatever the outcome. Server code must only ever see one
+  // this file wrote.
   const requestHeaders = stripForwardedSession(request.headers);
+
+  if (strippedOnly(request.nextUrl.pathname)) {
+    return NextResponse.next({ request: { headers: requestHeaders } });
+  }
 
   const stored = readSessionCookies(request.cookies);
   const now = Date.now();
@@ -93,12 +118,17 @@ export default async function proxy(request: NextRequest): Promise<NextResponse>
 
 export const config = {
   /**
-   * Everything except this app's own API routes and Next's static output.
+   * Everything except Next's static output.
    *
-   * `api` is excluded for the reason in the file comment — one refresher per
-   * request. `_next/static` and `_next/image` are build output and images;
-   * running a possible API round trip in front of a JS chunk would put the
-   * refresh on the critical path of every asset on the page.
+   * `/api/` is deliberately **in** — `strippedOnly` handles it — because a path
+   * this does not run on is a path where a client can supply its own
+   * {@link FORWARDED_SESSION_HEADER}. Narrowing this matcher again reopens that
+   * hole, which is why `__tests__/auth-routes.test.ts` asserts the pattern
+   * matches `/api/...` rather than only asserting the handler's behaviour.
+   *
+   * `_next/static` and `_next/image` stay out: they are build output, they can
+   * carry no session, and running anything in front of a JS chunk would put it
+   * on the critical path of every asset on the page.
    */
-  matcher: ["/((?!api/|_next/static|_next/image|favicon.ico).*)"],
+  matcher: ["/((?!_next/static|_next/image|favicon.ico).*)"],
 };
