@@ -35,6 +35,7 @@ type AuthService interface {
 	Logout(ctx context.Context, refreshToken string) error
 	SwitchOrganization(ctx context.Context, principal auth.Principal, target uuid.UUID) (auth.LoginResult, error)
 	Organizations(ctx context.Context, principal auth.Principal) ([]auth.Organization, error)
+	AddMember(ctx context.Context, in auth.AddMemberInput) (auth.AddMemberResult, error)
 }
 
 // TenantStore is the slice of internal/store the authenticated routes use.
@@ -66,6 +67,13 @@ type errorResponse struct {
 // wrong: the detail goes to the log with the request id, and the client gets a
 // sentence.
 const messageInternalError = "internal server error"
+
+// memberEnvelope is the JSON key a newly created membership is returned under.
+//
+// A named constant rather than a literal because the same word is also a role
+// name in this API, and at a use site the two are indistinguishable. crud.go
+// names its four envelope keys for the same reason.
+const memberEnvelope = "member"
 
 type registerRequest struct {
 	Email            string `json:"email"            binding:"required"`
@@ -131,6 +139,33 @@ type memberBody struct {
 	UserID       string `json:"user_id"`
 	Email        string `json:"email"`
 	DisplayName  string `json:"display_name"`
+	Role         string `json:"role"`
+	JoinedAt     string `json:"joined_at"`
+}
+
+// addMemberRequest is the body of POST /api/v1/members.
+//
+// Two fields, and no third one naming an organization. The tenant is the
+// caller's org claim; there is nowhere in this struct to put another, which is
+// the same property auth_middleware.go's header comment is about.
+type addMemberRequest struct {
+	Email string `json:"email" binding:"required"`
+	Role  string `json:"role"`
+}
+
+// addedMemberBody is what a successful addition returns.
+//
+// Deliberately narrower than [memberBody]: no display name. The response
+// carries the membership the caller just created and the address they typed,
+// and nothing that was read out of the global directory — so a 201 discloses
+// only that the address has an account, which is the bit the operation cannot
+// avoid disclosing. The full row, display name included, is one
+// GET /api/v1/members away and is scoped to the organization the account is now
+// in.
+type addedMemberBody struct {
+	MembershipID string `json:"membership_id"`
+	UserID       string `json:"user_id"`
+	Email        string `json:"email"`
 	Role         string `json:"role"`
 	JoinedAt     string `json:"joined_at"`
 }
@@ -392,6 +427,63 @@ func membersHandler(logger *slog.Logger, tenantStore TenantStore) gin.HandlerFun
 	}
 }
 
+// addMemberHandler puts an existing account into the caller's organization —
+// the demo's "invite teammate" step (issue #61).
+//
+// It is the same shape as every other handler in this file: decode, call
+// internal/auth, map an error to a status. In particular it does not read a
+// tenant, does not read a role, and does not decide who may add anyone. All
+// three are decisions about stored state, they are made in
+// [auth.Service.AddMember] against the database, and a handler that made any of
+// them from the token would be trusting a claim minted up to an access-token
+// lifetime ago.
+//
+// The statuses:
+//
+//	201  added; the body is the membership that was created
+//	400  the address or the role is not well formed
+//	403  the caller is not a member, or their role does not permit it
+//	404  no account has that address
+//	409  the account is already in this organization
+//
+// 404 does disclose that the address has no account. See members.go for why
+// that bit is inherent to the operation, what bounds it, and why
+// POST /auth/register already gives an *unauthenticated* caller the same bit.
+func addMemberHandler(logger *slog.Logger, service AuthService) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		principal, ok := principalFrom(c)
+		if !ok {
+			rejectUnauthenticated(c, logger, "no_principal", nil)
+
+			return
+		}
+
+		var req addMemberRequest
+		if !bindJSON(c, &req) {
+			return
+		}
+
+		result, err := service.AddMember(c.Request.Context(), auth.AddMemberInput{
+			Principal: principal,
+			Email:     req.Email,
+			Role:      req.Role,
+		})
+		if err != nil {
+			writeAuthError(c, logger, err)
+
+			return
+		}
+
+		c.JSON(http.StatusCreated, gin.H{memberEnvelope: addedMemberBody{
+			MembershipID: result.MembershipID.String(),
+			UserID:       result.UserID.String(),
+			Email:        result.Email,
+			Role:         result.Role,
+			JoinedAt:     result.JoinedAt.UTC().Format(time.RFC3339),
+		}})
+	}
+}
+
 func newSessionResponse(result auth.LoginResult) sessionResponse {
 	return sessionResponse{
 		TokenType:    "Bearer",
@@ -479,6 +571,23 @@ func writeAuthError(c *gin.Context, logger *slog.Logger, err error) {
 	case errors.Is(err, auth.ErrNotAMember):
 		c.AbortWithStatusJSON(http.StatusForbidden,
 			errorResponse{Error: "not a member of that organization"})
+
+	case errors.Is(err, auth.ErrInsufficientRole):
+		c.AbortWithStatusJSON(http.StatusForbidden,
+			errorResponse{Error: "your role does not permit adding a member"})
+
+	case errors.Is(err, auth.ErrNoSuchAccount):
+		// A fixed sentence with nothing in it but the sentence. The status
+		// already carries the one bit this operation cannot avoid disclosing;
+		// the body must not add a user id, a display name, or any hint about
+		// organizations the caller is not in.
+		c.AbortWithStatusJSON(http.StatusNotFound,
+			errorResponse{Error: "no account with that email address"})
+
+	case errors.Is(err, auth.ErrAlreadyMember):
+		// Discloses only what GET /api/v1/members already shows this caller.
+		c.AbortWithStatusJSON(http.StatusConflict,
+			errorResponse{Error: "already a member of this organization"})
 
 	default:
 		logger.ErrorContext(ctx, "auth request failed",

@@ -88,6 +88,14 @@ func NewRouter(
 	authenticated.GET("/me", meHandler(logger, authDeps.Service))
 	authenticated.POST("/auth/organization", switchOrganizationHandler(logger, authDeps.Service))
 
+	// Adding a member goes through the service rather than the store, because
+	// half of it — resolving an address to an account that may live entirely
+	// outside this tenant's visibility — travels the pre-tenant door, and
+	// internal/api has no access to that door and should not acquire one. So it
+	// is mounted here with the other service-backed routes rather than beside
+	// GET /members below, which needs only a tenant-scoped querier.
+	authenticated.POST("/members", addMemberHandler(logger, authDeps.Service))
+
 	if authDeps.Store != nil {
 		authenticated.GET("/members", membersHandler(logger, authDeps.Store))
 

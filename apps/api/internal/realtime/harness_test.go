@@ -91,6 +91,10 @@ func (stubAuthService) Organizations(context.Context, auth.Principal) ([]auth.Or
 	panic("stubAuthService: Organizations is not reachable from the realtime routes")
 }
 
+func (stubAuthService) AddMember(context.Context, auth.AddMemberInput) (auth.AddMemberResult, error) {
+	panic("stubAuthService: AddMember is not reachable from the realtime routes")
+}
+
 // recordingStore is a fake database that models the row-level security policies
 // rather than the rows.
 //
