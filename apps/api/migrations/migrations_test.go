@@ -114,26 +114,94 @@ func TestEveryMigrationHasUpAndDown(t *testing.T) {
 	})
 }
 
-// Guards against the app role being handed privileges that would make RLS
-// decorative, however the migration files are edited later.
-func TestMigrationsNeverGrantTheAppRoleAWayOut(t *testing.T) {
+// roleStatementRe captures one whole CREATE ROLE or ALTER ROLE statement.
+//
+// The checks below used to scan the entire file, which stopped working the
+// moment a migration had to *verify* an attribute rather than set it: issue #14
+// replaced `ALTER ROLE ... NOBYPASSRLS` with a DO block that reads
+// pg_roles.rolbypassrls and raises, and a whole-file scan reads that column
+// name as the migration granting BYPASSRLS. Scoping to role statements is not a
+// weakening — role attributes can only be conferred by CREATE ROLE or ALTER
+// ROLE, so nothing else could confer one. [^;] keeps a match inside a single
+// statement.
+var roleStatementRe = regexp.MustCompile(`(?is)\b(CREATE|ALTER)\s+ROLE\s[^;]*`)
+
+// Guards against a role being handed privileges that would make RLS decorative,
+// however the migration files are edited later.
+func TestMigrationsNeverGrantARoleAWayOut(t *testing.T) {
+	// CREATEROLE stays on the list even though the schema owner holds it: the
+	// owner gets it from apps/api/scripts/provision/bootstrap-owner.sql, run by
+	// a privileged identity out of band. A migration conferring it would mean a
+	// role the migrations themselves created could create more.
 	banned := []string{"BYPASSRLS", "SUPERUSER", "CREATEROLE", "CREATEDB", "REPLICATION"}
 
 	forEachMigration(t, func(t *testing.T, name, body string) {
 		t.Helper()
 
-		// Comments discuss these attributes by name, which is the point of the
-		// comments; only executable SQL is checked.
-		upper := strings.ToUpper(stripSQLComments(body))
-
-		for _, word := range banned {
-			// Only the negated form is legitimate, so strip those first and see
-			// whether the bare attribute is still granted anywhere.
-			if strings.Contains(strings.ReplaceAll(upper, "NO"+word, ""), word) {
-				t.Errorf("%s grants %s to a role; the app role must have none of %v", name, word, banned)
+		for _, statement := range roleStatements(body) {
+			for _, word := range banned {
+				// Only the negated form is legitimate, so strip those first and
+				// see whether the bare attribute is still conferred.
+				if strings.Contains(strings.ReplaceAll(statement, "NO"+word, ""), word) {
+					t.Errorf("%s confers %s in %q; no role this schema creates may hold any of %v",
+						name, word, collapse(statement), banned)
+				}
 			}
 		}
 	})
+}
+
+// attributesOnlyAHolderCanSet are the attributes PostgreSQL refuses to let a
+// role change unless it holds them itself — asserting the negative counts as
+// changing it. Verified against PostgreSQL 16.14; the error is
+// "permission denied to alter role / Only roles with the X attribute may change
+// the X attribute".
+//
+// CREATEROLE is not in the list: a CREATEROLE role may clear CREATEROLE, which
+// is why 00001, 00004 and 00005 can still say NOCREATEROLE outright.
+var attributesOnlyAHolderCanSet = []string{"NOSUPERUSER", "NOBYPASSRLS", "NOCREATEDB", "NOREPLICATION"}
+
+// TestMigrationsOnlyAlterAttributesTheOwnerCanSet is the regression guard for
+// the specific thing issue #14 found: the migration chain could not be applied
+// by the non-superuser owner it claimed to target, because 00001, 00004 and
+// 00005 each asserted attributes only a superuser may assert.
+//
+// CREATE ROLE is deliberately exempt. PostgreSQL only checks these attributes
+// when they are being *changed*, and a role being created has them off already,
+// so `CREATE ROLE x NOBYPASSRLS` is legal for any creator — which is why the
+// migrations state them there and check them afterwards.
+func TestMigrationsOnlyAlterAttributesTheOwnerCanSet(t *testing.T) {
+	forEachMigration(t, func(t *testing.T, name, body string) {
+		t.Helper()
+
+		for _, statement := range roleStatements(body) {
+			if !strings.HasPrefix(statement, "ALTER") {
+				continue
+			}
+
+			for _, attribute := range attributesOnlyAHolderCanSet {
+				if strings.Contains(statement, attribute) {
+					t.Errorf("%s says %s in %q; only a role that itself holds the attribute may set it, so this makes the chain unrunnable as the non-superuser owner. Verify it in a DO block instead — see 00001.",
+						name, attribute, collapse(statement))
+				}
+			}
+		}
+	})
+}
+
+// roleStatements returns every CREATE ROLE / ALTER ROLE statement in a
+// migration, upper-cased and with comments removed.
+//
+// Comments discuss these attributes by name, which is the point of the
+// comments; only executable SQL is checked.
+func roleStatements(body string) []string {
+	return roleStatementRe.FindAllString(strings.ToUpper(stripSQLComments(body)), -1)
+}
+
+// collapse renders a statement on one line, so a multi-line ALTER ROLE reads as
+// one thing in a failure message.
+func collapse(statement string) string {
+	return strings.Join(strings.Fields(statement), " ")
 }
 
 // stripSQLComments removes `--` line comments. Crude on purpose: it does not

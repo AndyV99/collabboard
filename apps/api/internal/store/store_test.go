@@ -26,8 +26,8 @@ var errBoom = errors.New("boom")
 func TestWithTenantSeesOnlyItsOwnTenantsRows(t *testing.T) {
 	ctx := context.Background()
 	pool := newPool(t, 4)
-	owner := newOwnerPool(t)
-	a, b, sharedEmail := seedTenants(t, owner)
+	superuser := newSuperuserPool(t)
+	a, b, sharedEmail := seedTenants(t, superuser)
 	s := store.New(pool)
 
 	for _, tc := range []struct {
@@ -112,8 +112,8 @@ func TestWithTenantSeesOnlyItsOwnTenantsRows(t *testing.T) {
 func TestSameQueryOutsideWithTenantSeesNothing(t *testing.T) {
 	ctx := context.Background()
 	pool := newPool(t, 1)
-	owner := newOwnerPool(t)
-	a, _, _ := seedTenants(t, owner)
+	superuser := newSuperuserPool(t)
+	a, _, _ := seedTenants(t, superuser)
 	s := store.New(pool)
 
 	backendBefore := backendPID(t, pool)
@@ -282,8 +282,8 @@ func TestConnectionIsReturnedToThePool(t *testing.T) {
 func TestCallbackErrorRollsBackTheTransaction(t *testing.T) {
 	ctx := context.Background()
 	pool := newPool(t, 2)
-	owner := newOwnerPool(t)
-	a, _, _ := seedTenants(t, owner)
+	superuser := newSuperuserPool(t)
+	a, _, _ := seedTenants(t, superuser)
 	s := store.New(pool)
 
 	const name = "rolled back project"
@@ -332,8 +332,8 @@ func TestCallbackErrorRollsBackTheTransaction(t *testing.T) {
 func TestInTenantCommitsAndReturns(t *testing.T) {
 	ctx := context.Background()
 	pool := newPool(t, 2)
-	owner := newOwnerPool(t)
-	a, b, _ := seedTenants(t, owner)
+	superuser := newSuperuserPool(t)
+	a, b, _ := seedTenants(t, superuser)
 	s := store.New(pool)
 
 	created, err := store.InTenant(ctx, s, a.TenantID, func(ctx context.Context, q store.Querier) (store.Project, error) {

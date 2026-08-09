@@ -64,27 +64,61 @@
 --
 -- Guarded for the same reason 00001 guards collabboard_app: CREATE ROLE has no
 -- IF NOT EXISTS, and in a deployed environment Terraform may have provisioned
--- the role already. The unconditional ALTER that follows is the load-bearing
--- half — it asserts the attributes this path's safety depends on however the
--- role came to exist.
+-- the role already. The negative attributes are stated on the CREATE because
+-- that is the only statement here that may choose them — see 00001 for the
+-- PostgreSQL rule, and for why the ALTER below is split from the assertion that
+-- follows it.
 -- +goose StatementBegin
 DO $$
 BEGIN
     IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'collabboard_identity') THEN
-        CREATE ROLE collabboard_identity;
+        CREATE ROLE collabboard_identity
+            NOSUPERUSER
+            NOBYPASSRLS
+            NOCREATEDB
+            NOCREATEROLE
+            NOREPLICATION;
     END IF;
 END
 $$;
 -- +goose StatementEnd
 
+-- The three attributes a non-superuser schema owner may set. NOLOGIN is the one
+-- that matters most here: it is what makes this role impossible to connect as,
+-- and it is settable, so it stays an instruction rather than a check.
 ALTER ROLE collabboard_identity
     NOLOGIN
-    NOSUPERUSER
-    NOBYPASSRLS
-    NOCREATEDB
     NOCREATEROLE
-    NOREPLICATION
     NOINHERIT;
+
+-- The four that cannot be set are verified. See 00001 for why a failed
+-- migration is the right outcome rather than a silent repair.
+-- +goose StatementBegin
+DO $$
+DECLARE
+    offending text;
+BEGIN
+    SELECT string_agg(a.attribute, ', ' ORDER BY a.attribute)
+      INTO offending
+      FROM pg_roles r
+      CROSS JOIN LATERAL (
+          VALUES ('SUPERUSER', r.rolsuper),
+                 ('BYPASSRLS', r.rolbypassrls),
+                 ('CREATEDB', r.rolcreatedb),
+                 ('REPLICATION', r.rolreplication)
+      ) AS a(attribute, is_held)
+     WHERE r.rolname = 'collabboard_identity'
+       AND a.is_held;
+
+    IF offending IS NOT NULL THEN
+        RAISE EXCEPTION
+            'collabboard_identity holds %, so the pre-tenant identity functions it owns would not be bounded by row-level security',
+            offending
+            USING HINT = 'Provision collabboard_identity without those attributes. See apps/api/scripts/provision/bootstrap-owner.sql and docs/adr/0006-database-role-provisioning.md.';
+    END IF;
+END
+$$;
+-- +goose StatementEnd
 
 GRANT USAGE ON SCHEMA public TO collabboard_identity;
 

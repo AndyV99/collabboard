@@ -62,7 +62,7 @@ var columnPrivileges = []string{"SELECT", "INSERT", "UPDATE", "REFERENCES"}
 // #8 granted, it granted to a third role, and these two are where they were.
 func TestOnlyTheCredentialsRoleCanReachCredentialStorage(t *testing.T) {
 	ctx := context.Background()
-	owner := newOwnerPool(t)
+	superuser := newSuperuserPool(t)
 
 	qualified := pgtest.AuthSchema + "." + credentialsTable
 
@@ -70,7 +70,7 @@ func TestOnlyTheCredentialsRoleCanReachCredentialStorage(t *testing.T) {
 		t.Run(role, func(t *testing.T) {
 			var mayUseSchema bool
 
-			if err := owner.QueryRow(ctx,
+			if err := superuser.QueryRow(ctx,
 				`SELECT has_schema_privilege($1, $2, 'USAGE')`,
 				role, pgtest.AuthSchema).Scan(&mayUseSchema); err != nil {
 				t.Fatalf("asking the catalog about USAGE on schema %s: %v", pgtest.AuthSchema, err)
@@ -86,7 +86,7 @@ func TestOnlyTheCredentialsRoleCanReachCredentialStorage(t *testing.T) {
 					role, pgtest.AuthSchema)
 			}
 
-			assertNoPrivileges(ctx, t, owner, role, qualified)
+			assertNoPrivileges(ctx, t, superuser, role, qualified)
 		})
 	}
 
@@ -96,7 +96,7 @@ func TestOnlyTheCredentialsRoleCanReachCredentialStorage(t *testing.T) {
 	t.Run(pgtest.CredentialsRole+" (control)", func(t *testing.T) {
 		var mayUseSchema, maySelect, mayInsert bool
 
-		if err := owner.QueryRow(ctx, `
+		if err := superuser.QueryRow(ctx, `
 			SELECT has_schema_privilege($1, $2, 'USAGE'),
 			       has_column_privilege($1, $3, 'verifier', 'SELECT'),
 			       has_column_privilege($1, $3, 'verifier', 'INSERT')
@@ -124,13 +124,13 @@ func TestOnlyTheCredentialsRoleCanReachCredentialStorage(t *testing.T) {
 // a function — they need a migration, which is the review point.
 func TestTheCredentialsRoleCannotChangeOrRemoveACredential(t *testing.T) {
 	ctx := context.Background()
-	owner := newOwnerPool(t)
+	superuser := newSuperuserPool(t)
 	qualified := pgtest.AuthSchema + "." + credentialsTable
 
 	for _, verb := range []string{"UPDATE", "DELETE", "TRUNCATE"} {
 		var atTable bool
 
-		if err := owner.QueryRow(ctx,
+		if err := superuser.QueryRow(ctx,
 			`SELECT has_table_privilege($1, $2, $3)`,
 			pgtest.CredentialsRole, qualified, verb).Scan(&atTable); err != nil {
 			t.Fatalf("asking the catalog about %s: %v", verb, err)
@@ -146,7 +146,7 @@ func TestTheCredentialsRoleCannotChangeOrRemoveACredential(t *testing.T) {
 
 	var atColumn bool
 
-	if err := owner.QueryRow(ctx,
+	if err := superuser.QueryRow(ctx,
 		`SELECT has_any_column_privilege($1, $2, 'UPDATE')`,
 		pgtest.CredentialsRole, qualified).Scan(&atColumn); err != nil {
 		t.Fatalf("asking the catalog about column UPDATE: %v", err)
@@ -168,12 +168,12 @@ func TestTheCredentialsRoleCannotChangeOrRemoveACredential(t *testing.T) {
 // is covered the moment it exists.
 func TestTheCredentialsRoleCannotTouchAnythingInPublic(t *testing.T) {
 	ctx := context.Background()
-	owner := newOwnerPool(t)
+	superuser := newSuperuserPool(t)
 
-	tables := tableNames(t, owner)
+	tables := tableNames(t, superuser)
 
 	for _, table := range tables {
-		assertNoPrivileges(ctx, t, owner, pgtest.CredentialsRole, table)
+		assertNoPrivileges(ctx, t, superuser, pgtest.CredentialsRole, table)
 	}
 
 	t.Logf("checked %d tables in schema public against %s: %v", len(tables), pgtest.CredentialsRole, tables)
@@ -181,13 +181,13 @@ func TestTheCredentialsRoleCannotTouchAnythingInPublic(t *testing.T) {
 
 // assertNoPrivileges asserts that role holds nothing at all on table, at table
 // level or on any single column.
-func assertNoPrivileges(ctx context.Context, t *testing.T, owner *pgxpool.Pool, role, table string) {
+func assertNoPrivileges(ctx context.Context, t *testing.T, superuser *pgxpool.Pool, role, table string) {
 	t.Helper()
 
 	for _, verb := range tablePrivileges {
 		var atTable bool
 
-		if err := owner.QueryRow(ctx,
+		if err := superuser.QueryRow(ctx,
 			`SELECT has_table_privilege($1, $2, $3)`, role, table, verb).Scan(&atTable); err != nil {
 			t.Fatalf("asking the catalog about %s on %s for %s: %v", verb, table, role, err)
 		}
@@ -200,7 +200,7 @@ func assertNoPrivileges(ctx context.Context, t *testing.T, owner *pgxpool.Pool, 
 	for _, verb := range columnPrivileges {
 		var atColumn bool
 
-		if err := owner.QueryRow(ctx,
+		if err := superuser.QueryRow(ctx,
 			`SELECT has_any_column_privilege($1, $2, $3)`, role, table, verb).Scan(&atColumn); err != nil {
 			t.Fatalf("asking the catalog about column %s on %s for %s: %v", verb, table, role, err)
 		}
@@ -224,7 +224,7 @@ func assertNoPrivileges(ctx context.Context, t *testing.T, owner *pgxpool.Pool, 
 // function does not work if they do.
 func TestNeitherPreTenantRoleCanReachTheOthersDataFromInsideItsOwnFunction(t *testing.T) {
 	ctx := context.Background()
-	owner := newOwnerPool(t)
+	superuser := newSuperuserPool(t)
 	app := newPool(t, 1)
 
 	for _, probe := range []struct {
@@ -259,12 +259,12 @@ func TestNeitherPreTenantRoleCanReachTheOthersDataFromInsideItsOwnFunction(t *te
 				GRANT EXECUTE ON FUNCTION public.%s() TO %s;
 			`, fn, probe.target, fn, probe.role, fn, pgtest.AppRole)
 
-			if _, err := owner.Exec(ctx, create); err != nil {
+			if _, err := superuser.Exec(ctx, create); err != nil {
 				t.Fatalf("creating the probe function: %v", err)
 			}
 
 			t.Cleanup(func() {
-				if _, derr := owner.Exec(ctx, fmt.Sprintf(`DROP FUNCTION IF EXISTS public.%s()`, fn)); derr != nil {
+				if _, derr := superuser.Exec(ctx, fmt.Sprintf(`DROP FUNCTION IF EXISTS public.%s()`, fn)); derr != nil {
 					t.Errorf("dropping the probe function: %v", derr)
 				}
 			})
@@ -308,14 +308,14 @@ const invalidSchemaName = "3F000"
 // be decorative — it could read verifiers with a plain SELECT.
 func TestTheServingRoleCannotAssumeTheCredentialsRole(t *testing.T) {
 	ctx := context.Background()
-	owner := newOwnerPool(t)
+	superuser := newSuperuserPool(t)
 
 	var (
 		canLogin, super, bypassRLS bool
 		appIsMember, appHasUsage   bool
 	)
 
-	err := owner.QueryRow(ctx, `
+	err := superuser.QueryRow(ctx, `
 		SELECT r.rolcanlogin,
 		       r.rolsuper,
 		       r.rolbypassrls,
@@ -352,7 +352,7 @@ func TestTheServingRoleCannotAssumeTheCredentialsRole(t *testing.T) {
 	// where one can become the other is one role with extra steps.
 	var identityIsMember bool
 
-	if err := owner.QueryRow(ctx,
+	if err := superuser.QueryRow(ctx,
 		`SELECT pg_has_role($1, $2, 'USAGE')`,
 		pgtest.IdentityRole, pgtest.CredentialsRole).Scan(&identityIsMember); err != nil {
 		t.Fatalf("reading role membership: %v", err)
@@ -375,9 +375,9 @@ func TestTheServingRoleCannotAssumeTheCredentialsRole(t *testing.T) {
 // is.
 func TestNoPreTenantFunctionReturnsTheVerifier(t *testing.T) {
 	ctx := context.Background()
-	owner := newOwnerPool(t)
+	superuser := newSuperuserPool(t)
 
-	rows, err := owner.Query(ctx, `
+	rows, err := superuser.Query(ctx, `
 		SELECT p.proname, pg_get_function_result(p.oid)
 		FROM pg_proc p
 		JOIN pg_namespace n ON n.oid = p.pronamespace
@@ -426,9 +426,9 @@ func TestNoPreTenantFunctionReturnsTheVerifier(t *testing.T) {
 // existing catalog test would not have noticed if it had shipped without RLS.
 func TestEveryTableOutsideSystemSchemasHasForcedRLSAndAPolicy(t *testing.T) {
 	ctx := context.Background()
-	owner := newOwnerPool(t)
+	superuser := newSuperuserPool(t)
 
-	rows, err := owner.Query(ctx, `
+	rows, err := superuser.Query(ctx, `
 		SELECT n.nspname, c.relname, c.relrowsecurity, c.relforcerowsecurity,
 		       (SELECT count(*) FROM pg_policy p WHERE p.polrelid = c.oid)
 		FROM pg_class c
@@ -496,9 +496,9 @@ func TestEveryTableOutsideSystemSchemasHasForcedRLSAndAPolicy(t *testing.T) {
 func TestAPasswordCanBeStoredAndVerifiedWithoutATenant(t *testing.T) {
 	ctx := context.Background()
 	s := store.New(newPool(t, 2))
-	owner := newOwnerPool(t)
+	superuser := newSuperuserPool(t)
 
-	user := createThrowawayUser(t, s, owner)
+	user := createThrowawayUser(t, s, superuser)
 
 	salt := randomBytes(t, 16)
 	key := randomBytes(t, 32)
@@ -613,9 +613,9 @@ func TestAPasswordCanBeStoredAndVerifiedWithoutATenant(t *testing.T) {
 func TestPasswordParamsReportsAnAccountWithNoPasswordAsNoRow(t *testing.T) {
 	ctx := context.Background()
 	s := store.New(newPool(t, 2))
-	owner := newOwnerPool(t)
+	superuser := newSuperuserPool(t)
 
-	user := createThrowawayUser(t, s, owner)
+	user := createThrowawayUser(t, s, superuser)
 
 	_, err := store.WithoutTenantValue(ctx, s, store.ReasonPasswordParams,
 		func(ctx context.Context, q store.IdentityQuerier) (store.PasswordKDFParams, error) {
@@ -637,9 +637,9 @@ func TestPasswordParamsReportsAnAccountWithNoPasswordAsNoRow(t *testing.T) {
 func TestAPasswordCannotBeOverwrittenThroughThisPath(t *testing.T) {
 	ctx := context.Background()
 	s := store.New(newPool(t, 2))
-	owner := newOwnerPool(t)
+	superuser := newSuperuserPool(t)
 
-	user := createThrowawayUser(t, s, owner)
+	user := createThrowawayUser(t, s, superuser)
 
 	create := func(key []byte) error {
 		_, err := store.WithoutTenantValue(ctx, s, store.ReasonRegisterUser,
@@ -698,7 +698,7 @@ func TestAPasswordCannotBeOverwrittenThroughThisPath(t *testing.T) {
 // createThrowawayUser creates a global user through the real pre-tenant door
 // and removes it when the test ends. The credential row goes with it: the
 // foreign key is ON DELETE CASCADE.
-func createThrowawayUser(t *testing.T, s *store.Store, owner *pgxpool.Pool) uuid.UUID {
+func createThrowawayUser(t *testing.T, s *store.Store, superuser *pgxpool.Pool) uuid.UUID {
 	t.Helper()
 
 	ctx := context.Background()
@@ -713,7 +713,7 @@ func createThrowawayUser(t *testing.T, s *store.Store, owner *pgxpool.Pool) uuid
 	}
 
 	t.Cleanup(func() {
-		if _, derr := owner.Exec(ctx, `DELETE FROM users WHERE id = $1`, created.ID); derr != nil {
+		if _, derr := superuser.Exec(ctx, `DELETE FROM users WHERE id = $1`, created.ID); derr != nil {
 			t.Errorf("removing the throwaway user: %v", derr)
 		}
 	})

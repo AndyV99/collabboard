@@ -39,25 +39,47 @@ docs/adr/            architecture decision records
 ## Getting started
 
 ```bash
-docker compose up -d                 # Postgres + Redis
+docker compose up -d                 # Postgres + Redis, and collabboard_owner
 
 cd apps/api
-go run ./cmd/api migrate up          # create the schema, RLS policies and app role
-
-# One-time, local only: migration 00001 creates collabboard_app without a
-# password, because a credential in a versioned migration can never be rotated.
-# Deployed environments set it from the secret store; the laptop sets it here.
-docker compose exec -T postgres psql -U collabboard -d collabboard \
-  < scripts/dev/set-app-role-password.sql
-
+go run ./cmd/api migrate up          # schema, RLS policies and the app roles
+go run ./cmd/api provision           # app-role password, from POSTGRES_PASSWORD
 go run ./cmd/api                     # serve on :8080
 ```
 
 `api migrate` also takes `down` (one step), `reset` (all the way back) and
-`status`. It connects as `POSTGRES_MIGRATION_USER` — the role that owns the
-schema — while the server connects as `POSTGRES_USER`, which must be
-`collabboard_app`. Those two are deliberately different roles: see
-`docs/adr/0001-tenant-isolation.md`.
+`status`. It connects as `POSTGRES_MIGRATION_USER` — `collabboard_owner`, which
+owns the schema — while the server connects as `POSTGRES_USER`, which must be
+`collabboard_app`. Those two are deliberately different roles, and neither is
+the cluster's superuser: see `docs/adr/0001-tenant-isolation.md` and
+`docs/adr/0006-database-role-provisioning.md`. `api migrate` refuses to run as a
+role row-level security is not enforced against, before it applies anything.
+
+`api provision` sets the app role's password to `POSTGRES_PASSWORD`. Migration
+00001 creates `collabboard_app` without one on purpose — a credential in a
+versioned migration can never be rotated — so this is the step that supplies it,
+from configuration rather than from a file in this repository. In a deployed
+environment `POSTGRES_PASSWORD` comes from the secret store and the command runs
+as part of the pre-deploy task, next to `api migrate up`.
+
+### If your Postgres volume predates the owner role
+
+`collabboard_owner` is created by an init hook, and the postgres image runs those
+only on an empty data directory. A checkout from before that hook existed has a
+volume without it, and `api migrate up` will say so. Either start over:
+
+```bash
+docker compose down -v && docker compose up -d
+```
+
+or adopt the existing volume in place, keeping the data:
+
+```bash
+docker compose exec -T postgres psql -v ON_ERROR_STOP=1 \
+  -U collabboard -d collabboard \
+  -v owner_password=dev -v previous_owner=collabboard \
+  -f /opt/collabboard/provision/bootstrap-owner.sql
+```
 
 ## Database access
 
@@ -89,11 +111,14 @@ go test -tags=integration ./...  # integration: real Postgres in a container
 ```
 
 The integration suite brings up its own Postgres with Testcontainers on a random
-port, applies the real migrations to it, and connects as `collabboard_app` — not
-as the owner and not as a superuser, because row-level security does not apply to
-either, and a suite that connects as one of them passes every isolation assertion
-while proving nothing. It asserts that too, in
-`apps/api/internal/store/identity_test.go`.
+port, provisions `collabboard_owner` by running the same init hook and the same
+`bootstrap-owner.sql` the compose stack and a deploy run, applies the real
+migrations *as that non-superuser owner*, and connects as `collabboard_app` for
+everything under test. A suite that migrates as a superuser passes every
+isolation assertion while proving nothing, which is how the gap issue #14 closed
+went unnoticed for five migrations. It asserts all of that rather than trusting
+it, in `apps/api/internal/store/identity_test.go` and
+`apps/api/internal/store/provisioning_test.go`.
 
 It needs a running Docker daemon and nothing else: no compose stack, no
 pre-provisioned database, no environment variables. Containers are removed when

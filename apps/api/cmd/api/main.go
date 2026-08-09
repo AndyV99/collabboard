@@ -4,14 +4,16 @@
 // build the router with those dependencies injected, serve, and shut down
 // cleanly. All behaviour lives under internal/.
 //
-// Two modes, one binary:
+// Three modes, one binary:
 //
 //	api                  serve HTTP (the default)
 //	api migrate <cmd>    apply or roll back schema migrations, then exit
+//	api provision        set the serving role's password from configuration
 //
-// One binary because it keeps the image and the schema it expects inseparable;
-// two modes because they connect as different database roles — see
-// internal/migrate.
+// One binary because it keeps the image and the schema it expects inseparable.
+// Separate modes because they connect as different database roles — see
+// internal/migrate — and because a deploy has to be able to run the first two
+// as a pre-deploy task while the old version is still serving.
 package main
 
 import (
@@ -37,6 +39,7 @@ import (
 	"github.com/AndyV99/collabboard/apps/api/internal/config"
 	"github.com/AndyV99/collabboard/apps/api/internal/logging"
 	"github.com/AndyV99/collabboard/apps/api/internal/migrate"
+	"github.com/AndyV99/collabboard/apps/api/internal/provision"
 	"github.com/AndyV99/collabboard/apps/api/internal/realtime"
 	"github.com/AndyV99/collabboard/apps/api/internal/store"
 )
@@ -44,8 +47,10 @@ import (
 const (
 	serviceName = "collabboard-api"
 
-	// migrateCommand is the argv[1] that switches the binary out of serve mode.
-	migrateCommand = "migrate"
+	// migrateCommand and provisionCommand are the argv[1] values that switch
+	// the binary out of serve mode.
+	migrateCommand   = "migrate"
+	provisionCommand = "provision"
 
 	// startupPingTimeout bounds the optional connectivity probe at boot. It is
 	// advisory only — a failure is logged, not fatal.
@@ -72,8 +77,13 @@ func run(args []string) error {
 	logger := logging.New(os.Stdout, serviceName, cfg.LogLevel)
 	slog.SetDefault(logger)
 
-	if len(args) > 0 && args[0] == migrateCommand {
-		return runMigrate(logger, cfg, args[1:])
+	if len(args) > 0 {
+		switch args[0] {
+		case migrateCommand:
+			return runMigrate(logger, cfg, args[1:])
+		case provisionCommand:
+			return runProvision(logger, cfg, args[1:])
+		}
 	}
 
 	return runServe(logger, cfg)
@@ -92,6 +102,46 @@ func runMigrate(logger *slog.Logger, cfg config.Config, args []string) error {
 	defer stop()
 
 	return migrate.Run(ctx, logger, cfg.Postgres.MigrationDSN(), migrate.Command(args[0]))
+}
+
+// runProvision gives the serving role the password the serving DSN is built
+// from, and exits.
+//
+// One configuration value, two uses: POSTGRES_PASSWORD is both what this writes
+// into the database and what `api` authenticates with. Two variables would be
+// two things to rotate and one more way for a deploy to end up with a role
+// whose password nothing knows.
+//
+// It connects with the migration DSN because setting another role's password
+// requires administrative rights over it, which only the schema owner has. The
+// serving role deliberately cannot rotate its own credential.
+func runProvision(logger *slog.Logger, cfg config.Config, args []string) error {
+	if len(args) != 0 {
+		return fmt.Errorf("usage: %s %s (takes no arguments)", os.Args[0], provisionCommand)
+	}
+
+	credentials := []provision.Credential{
+		{Role: cfg.Postgres.User, Password: cfg.Postgres.Password},
+	}
+
+	// The serving role and the migration role must be different identities —
+	// that separation is the whole of ADR 0001's answer to the owner trap — and
+	// this command is where getting it wrong would do real damage: it would
+	// rotate the owner's own password out from under the deploy.
+	if cfg.Postgres.User == cfg.Postgres.MigrationUser {
+		return fmt.Errorf(
+			"POSTGRES_USER and POSTGRES_MIGRATION_USER are both %q; the serving role must not be the schema owner (docs/adr/0001-tenant-isolation.md)",
+			cfg.Postgres.User)
+	}
+
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
+	logger.Info("provisioning database role credentials",
+		slog.String("roles", provision.Describe(credentials)),
+		slog.String("as", cfg.Postgres.MigrationUser))
+
+	return provision.Roles(ctx, logger, cfg.Postgres.MigrationDSN(), credentials...)
 }
 
 // runServe builds the HTTP service and runs it until a shutdown signal arrives.

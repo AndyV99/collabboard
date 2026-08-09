@@ -138,10 +138,19 @@ func (h HTTPConfig) Addr() string {
 //
 // Two identities, not one. User/Password is the serving role — collabboard_app,
 // which owns nothing and is subject to row-level security. MigrationUser /
-// MigrationPassword is the role that owns the schema and is the only one able
-// to run DDL. Keeping them apart in config is what stops the API from
+// MigrationPassword is collabboard_owner, which owns the schema and is the only
+// one able to run DDL. Keeping them apart in config is what stops the API from
 // accidentally connecting as the owner, which would defeat the isolation model
 // (docs/adr/0001-tenant-isolation.md).
+//
+// Neither is the cluster's bootstrap superuser or the RDS master. The owner is
+// a dedicated non-superuser role created by
+// apps/api/scripts/provision/bootstrap-owner.sql, so that FORCE ROW LEVEL
+// SECURITY is exercised by the role that owns the tables rather than silently
+// skipped — see docs/adr/0006-database-role-provisioning.md.
+//
+// Password is also what `api provision` writes into the database, so there is
+// one secret for the serving role rather than two values that have to agree.
 type PostgresConfig struct {
 	Host     string
 	Port     int
@@ -221,7 +230,7 @@ func Load() (Config, error) {
 			Password:          envString("POSTGRES_PASSWORD", "dev"),
 			Database:          envString("POSTGRES_DB", "collabboard"),
 			SSLMode:           envString("POSTGRES_SSLMODE", "disable"),
-			MigrationUser:     envString("POSTGRES_MIGRATION_USER", "collabboard"),
+			MigrationUser:     envString("POSTGRES_MIGRATION_USER", "collabboard_owner"),
 			MigrationPassword: envString("POSTGRES_MIGRATION_PASSWORD", "dev"),
 			MaxConns:          int32(envInt("POSTGRES_MAX_CONNS", 10, &errs)), //nolint:gosec // bounded small int from config
 		},

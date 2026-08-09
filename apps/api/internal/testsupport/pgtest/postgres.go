@@ -9,17 +9,19 @@ import (
 	"log/slog"
 	"net/url"
 	"os"
+	"path/filepath"
+	"runtime"
 	"sync"
 	"testing"
 	"time"
 
 	"github.com/google/uuid"
-	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/testcontainers/testcontainers-go"
 	"github.com/testcontainers/testcontainers-go/modules/postgres"
 
 	"github.com/AndyV99/collabboard/apps/api/internal/migrate"
+	"github.com/AndyV99/collabboard/apps/api/internal/provision"
 	"github.com/AndyV99/collabboard/apps/api/internal/store"
 )
 
@@ -29,10 +31,31 @@ const (
 	// the version is load-bearing rather than incidental.
 	Image = "postgres:16-alpine"
 
-	// OwnerRole owns the schema and runs the migrations. In the container it is
-	// also the bootstrap superuser, which is fine precisely because no test
-	// asserts anything through it.
-	OwnerRole = "collabboard"
+	// SuperuserRole is the role the container starts with: the cluster's
+	// bootstrap superuser.
+	//
+	// It provisions [SchemaOwnerRole] — the one step a migration cannot do for
+	// itself, because creating a role that must not be a superuser requires
+	// privileges that role must not have — and it seeds fixtures. Nothing under
+	// test ever runs through it, and nothing about the schema is asserted
+	// through it either.
+	//
+	// Fixtures need it and cannot avoid it. Seeding is precisely what the
+	// policies forbid: `users` cannot be inserted into by any role subject to
+	// RLS, because its WITH CHECK requires a membership that cannot exist until
+	// the user row does. That is issue #13 showing up where migration 00002's
+	// header says it will, not a shortcut.
+	SuperuserRole = "collabboard"
+
+	// SchemaOwnerRole owns the schema and runs the migrations.
+	//
+	// Not a superuser and no BYPASSRLS, so FORCE ROW LEVEL SECURITY actually
+	// applies to it. Before issue #14 the migrations ran as SuperuserRole, and
+	// the whole chain had come to depend on that without anyone choosing it:
+	// three of the five migrations issued ALTER ROLE statements PostgreSQL only
+	// permits a superuser to issue. A harness that migrates as a superuser
+	// cannot notice.
+	SchemaOwnerRole = "collabboard_owner"
 
 	// AppRole is the serving role that migration 00001 creates: no superuser,
 	// no BYPASSRLS, owns nothing, table grants only.
@@ -70,55 +93,79 @@ const startTimeout = 5 * time.Minute
 // pingTimeout bounds the "is this pool usable" probe.
 const pingTimeout = 10 * time.Second
 
-// alterAppRoleLoginSQL gives the app role a login password.
+// bootstrapScriptPath locates the provisioning SQL a deployed environment runs,
+// relative to this file.
 //
-// Migration 00001 creates collabboard_app without one on purpose — a credential
-// in a versioned migration can never be rotated — so a freshly migrated
-// database has an app role that cannot log in. Deployed environments set it
-// from the secret store; local dev uses scripts/dev/set-app-role-password.sql;
-// this is the same step for a container that lives for one test run.
+// The harness executes that file rather than restating its SQL, for the same
+// reason [Start] calls migrate.Run rather than reimplementing goose: a harness
+// that proves the migrations work under a role model no operator will ever
+// create proves nothing. The script is an artifact under test.
 //
-// ALTER ROLE takes a literal password and cannot be parameterised, and
-// interpolating into SQL is how injection happens. The value therefore travels
-// as a bind parameter into a GUC, and format(%L) quotes it back out inside a DO
-// block, which is the parameterised equivalent.
-const alterAppRoleLoginSQL = `
-DO $$
-BEGIN
-    EXECUTE format('ALTER ROLE %I WITH PASSWORD %L',
-                   current_setting('pgtest.app_role'),
-                   current_setting('pgtest.app_password'));
-END
-$$`
+// It is resolved through runtime.Caller rather than go:embed because embed
+// patterns cannot escape the package directory, and rather than a path relative
+// to the working directory because `go test` sets that to whichever package is
+// running — internal/store here, internal/api there. The compiled-in source
+// path is the one thing that is the same for all of them.
+const bootstrapScriptPath = "../../../scripts/provision/bootstrap-owner.sql"
+
+// initScriptPath is the compose stack's init hook, also relative to this file.
+// The harness runs the same one, so "docker compose up produces a database the
+// migrations can be applied to" is a claim CI checks.
+const initScriptPath = "../../../scripts/dev/initdb/10-bootstrap-owner.sh"
+
+// containerProvisionDir is where the init hook looks for the provisioning SQL.
+// It matches the mount point in docker-compose.yml; the two are the same
+// contract seen from two sides.
+const containerProvisionDir = "/opt/collabboard/provision"
+
+// ownerPasswordEnv is the environment variable the init hook reads the schema
+// owner's password from. Named here so that renaming it in the hook breaks the
+// harness loudly rather than leaving it to fall back to the local default.
+//
+//nolint:gosec // G101 pattern-matches "PASSWORD"; this is the variable's name, not its value.
+const ownerPasswordEnv = "COLLABBOARD_OWNER_PASSWORD"
 
 // DB is a running Postgres container with the migrations applied.
 //
-// The two DSNs are the point of the type: which one a test picks decides
+// The three DSNs are the point of the type: which one a test picks decides
 // whether it is proving anything.
 type DB struct {
 	container *postgres.PostgresContainer
 
-	// OwnerDSN connects as the role that owns the schema. For migrations and
-	// for seeding fixtures the policies would otherwise forbid — creating a
-	// user, for instance, which no tenant-scoped transaction can do because the
-	// membership that would make the user visible cannot exist yet.
-	OwnerDSN string
+	// SuperuserDSN connects as the cluster's bootstrap superuser. It exists to
+	// create the schema owner and to seed fixtures the policies would otherwise
+	// forbid — creating a user, for instance, which no role subject to RLS can
+	// do because the membership that would make the user visible cannot exist
+	// yet. Nothing under test runs through it.
+	SuperuserDSN string
+
+	// SchemaOwnerDSN connects as collabboard_owner: the non-superuser that owns
+	// every table and runs the migrations. Row-level security applies to it,
+	// which is exactly what makes it worth migrating as.
+	SchemaOwnerDSN string
 
 	// AppDSN connects as collabboard_app. Everything under test runs through
 	// this one.
 	AppDSN string
 
-	// fixtureOnce guards the long-lived owner pool that Seed and OwnerExec
-	// share. It belongs to the harness rather than to a test, because fixtures
-	// are created and torn down across several tests and a pool closed by the
-	// first test's cleanup would break the second's.
+	// fixtureOnce guards the long-lived superuser pool that Seed and
+	// SuperuserExec share. It belongs to the harness rather than to a test,
+	// because fixtures are created and torn down across several tests and a
+	// pool closed by the first test's cleanup would break the second's.
 	fixtureOnce sync.Once
 	fixturePool *pgxpool.Pool
 	fixtureErr  error
 }
 
-// Start brings up Postgres on a random host port, applies the embedded
-// migrations as the owner, and gives the app role a password.
+// Start brings up Postgres on a random host port, provisions the schema owner,
+// applies the embedded migrations as that owner, and gives the app role a
+// password.
+//
+// Every step after the container start runs the code a deploy runs: the compose
+// stack's init hook, the provisioning SQL an operator executes, migrate.Run and
+// provision.Roles. Nothing about the role model is reimplemented here, because a
+// harness that builds the schema its own way can only ever prove things about
+// itself.
 //
 // The caller owns the returned [DB] and must call [DB.Close]. On any failure
 // during bring-up the container is terminated before the error is returned, so
@@ -130,13 +177,37 @@ func Start(ctx context.Context) (*DB, error) {
 	// Generated per run rather than hardcoded. Nothing outside this process
 	// needs them, the container is discarded when the run ends, and a constant
 	// here would be a committed credential that looks like it means something.
+	superuserPassword := uuid.NewString()
 	ownerPassword := uuid.NewString()
 	appPassword := uuid.NewString()
 
+	initScript, provisionScript, err := provisionScripts()
+	if err != nil {
+		return nil, err
+	}
+
 	container, err := postgres.Run(ctx, Image,
 		postgres.WithDatabase(Database),
-		postgres.WithUsername(OwnerRole),
-		postgres.WithPassword(ownerPassword),
+		postgres.WithUsername(SuperuserRole),
+		postgres.WithPassword(superuserPassword),
+		// The compose stack's own init hook, run the way the compose stack runs
+		// it: the image executes everything in /docker-entrypoint-initdb.d once,
+		// on an empty data directory, as the bootstrap superuser. Using it here
+		// means "the local dev path works" is asserted by CI rather than by
+		// whoever last followed the README.
+		postgres.WithInitScripts(initScript),
+		// The hook shells out to this file, which is the same one a deployed
+		// environment runs. It is placed where the hook looks for it — the path
+		// docker-compose.yml mounts it at — rather than in initdb.d, where the
+		// entrypoint would also execute it directly and without arguments.
+		testcontainers.WithFiles(testcontainers.ContainerFile{
+			HostFilePath:      provisionScript,
+			ContainerFilePath: containerProvisionDir + "/" + filepath.Base(provisionScript),
+			FileMode:          0o644,
+		}),
+		testcontainers.WithEnv(map[string]string{
+			ownerPasswordEnv: ownerPassword,
+		}),
 		// Waits for the "ready to accept connections" log twice — Postgres
 		// emits it once for the init-scripts phase and once for the real
 		// startup, and connecting during the first one hits a database that is
@@ -154,25 +225,45 @@ func Start(ctx context.Context) (*DB, error) {
 
 	db := &DB{container: container}
 
-	ownerDSN, err := container.ConnectionString(ctx, "sslmode=disable")
+	superuserDSN, err := container.ConnectionString(ctx, "sslmode=disable")
 	if err != nil {
 		return nil, db.abort(fmt.Errorf("reading connection string: %w", err))
 	}
 
-	db.OwnerDSN = ownerDSN
+	db.SuperuserDSN = superuserDSN
 
-	// The real migration code, not a reimplementation: whatever this harness
-	// proves about the schema is only worth something if the schema got there
-	// the way a deploy would.
-	if err := migrate.Run(ctx, harnessLogger(), ownerDSN, migrate.CommandUp); err != nil {
-		return nil, db.abort(fmt.Errorf("applying migrations: %w", err))
-	}
-
-	if err := setAppRolePassword(ctx, ownerDSN, appPassword); err != nil {
+	// Same host and port, different identity. The owner role was created by the
+	// init hook above, before the database finished starting.
+	schemaOwnerDSN, err := withCredentials(superuserDSN, SchemaOwnerRole, ownerPassword)
+	if err != nil {
 		return nil, db.abort(err)
 	}
 
-	appDSN, err := withCredentials(ownerDSN, AppRole, appPassword)
+	db.SchemaOwnerDSN = schemaOwnerDSN
+
+	// The real migration code, not a reimplementation: whatever this harness
+	// proves about the schema is only worth something if the schema got there
+	// the way a deploy would. As of issue #14 that includes the identity it got
+	// there under — migration 00006 refuses to apply as anything row-level
+	// security is not enforced against, so a regression that put the superuser
+	// DSN back here fails the whole suite at bring-up.
+	if err := migrate.Run(ctx, harnessLogger(), schemaOwnerDSN, migrate.CommandUp); err != nil {
+		return nil, db.abort(fmt.Errorf("applying migrations as %s: %w", SchemaOwnerRole, err))
+	}
+
+	// Migration 00001 creates collabboard_app without a password on purpose, so
+	// a freshly migrated database has an app role that cannot log in. This is
+	// `api provision`, called as a library rather than restated: a container
+	// that lives for one test run gets its credential from configuration the
+	// same way a deployed environment does.
+	if err := provision.Roles(ctx, harnessLogger(), schemaOwnerDSN, provision.Credential{
+		Role:     AppRole,
+		Password: appPassword,
+	}); err != nil {
+		return nil, db.abort(fmt.Errorf("provisioning the %s password: %w", AppRole, err))
+	}
+
+	appDSN, err := withCredentials(superuserDSN, AppRole, appPassword)
 	if err != nil {
 		return nil, db.abort(err)
 	}
@@ -180,6 +271,33 @@ func Start(ctx context.Context) (*DB, error) {
 	db.AppDSN = appDSN
 
 	return db, nil
+}
+
+// provisionScripts resolves the two files the container needs from this
+// package's own source location.
+//
+// runtime.Caller rather than a working-directory-relative path: `go test` sets
+// the working directory to the package under test, which is internal/store for
+// one suite and internal/api for another, so nothing relative to it is stable.
+// The compiled-in path of this file is.
+func provisionScripts() (initScript, provisionScript string, err error) {
+	_, thisFile, _, ok := runtime.Caller(0)
+	if !ok {
+		return "", "", errors.New("pgtest: cannot locate this package's source; the provisioning scripts are read from disk")
+	}
+
+	dir := filepath.Dir(thisFile)
+
+	initScript = filepath.Join(dir, initScriptPath)
+	provisionScript = filepath.Join(dir, bootstrapScriptPath)
+
+	for _, path := range []string{initScript, provisionScript} {
+		if _, statErr := os.Stat(path); statErr != nil {
+			return "", "", fmt.Errorf("pgtest: reading provisioning script %s: %w", path, statErr)
+		}
+	}
+
+	return initScript, provisionScript, nil
 }
 
 // AppStore opens a pool as the serving role and wraps it in the real
@@ -197,40 +315,60 @@ func (db *DB) AppStore(tb testing.TB, maxConns int32) *store.Store {
 	return store.New(db.AppPool(tb, maxConns))
 }
 
-// Seed creates the two-tenant fixture using the harness's own owner pool.
+// Seed creates the two-tenant fixture using the harness's own superuser pool.
 func (db *DB) Seed(tb testing.TB) Fixture {
 	tb.Helper()
 
 	return SeedTenants(tb, db.fixtures(tb))
 }
 
-// OwnerExec runs one statement as the schema owner.
+// SuperuserExec runs one statement as the bootstrap superuser.
 //
-// For the fixture changes the policies deliberately forbid a tenant-scoped
-// connection from making — revoking a membership, for instance, which is how
-// the realtime suite tests what happens to a live WebSocket when one goes away.
-func (db *DB) OwnerExec(tb testing.TB, sql string, args ...any) {
+// For the fixture changes every other identity is deliberately forbidden from
+// making — revoking a membership, for instance, which is how the realtime suite
+// tests what happens to a live WebSocket when one goes away. Since issue #14
+// that includes the schema owner: it is subject to FORCE ROW LEVEL SECURITY, so
+// the same DELETE issued through [DB.SchemaOwnerPool] would silently affect
+// zero rows.
+func (db *DB) SuperuserExec(tb testing.TB, sql string, args ...any) {
 	tb.Helper()
 
 	if _, err := db.fixtures(tb).Exec(context.Background(), sql, args...); err != nil {
-		tb.Fatalf("pgtest: executing as %s (%s): %v", OwnerRole, sql, err)
+		tb.Fatalf("pgtest: executing as %s (%s): %v", SuperuserRole, sql, err)
 	}
 }
 
-// fixtures returns the harness-owned owner pool, opening it on first use. It is
-// closed by [DB.Close] rather than by a test's cleanup, because it outlives any
-// one test.
+// OwnerExec is the pre-#14 name for [DB.SuperuserExec], and a misnomer since.
+//
+// It was accurate when the container's bootstrap superuser was also the schema
+// owner. It is not any more — the schema owner is [SchemaOwnerRole] — and this
+// method has never meant that role. Kept only because internal/realtime spells
+// it this way and #45 is in flight over that package. Do not use it in new
+// code; it goes away once that lands.
+//
+// Not marked with a `Deprecated:` line on purpose: staticcheck would then fail
+// the lint run on a package this change is not allowed to touch, which would
+// hold this work hostage to another branch's merge order.
+func (db *DB) OwnerExec(tb testing.TB, sql string, args ...any) {
+	tb.Helper()
+
+	db.SuperuserExec(tb, sql, args...)
+}
+
+// fixtures returns the harness-owned superuser pool, opening it on first use.
+// It is closed by [DB.Close] rather than by a test's cleanup, because it
+// outlives any one test.
 func (db *DB) fixtures(tb testing.TB) *pgxpool.Pool {
 	tb.Helper()
 
-	if db == nil || db.OwnerDSN == "" {
+	if db == nil || db.SuperuserDSN == "" {
 		tb.Fatal("pgtest: harness was never started; TestMain did not run or failed")
 	}
 
 	db.fixtureOnce.Do(func() {
-		cfg, err := pgxpool.ParseConfig(db.OwnerDSN)
+		cfg, err := pgxpool.ParseConfig(db.SuperuserDSN)
 		if err != nil {
-			db.fixtureErr = fmt.Errorf("parsing the owner dsn: %w", err)
+			db.fixtureErr = fmt.Errorf("parsing the superuser dsn: %w", err)
 
 			return
 		}
@@ -283,12 +421,43 @@ func (db *DB) AppPool(tb testing.TB, maxConns int32) *pgxpool.Pool {
 	return db.openPool(tb, db.AppDSN, maxConns)
 }
 
-// OwnerPool opens a pool as the schema owner, for seeding and for reading the
-// catalog. Nothing under test should run through it.
+// SuperuserPool opens a pool as the bootstrap superuser, for seeding fixtures
+// and for reading the catalog. Nothing under test should run through it: RLS is
+// not enforced against a superuser, so an assertion made here passes whether
+// the policies work or not.
+func (db *DB) SuperuserPool(tb testing.TB, maxConns int32) *pgxpool.Pool {
+	tb.Helper()
+
+	return db.openPool(tb, db.SuperuserDSN, maxConns)
+}
+
+// SchemaOwnerPool opens a pool as collabboard_owner, the non-superuser that
+// owns every table and applied the migrations.
+//
+// Unlike [DB.SuperuserPool] this identity is worth asserting against: FORCE ROW
+// LEVEL SECURITY applies to it, so "the owner with no tenant context sees
+// nothing" is a real claim about the schema rather than a property of the
+// connection string. It is the identity a bug that pointed the API at the
+// migration credentials would use, which is why the suite checks what it can
+// and cannot see.
+func (db *DB) SchemaOwnerPool(tb testing.TB, maxConns int32) *pgxpool.Pool {
+	tb.Helper()
+
+	return db.openPool(tb, db.SchemaOwnerDSN, maxConns)
+}
+
+// OwnerPool is the pre-#14 name for [DB.SuperuserPool], and a misnomer since.
+//
+// It was accurate when the container's bootstrap superuser was also the schema
+// owner. Since issue #14 those are different roles, and this method has never
+// returned the schema owner's — [DB.SchemaOwnerPool] does. Kept only because
+// internal/api spells it this way and #45 is in flight over that package. Do
+// not use it in new code; it goes away once that lands. See [DB.OwnerExec] for
+// why it carries no `Deprecated:` marker.
 func (db *DB) OwnerPool(tb testing.TB, maxConns int32) *pgxpool.Pool {
 	tb.Helper()
 
-	return db.openPool(tb, db.OwnerDSN, maxConns)
+	return db.SuperuserPool(tb, maxConns)
 }
 
 func (db *DB) openPool(tb testing.TB, dsn string, maxConns int32) *pgxpool.Pool {
@@ -329,30 +498,6 @@ func (db *DB) openPool(tb testing.TB, dsn string, maxConns int32) *pgxpool.Pool 
 // error that caused the abort, so a bring-up failure never leaks a container.
 func (db *DB) abort(cause error) error {
 	return errors.Join(cause, db.Close())
-}
-
-func setAppRolePassword(ctx context.Context, ownerDSN, password string) error {
-	conn, err := pgx.Connect(ctx, ownerDSN)
-	if err != nil {
-		return fmt.Errorf("connecting as %s to set the app role password: %w", OwnerRole, err)
-	}
-
-	defer func() { _ = conn.Close(ctx) }()
-
-	for _, setting := range []struct{ name, value string }{
-		{"pgtest.app_role", AppRole},
-		{"pgtest.app_password", password},
-	} {
-		if _, err := conn.Exec(ctx, `SELECT set_config($1, $2, false)`, setting.name, setting.value); err != nil {
-			return fmt.Errorf("setting %s: %w", setting.name, err)
-		}
-	}
-
-	if _, err := conn.Exec(ctx, alterAppRoleLoginSQL); err != nil {
-		return fmt.Errorf("setting the %s password: %w", AppRole, err)
-	}
-
-	return nil
 }
 
 // withCredentials swaps the user and password of a DSN, keeping the host, port

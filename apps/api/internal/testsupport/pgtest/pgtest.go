@@ -1,6 +1,7 @@
 // Package pgtest is the integration-test harness: a throwaway Postgres in a
-// container, migrated with the real migrations, and reachable under both of the
-// database identities the isolation model depends on.
+// container, provisioned and migrated the way a deploy provisions and migrates,
+// and reachable under each of the database identities the isolation model
+// depends on.
 //
 // # Why a container rather than the compose stack
 //
@@ -13,18 +14,27 @@
 // remembered to provision. A container per run is migrated from empty every
 // time, so the schema under test is exactly what is in migrations/.
 //
-// # Two identities, and why the app one is the whole point
+// # Three identities, and why picking the wrong one is the failure mode
 //
-// [DB.OwnerDSN] is the role that owns the schema. It runs migrations and seeds
-// fixtures, and it is the *wrong* identity to test with: row-level security is
-// bypassed by superusers, by BYPASSRLS roles and — without FORCE — by the table
-// owner. A suite that connects as the owner passes every isolation assertion
-// while proving nothing.
+// [DB.SuperuserDSN] is the cluster's bootstrap superuser. It exists to do the
+// two things nothing else can: create the schema owner, and seed fixtures. It
+// is the *wrong* identity to test with — row-level security is not enforced
+// against a superuser at all — so nothing under test runs through it and no
+// assertion is made through it.
 //
-// [DB.AppDSN] is collabboard_app, the role the API actually serves with. That
-// is the only identity the policies apply to, so it is the only identity worth
-// asserting against. See docs/adr/0001-tenant-isolation.md, and
-// store/identity_test.go, which asserts the distinction in-test rather than
+// [DB.SchemaOwnerDSN] is collabboard_owner: a non-superuser with no BYPASSRLS
+// that owns every table and applies the migrations. Before issue #14 this role
+// did not exist and migrations ran as the superuser, which meant the whole
+// migration chain had quietly come to depend on privileges no correctly
+// provisioned owner has. It is also the identity FORCE ROW LEVEL SECURITY
+// exists for, so it is worth asserting against: with no tenant context it must
+// see nothing.
+//
+// [DB.AppDSN] is collabboard_app, the role the API actually serves with. It is
+// the identity almost every test should use, because it is the one a request
+// runs under. See docs/adr/0001-tenant-isolation.md and
+// docs/adr/0006-database-role-provisioning.md, and store/identity_test.go and
+// store/provisioning_test.go, which assert the distinctions in-test rather than
 // trusting this comment.
 //
 // # Build tag

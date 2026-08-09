@@ -43,8 +43,8 @@ const uniqueViolation = "23505"
 func TestLoginByEmailWorksWithoutATenant(t *testing.T) {
 	ctx := context.Background()
 	pool := newPool(t, 2)
-	owner := newOwnerPool(t)
-	a, _, _ := seedTenants(t, owner)
+	superuser := newSuperuserPool(t)
+	a, _, _ := seedTenants(t, superuser)
 	s := store.New(pool)
 
 	var directlyVisible int
@@ -80,8 +80,8 @@ func TestLoginByEmailWorksWithoutATenant(t *testing.T) {
 // signup and the query would not find the existing row.
 func TestLoginByEmailIsCaseInsensitive(t *testing.T) {
 	ctx := context.Background()
-	owner := newOwnerPool(t)
-	a, _, _ := seedTenants(t, owner)
+	superuser := newSuperuserPool(t)
+	a, _, _ := seedTenants(t, superuser)
 	s := store.New(newPool(t, 2))
 
 	for _, spelling := range []string{
@@ -134,8 +134,8 @@ func TestLoginByEmailReportsAnUnknownAddressAsNoRow(t *testing.T) {
 // pre-tenant path.
 func TestListUserOrganizationsSpansTenants(t *testing.T) {
 	ctx := context.Background()
-	owner := newOwnerPool(t)
-	fixture := seedFixture(t, owner)
+	superuser := newSuperuserPool(t)
+	fixture := seedFixture(t, superuser)
 	s := store.New(newPool(t, 2))
 
 	orgs, err := store.WithoutTenantValue(ctx, s, store.ReasonListOrganizations,
@@ -188,8 +188,8 @@ func TestListUserOrganizationsSpansTenants(t *testing.T) {
 // resolving the address is pre-tenant, and creating the membership is not.
 func TestInvitingAnExistingUserFromAnotherOrganization(t *testing.T) {
 	ctx := context.Background()
-	owner := newOwnerPool(t)
-	a, b, _ := seedTenants(t, owner)
+	superuser := newSuperuserPool(t)
+	a, b, _ := seedTenants(t, superuser)
 	s := store.New(newPool(t, 3))
 
 	// Before: b's member is invisible to a, which is what makes the invite hard
@@ -262,8 +262,8 @@ func TestInvitingAnExistingUserFromAnotherOrganization(t *testing.T) {
 // generated signature this test reads.
 func TestResolveUserIDDiscloseNothingButTheID(t *testing.T) {
 	ctx := context.Background()
-	owner := newOwnerPool(t)
-	_, b, _ := seedTenants(t, owner)
+	superuser := newSuperuserPool(t)
+	_, b, _ := seedTenants(t, superuser)
 	s := store.New(newPool(t, 1))
 
 	id, err := store.WithoutTenantValue(ctx, s, store.ReasonInviteLookup,
@@ -306,8 +306,8 @@ func TestResolveUserIDReportsAnUnregisteredAddressAsNoRow(t *testing.T) {
 // that the tenant-scoped door cannot do the same thing.
 func TestCreatingAUserIsOnlyPossibleThroughThePreTenantPath(t *testing.T) {
 	ctx := context.Background()
-	owner := newOwnerPool(t)
-	a, _, _ := seedTenants(t, owner)
+	superuser := newSuperuserPool(t)
+	a, _, _ := seedTenants(t, superuser)
 	tenantPool := newPool(t, 2)
 	s := store.New(tenantPool)
 
@@ -322,7 +322,7 @@ func TestCreatingAUserIsOnlyPossibleThroughThePreTenantPath(t *testing.T) {
 	}
 
 	t.Cleanup(func() {
-		if _, derr := owner.Exec(context.Background(), `DELETE FROM users WHERE id = $1`, created.ID); derr != nil {
+		if _, derr := superuser.Exec(context.Background(), `DELETE FROM users WHERE id = $1`, created.ID); derr != nil {
 			t.Errorf("cleaning up the registered user: %v", derr)
 		}
 	})
@@ -365,8 +365,8 @@ func TestCreatingAUserIsOnlyPossibleThroughThePreTenantPath(t *testing.T) {
 // skipped the resolve step would silently hand back somebody else's row.
 func TestRegisteringADuplicateAddressIsRejected(t *testing.T) {
 	ctx := context.Background()
-	owner := newOwnerPool(t)
-	a, _, _ := seedTenants(t, owner)
+	superuser := newSuperuserPool(t)
+	a, _, _ := seedTenants(t, superuser)
 	s := store.New(newPool(t, 1))
 
 	_, err := store.WithoutTenantValue(ctx, s, store.ReasonRegisterUser,
@@ -401,8 +401,8 @@ func TestRegisteringADuplicateAddressIsRejected(t *testing.T) {
 func TestWithoutTenantRunsWithNoTenantContextAndLeavesNone(t *testing.T) {
 	ctx := context.Background()
 	pool := newPool(t, 1)
-	owner := newOwnerPool(t)
-	a, _, _ := seedTenants(t, owner)
+	superuser := newSuperuserPool(t)
+	a, _, _ := seedTenants(t, superuser)
 	s := store.New(pool)
 
 	// Deliberately dirty the connection first: a committed tenant transaction
@@ -489,7 +489,7 @@ func TestWithoutTenantRefusesTheZeroReason(t *testing.T) {
 // user was created anyway" is a state a signup flow could get stuck in.
 func TestWithoutTenantRollsBackOnCallbackError(t *testing.T) {
 	ctx := context.Background()
-	owner := newOwnerPool(t)
+	superuser := newSuperuserPool(t)
 	s := store.New(newPool(t, 2))
 
 	email := "rolled-back-" + uuid.NewString()[:8] + "@example.com"
@@ -508,11 +508,11 @@ func TestWithoutTenantRollsBackOnCallbackError(t *testing.T) {
 		t.Fatalf("WithoutTenant error = %v, want %v", err, errBoom)
 	}
 
-	// Asked through the owner pool, which is subject to no policy at all — so a
+	// Asked through the superuser pool, which is subject to no policy at all — so a
 	// surviving row would be found here even though the app role could not see
 	// it.
 	var survived int
-	if serr := owner.QueryRow(ctx, `SELECT count(*) FROM users WHERE email = $1`, email).Scan(&survived); serr != nil {
+	if serr := superuser.QueryRow(ctx, `SELECT count(*) FROM users WHERE email = $1`, email).Scan(&survived); serr != nil {
 		t.Fatalf("counting the rolled-back user: %v", serr)
 	}
 
