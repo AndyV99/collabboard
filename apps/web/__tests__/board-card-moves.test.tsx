@@ -631,6 +631,22 @@ describe("saying where the card went", () => {
     expect(announced()).toMatch(/Move cancelled\. Kilo is back in Doing, 1 of 3\./);
   });
 
+  it("says so when a card is lifted and dropped without being moved", () => {
+    // For someone who cannot see the card, an unremarked drop is
+    // indistinguishable from a key that did nothing — and the next arrow press
+    // would be aimed at a card they no longer hold.
+    const fetchStub = respond(200);
+
+    vi.stubGlobal("fetch", fetchStub);
+    renderBoard();
+
+    lift("Kilo");
+    press("Kilo", "Enter");
+
+    expect(announced()).toMatch(/Kilo was not moved\. Doing, 2 of 3\./);
+    expect(fetchStub).not.toHaveBeenCalled();
+  });
+
   it("repeats itself audibly when the answer is the same twice", () => {
     // A live region whose text has not changed is not re-announced, so two
     // presses that both hit the top of a column would be one announcement and

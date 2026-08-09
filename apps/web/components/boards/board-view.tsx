@@ -302,11 +302,20 @@ export function BoardView({
 
   function handleKeyboardDrop(): void {
     const held = proposal;
+    const card = lifted;
 
     setLifted(null);
     setProposal(null);
 
     if (held === null) {
+      // Lifted and dropped without moving. Saying so matters more here than
+      // anywhere else on this screen: for someone who cannot see the card, an
+      // unremarked drop is indistinguishable from a key that did nothing, and
+      // the next arrow press would be aimed at a card they no longer hold.
+      if (card !== null) {
+        say(`${titleOf(card)} was not moved. ${whereIs(shown, card)}`);
+      }
+
       return;
     }
 
