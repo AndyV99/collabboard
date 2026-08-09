@@ -93,6 +93,12 @@ type crudStore struct {
 	mu      sync.Mutex
 	opened  []uuid.UUID
 	objects map[uuid.UUID]*tenantObjects
+
+	// failCommit models a transaction whose statements all succeeded and whose
+	// COMMIT then did not — the case that matters for #45, because it is the
+	// only one where a handler could plausibly have already decided the write
+	// happened. See TestARolledBackWriteBroadcastsNothing.
+	failCommit error
 }
 
 func newCRUDStore() *crudStore {
@@ -112,9 +118,25 @@ func (s *crudStore) seed(tenantID uuid.UUID, marker string) *tenantObjects {
 func (s *crudStore) WithTenant(ctx context.Context, tenantID uuid.UUID, fn store.TenantFunc) error {
 	s.mu.Lock()
 	s.opened = append(s.opened, tenantID)
+	failCommit := s.failCommit
 	s.mu.Unlock()
 
-	return fn(ctx, crudQuerier{store: s, tenantID: tenantID})
+	if err := fn(ctx, crudQuerier{store: s, tenantID: tenantID}); err != nil {
+		return err
+	}
+
+	// The commit, modelled: the callback returned nil and the transaction still
+	// did not survive. Store.WithTenant reports exactly this, and nothing the
+	// callback did is durable afterwards.
+	return failCommit
+}
+
+// breakCommit makes every subsequent transaction fail at commit time.
+func (s *crudStore) breakCommit(err error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	s.failCommit = err
 }
 
 func (s *crudStore) openedTenants() []uuid.UUID {
@@ -294,13 +316,12 @@ func (q crudQuerier) MoveColumn(_ context.Context, arg store.MoveColumnParams) (
 	}, nil
 }
 
-func (q crudQuerier) DeleteColumn(_ context.Context, id uuid.UUID) (int64, error) {
-	own, ok := q.own()
-	if !ok || own.column.ID != id {
-		return 0, nil
-	}
-
-	return 1, nil
+// DeleteColumn returns the row it would have removed, which is how the real
+// DELETE ... RETURNING tells the caller both that the id named something visible
+// and which board to announce it on. ErrNoRows for another tenant's column, and
+// — as everywhere in this fake — nothing is actually removed.
+func (q crudQuerier) DeleteColumn(_ context.Context, id uuid.UUID) (store.Column, error) {
+	return q.column(id)
 }
 
 func (q crudQuerier) CreateCard(_ context.Context, arg store.CreateCardParams) (store.Card, error) {
@@ -374,13 +395,9 @@ func (q crudQuerier) MoveCard(_ context.Context, arg store.MoveCardParams) (stor
 	}, nil
 }
 
-func (q crudQuerier) DeleteCard(_ context.Context, id uuid.UUID) (int64, error) {
-	own, ok := q.own()
-	if !ok || own.card.ID != id {
-		return 0, nil
-	}
-
-	return 1, nil
+// DeleteCard returns the deleted row, for the same reason DeleteColumn does.
+func (q crudQuerier) DeleteCard(_ context.Context, id uuid.UUID) (store.Card, error) {
+	return q.cardByID(id)
 }
 
 func (q crudQuerier) RebalanceBoardColumns(context.Context, uuid.UUID) error {
@@ -391,15 +408,24 @@ func (q crudQuerier) RebalanceColumnCards(context.Context, uuid.UUID) error {
 	return nil
 }
 
-// boardFixture is a router, a two-tenant dataset, and alice's token.
+// boardFixture is a router, a two-tenant dataset, alice's token, and everything
+// the router broadcast while the test ran.
+//
+// The publisher is part of the fixture rather than a separate harness because
+// the realtime fan-out is a *second* way a board id crosses the tenant boundary
+// (#45): a handler that answered 404 correctly and still addressed an event to
+// the other organization's room would pass every assertion this file had before
+// the publisher existed.
 type boardFixture struct {
 	router *gin.Engine
 	store  *crudStore
+	events *recordingPublisher
 	issuer *auth.Issuer
 	token  string
 
 	tenantA uuid.UUID
 	tenantB uuid.UUID
+	aliceID uuid.UUID
 	alice   *tenantObjects
 	bob     *tenantObjects
 }
@@ -414,16 +440,19 @@ func newBoardFixture(t *testing.T) *boardFixture {
 	aliceID := uuid.New()
 
 	tenantStore := newCRUDStore()
+	publisher := &recordingPublisher{}
 
 	f := &boardFixture{
 		router: NewRouter(discardLogger(),
 			HealthDeps{Postgres: stubPinger{}, Redis: stubPinger{}},
 			AuthDeps{Service: &membershipService{issuer: issuer}, Verifier: issuer, Store: tenantStore},
-			RealtimeDeps{}),
+			RealtimeDeps{Publisher: publisher}),
 		store:   tenantStore,
+		events:  publisher,
 		issuer:  issuer,
 		tenantA: tenantA,
 		tenantB: tenantB,
+		aliceID: aliceID,
 		alice:   tenantStore.seed(tenantA, "alpha"),
 		bob:     tenantStore.seed(tenantB, "beta"),
 	}
@@ -458,6 +487,13 @@ type boardCall struct {
 
 	// selfStatus is what the control must answer.
 	selfStatus int
+
+	// publishes is whether a successful call broadcasts. Stated per route
+	// rather than inferred from the method, because it is a decision — see
+	// events.go — and because "this write published nothing" has to be a
+	// failure somewhere, or the cross-tenant assertion below would also pass
+	// against a router that never published at all.
+	publishes bool
 }
 
 // boardCalls is every route mountBoardRoutes mounts that takes an object id.
@@ -504,17 +540,20 @@ func boardCalls() []boardCall {
 			ids:        func(o *tenantObjects) []any { return []any{o.board.ID} },
 			body:       func(*tenantObjects) any { return map[string]string{"name": "renamed by alice"} },
 			selfStatus: http.StatusOK,
+			publishes:  true,
 		},
 		{
 			name: "DELETE /boards/:id", method: http.MethodDelete, path: "/api/v1/boards/%s",
 			ids:        func(o *tenantObjects) []any { return []any{o.board.ID} },
 			selfStatus: http.StatusNoContent,
+			publishes:  true,
 		},
 		{
 			name: "POST /boards/:id/columns", method: http.MethodPost, path: "/api/v1/boards/%s/columns",
 			ids:        func(o *tenantObjects) []any { return []any{o.board.ID} },
 			body:       func(*tenantObjects) any { return map[string]string{"name": "column by alice"} },
 			selfStatus: http.StatusCreated,
+			publishes:  true,
 		},
 		{
 			name: "GET /boards/:id/columns", method: http.MethodGet, path: "/api/v1/boards/%s/columns",
@@ -531,23 +570,27 @@ func boardCalls() []boardCall {
 			ids:        func(o *tenantObjects) []any { return []any{o.column.ID} },
 			body:       func(*tenantObjects) any { return map[string]string{"name": "renamed by alice"} },
 			selfStatus: http.StatusOK,
+			publishes:  true,
 		},
 		{
 			name: "POST /columns/:id/move", method: http.MethodPost, path: "/api/v1/columns/%s/move",
 			ids:        func(o *tenantObjects) []any { return []any{o.column.ID} },
 			body:       func(*tenantObjects) any { return map[string]any{"after_column_id": nil} },
 			selfStatus: http.StatusOK,
+			publishes:  true,
 		},
 		{
 			name: "DELETE /columns/:id", method: http.MethodDelete, path: "/api/v1/columns/%s",
 			ids:        func(o *tenantObjects) []any { return []any{o.column.ID} },
 			selfStatus: http.StatusNoContent,
+			publishes:  true,
 		},
 		{
 			name: "POST /columns/:id/cards", method: http.MethodPost, path: "/api/v1/columns/%s/cards",
 			ids:        func(o *tenantObjects) []any { return []any{o.column.ID} },
 			body:       func(*tenantObjects) any { return map[string]string{"title": "card by alice"} },
 			selfStatus: http.StatusCreated,
+			publishes:  true,
 		},
 		{
 			name: "GET /columns/:id/cards", method: http.MethodGet, path: "/api/v1/columns/%s/cards",
@@ -564,6 +607,7 @@ func boardCalls() []boardCall {
 			ids:        func(o *tenantObjects) []any { return []any{o.card.ID} },
 			body:       func(*tenantObjects) any { return map[string]string{"title": "retitled by alice"} },
 			selfStatus: http.StatusOK,
+			publishes:  true,
 		},
 		{
 			// The move is the interesting one: it names two objects, so the
@@ -575,11 +619,13 @@ func boardCalls() []boardCall {
 				return map[string]any{"column_id": o.column.ID.String(), "after_card_id": nil}
 			},
 			selfStatus: http.StatusOK,
+			publishes:  true,
 		},
 		{
 			name: "DELETE /cards/:id", method: http.MethodDelete, path: "/api/v1/cards/%s",
 			ids:        func(o *tenantObjects) []any { return []any{o.card.ID} },
 			selfStatus: http.StatusNoContent,
+			publishes:  true,
 		},
 	}
 }
@@ -611,6 +657,27 @@ func TestBoardSurfaceControlWorks(t *testing.T) {
 			if rec.Code != http.StatusNoContent && !bytes.Contains(rec.Body.Bytes(), []byte("alpha")) {
 				t.Errorf("a successful response carried none of alice's data: %s", rec.Body.String())
 			}
+
+			// The control for the fan-out half. It has to assert a *count*:
+			// "no event crossed the boundary" in the next test would hold just
+			// as well against a router that published nothing at all, so the
+			// thing that rules that out is this — a write that should broadcast
+			// broadcasts exactly once, into alice's own room.
+			published := f.events.published()
+
+			for _, event := range published {
+				t.Logf("published %s to tenant %s / board %s", event.Type, event.TenantID, event.BoardID)
+			}
+
+			if call.publishes && len(published) != 1 {
+				t.Errorf("published %d events, want exactly 1: %+v", len(published), published)
+			}
+
+			if !call.publishes && len(published) != 0 {
+				t.Errorf("published %+v; this route is one of the ones that deliberately does not", published)
+			}
+
+			f.assertNoEventLeaked(t, 0)
 		})
 	}
 }
@@ -642,6 +709,16 @@ func TestAnAuthenticatedUserCannotReachAnotherTenantsBoardObjects(t *testing.T) 
 			if rec.Code >= 200 && rec.Code < 300 && call.method != http.MethodGet {
 				t.Errorf("a write against another tenant's object answered %d, want a refusal", rec.Code)
 			}
+
+			// The fan-out half of the same claim. A refused write must announce
+			// nothing at all — not into bob's room, which would be the leak, and
+			// not into alice's either, which would tell her board that something
+			// happened to it when nothing did.
+			if published := f.events.published(); len(published) != 0 {
+				t.Errorf("a refused cross-tenant write published %d event(s): %+v", len(published), published)
+			}
+
+			f.assertNoEventLeaked(t, 0)
 		})
 	}
 }
@@ -685,6 +762,10 @@ func TestMovingOwnCardIntoAnotherTenantsColumnIsRefused(t *testing.T) {
 
 	f.assertNoBobData(t, rec.Body.Bytes())
 	f.assertOnlyAliceOpened(t, before)
+
+	if published := f.events.published(); len(published) != 0 {
+		t.Errorf("a refused move published %d event(s): %+v", len(published), published)
+	}
 }
 
 // TestTenantCannotBeOverriddenOnTheBoardSurface repeats auth_bola_test.go's
@@ -802,6 +883,40 @@ func (f *boardFixture) assertNoBobData(t *testing.T, body []byte) {
 		if bytes.Contains(body, []byte(secret.value)) {
 			t.Errorf("BOLA: the response contains %s (%s)\n%s", secret.what, secret.value, body)
 		}
+	}
+}
+
+// assertNoEventLeaked checks every event published since index `from` against
+// the tenant boundary and the board boundary.
+//
+// Three separate claims, because they fail separately: the room's tenant half is
+// alice's, the room's board half is a board of alice's, and nothing in the
+// rendered payload is bob's. The third is the one that catches a handler that
+// addressed the room correctly and put another organization's row inside it.
+func (f *boardFixture) assertNoEventLeaked(t *testing.T, from int) {
+	t.Helper()
+
+	for _, event := range f.events.publishedFrom(from) {
+		if event.TenantID != f.tenantA {
+			t.Errorf("an event was addressed to tenant %s while authenticated as a member of %s only",
+				event.TenantID, f.tenantA)
+		}
+
+		if event.ActorID != f.aliceID {
+			t.Errorf("an event names actor %s, want alice (%s)", event.ActorID, f.aliceID)
+		}
+
+		if event.BoardID != f.alice.board.ID {
+			t.Errorf("an event was addressed to board %s, which is not alice's board %s",
+				event.BoardID, f.alice.board.ID)
+		}
+
+		encoded, err := json.Marshal(event.Payload)
+		if err != nil {
+			t.Fatalf("encoding a published payload: %v", err)
+		}
+
+		f.assertNoBobData(t, encoded)
 	}
 }
 

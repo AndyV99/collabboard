@@ -132,8 +132,11 @@ func runServe(logger *slog.Logger, cfg config.Config) error {
 		Postgres: pgxPinger{pool: pool},
 		Redis:    redisPinger{client: redisClient},
 	}, authDeps, api.RealtimeDeps{
-		Connect:      hub.ConnectHandler(),
-		PublishEvent: hub.PublishHandler(),
+		Connect: hub.ConnectHandler(),
+		// The write path's broadcaster. Every card and column write publishes
+		// through this after its transaction commits — see
+		// internal/api/events.go and docs/adr/0005-realtime-event-delivery.md.
+		Publisher: hub.EventPublisher(),
 	})
 
 	server := &http.Server{

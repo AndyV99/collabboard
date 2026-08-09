@@ -65,7 +65,18 @@ func NewRouter(logger *slog.Logger, deps HealthDeps, authDeps AuthDeps, realtime
 	if authDeps.Store != nil {
 		authenticated.GET("/members", membersHandler(logger, authDeps.Store))
 
-		mountBoardRoutes(authenticated, logger, authDeps.Store)
+		// A board surface with no publisher commits writes that nobody is told
+		// about, and does it silently. That is the correct configuration for a
+		// router built without realtime — several tests, and nothing else — and
+		// a wiring bug anywhere it is not, so it says so once at startup rather
+		// than being discovered as "the board stopped updating".
+		if realtimeDeps.Publisher == nil {
+			logger.Warn("board routes mounted without a realtime publisher; writes will not be broadcast",
+				slog.String("event", "realtime.publisher.absent"),
+			)
+		}
+
+		mountBoardRoutes(authenticated, logger, authDeps.Store, realtimeDeps.Publisher)
 	}
 
 	// The WebSocket upgrade is authenticated by the *same* requireAuth as every
@@ -74,14 +85,6 @@ func NewRouter(logger *slog.Logger, deps HealthDeps, authDeps AuthDeps, realtime
 	// needs it and why it is not a second credential.
 	if realtimeDeps.Connect != nil {
 		v1.GET("/ws", websocketBearer(), requireAuth(logger, authDeps.Verifier), realtimeDeps.Connect)
-	}
-
-	// A board id in the path, which is fine and is not the thing
-	// auth_bola_test.go forbids: boards are objects inside a tenant, and this
-	// one is authorized against the caller's own tenant before anything
-	// happens. An *organization* in the path is what remains impossible.
-	if realtimeDeps.PublishEvent != nil {
-		authenticated.POST("/boards/:board_id/events", realtimeDeps.PublishEvent)
 	}
 
 	return router
@@ -94,6 +97,14 @@ func NewRouter(logger *slog.Logger, deps HealthDeps, authDeps AuthDeps, realtime
 // authorization path: an object id in the path is resolved inside the caller's
 // own tenant context and matches nothing when it belongs elsewhere. See crud.go.
 //
+// The write handlers additionally take the realtime publisher, and every one of
+// them broadcasts *after* its transaction commits. Which writes announce
+// themselves is a decision, not a default: everything whose effect is visible to
+// someone already looking at the board does — cards and columns in full, board
+// rename and delete — and everything else does not, because a realtime room is a
+// board and there is no room to publish a project change or a board creation to.
+// See events.go.
+//
 // The shape is deliberately flat rather than fully nested. A card lives at
 // /cards/:card_id, not /projects/:p/boards/:b/columns/:c/cards/:id, because the
 // longer form invites a handler to trust the ancestors in the path — and a
@@ -101,7 +112,12 @@ func NewRouter(logger *slog.Logger, deps HealthDeps, authDeps AuthDeps, realtime
 // another. One id, resolved against the token's tenant, has no such seam. The
 // nested forms that do exist are creates and lists, where the parent is the
 // collection being addressed rather than a claim about the child.
-func mountBoardRoutes(authenticated *gin.RouterGroup, logger *slog.Logger, tenantStore TenantStore) {
+func mountBoardRoutes(
+	authenticated *gin.RouterGroup,
+	logger *slog.Logger,
+	tenantStore TenantStore,
+	publisher EventPublisher,
+) {
 	authenticated.POST("/projects", createProjectHandler(logger, tenantStore))
 	authenticated.GET("/projects", listProjectsHandler(logger, tenantStore))
 	authenticated.GET("/projects/:project_id", getProjectHandler(logger, tenantStore))
@@ -111,24 +127,24 @@ func mountBoardRoutes(authenticated *gin.RouterGroup, logger *slog.Logger, tenan
 	authenticated.POST("/projects/:project_id/boards", createBoardHandler(logger, tenantStore))
 	authenticated.GET("/projects/:project_id/boards", listBoardsHandler(logger, tenantStore))
 	authenticated.GET("/boards/:board_id", getBoardHandler(logger, tenantStore))
-	authenticated.PATCH("/boards/:board_id", patchBoardHandler(logger, tenantStore))
-	authenticated.DELETE("/boards/:board_id", deleteBoardHandler(logger, tenantStore))
+	authenticated.PATCH("/boards/:board_id", patchBoardHandler(logger, tenantStore, publisher))
+	authenticated.DELETE("/boards/:board_id", deleteBoardHandler(logger, tenantStore, publisher))
 
-	authenticated.POST("/boards/:board_id/columns", createColumnHandler(logger, tenantStore))
+	authenticated.POST("/boards/:board_id/columns", createColumnHandler(logger, tenantStore, publisher))
 	authenticated.GET("/boards/:board_id/columns", listColumnsHandler(logger, tenantStore))
-	authenticated.PATCH("/columns/:column_id", patchColumnHandler(logger, tenantStore))
-	authenticated.POST("/columns/:column_id/move", moveColumnHandler(logger, tenantStore))
-	authenticated.DELETE("/columns/:column_id", deleteColumnHandler(logger, tenantStore))
+	authenticated.PATCH("/columns/:column_id", patchColumnHandler(logger, tenantStore, publisher))
+	authenticated.POST("/columns/:column_id/move", moveColumnHandler(logger, tenantStore, publisher))
+	authenticated.DELETE("/columns/:column_id", deleteColumnHandler(logger, tenantStore, publisher))
 
-	authenticated.POST("/columns/:column_id/cards", createCardHandler(logger, tenantStore))
+	authenticated.POST("/columns/:column_id/cards", createCardHandler(logger, tenantStore, publisher))
 	authenticated.GET("/columns/:column_id/cards", listCardsByColumnHandler(logger, tenantStore))
 	authenticated.GET("/boards/:board_id/cards", listCardsByBoardHandler(logger, tenantStore))
 	authenticated.GET("/cards/:card_id", getCardHandler(logger, tenantStore))
-	authenticated.PATCH("/cards/:card_id", patchCardHandler(logger, tenantStore))
+	authenticated.PATCH("/cards/:card_id", patchCardHandler(logger, tenantStore, publisher))
 
 	// A move is a POST rather than a PATCH on the card: it is not a partial
 	// update of the card's fields, it is an operation whose arguments (the
 	// target column and the anchor) are not properties of the card at all.
-	authenticated.POST("/cards/:card_id/move", moveCardHandler(logger, tenantStore))
-	authenticated.DELETE("/cards/:card_id", deleteCardHandler(logger, tenantStore))
+	authenticated.POST("/cards/:card_id/move", moveCardHandler(logger, tenantStore, publisher))
+	authenticated.DELETE("/cards/:card_id", deleteCardHandler(logger, tenantStore, publisher))
 }

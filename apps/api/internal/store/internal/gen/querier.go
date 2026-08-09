@@ -57,8 +57,16 @@ type Querier interface {
 	// rather than :exec because "0 rows" is the only way this can report that the id
 	// named no board the caller can see.
 	DeleteBoard(ctx context.Context, boardID uuid.UUID) (int64, error)
-	DeleteCard(ctx context.Context, cardID uuid.UUID) (int64, error)
-	DeleteColumn(ctx context.Context, columnID uuid.UUID) (int64, error)
+	// RETURNING for the same reason as DeleteColumn: after this statement the card's
+	// board and column ids exist nowhere else, and both are needed to tell the
+	// board's other clients which card left which column.
+	DeleteCard(ctx context.Context, cardID uuid.UUID) (Card, error)
+	// RETURNING rather than a row count, because the deleted row is the only place
+	// the column's board id still exists once the statement has run — and #45 needs
+	// it to address the event that tells every other client the column is gone.
+	// "No row" and "not this tenant's" remain the same answer, which is what the
+	// 404 in internal/api/columns.go is built on.
+	DeleteColumn(ctx context.Context, columnID uuid.UUID) (Column, error)
 	// Returns no row rather than another tenant's board when the id belongs to
 	// someone else, which is the behaviour the isolation model is chosen for.
 	GetBoard(ctx context.Context, boardID uuid.UUID) (Board, error)

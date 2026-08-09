@@ -80,7 +80,7 @@ func newCardBody(card store.Card) cardBody {
 //
 // LockColumn is the 404 for a column this tenant cannot see *and* the serialiser
 // for the "one past the current maximum" read inside CreateCard.
-func createCardHandler(logger *slog.Logger, tenantStore TenantStore) gin.HandlerFunc {
+func createCardHandler(logger *slog.Logger, tenantStore TenantStore, publisher EventPublisher) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		columnID, ok := pathUUID(c, "column_id")
 		if !ok {
@@ -102,7 +102,7 @@ func createCardHandler(logger *slog.Logger, tenantStore TenantStore) gin.Handler
 			return
 		}
 
-		card, ok := tenantScoped(c, logger, tenantStore, "card.create.failed",
+		card, ok := tenantScopedPublish(c, logger, tenantStore, publisher, "card.create.failed",
 			func(ctx context.Context, q store.Querier) (store.Card, error) {
 				column, err := q.LockColumn(ctx, columnID)
 				if _, err := asNotFound(subjectColumn, column, err); err != nil {
@@ -116,6 +116,15 @@ func createCardHandler(logger *slog.Logger, tenantStore TenantStore) gin.Handler
 				})
 
 				return asNotFound(subjectColumn, card, err)
+			},
+			// Appended to the end of the column, which is why there is no anchor
+			// in the payload — see events.go.
+			func(card store.Card) BoardEvent {
+				return BoardEvent{
+					BoardID: card.BoardID,
+					Type:    eventCardCreated,
+					Payload: cardEventPayload{Card: newCardBody(card)},
+				}
 			})
 		if !ok {
 			return
@@ -186,7 +195,7 @@ func getCardHandler(logger *slog.Logger, tenantStore TenantStore) gin.HandlerFun
 	}
 }
 
-func patchCardHandler(logger *slog.Logger, tenantStore TenantStore) gin.HandlerFunc {
+func patchCardHandler(logger *slog.Logger, tenantStore TenantStore, publisher EventPublisher) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		cardID, ok := pathUUID(c, "card_id")
 		if !ok {
@@ -215,7 +224,7 @@ func patchCardHandler(logger *slog.Logger, tenantStore TenantStore) gin.HandlerF
 			return
 		}
 
-		card, ok := tenantScoped(c, logger, tenantStore, "card.update.failed",
+		card, ok := tenantScopedPublish(c, logger, tenantStore, publisher, "card.update.failed",
 			func(ctx context.Context, q store.Querier) (store.Card, error) {
 				card, err := q.UpdateCard(ctx, store.UpdateCardParams{
 					CardID:      cardID,
@@ -224,6 +233,16 @@ func patchCardHandler(logger *slog.Logger, tenantStore TenantStore) gin.HandlerF
 				})
 
 				return asNotFound(subjectCard, card, err)
+			},
+			// The whole card rather than the fields that changed: a PATCH that
+			// only set the title still produces a card body a client can replace
+			// wholesale, so there is no merge for a client to get wrong.
+			func(card store.Card) BoardEvent {
+				return BoardEvent{
+					BoardID: card.BoardID,
+					Type:    eventCardUpdated,
+					Payload: cardEventPayload{Card: newCardBody(card)},
+				}
 			})
 		if !ok {
 			return
@@ -239,7 +258,7 @@ func patchCardHandler(logger *slog.Logger, tenantStore TenantStore) gin.HandlerF
 // resolved inside the caller's own tenant context, so neither can name anything
 // belonging to another organization. Neither is checked against an owner: a
 // foreign column simply does not exist to this transaction.
-func moveCardHandler(logger *slog.Logger, tenantStore TenantStore) gin.HandlerFunc {
+func moveCardHandler(logger *slog.Logger, tenantStore TenantStore, publisher EventPublisher) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		cardID, ok := pathUUID(c, "card_id")
 		if !ok {
@@ -263,15 +282,33 @@ func moveCardHandler(logger *slog.Logger, tenantStore TenantStore) gin.HandlerFu
 			return
 		}
 
-		card, ok := tenantScoped(c, logger, tenantStore, "card.move.failed",
-			func(ctx context.Context, q store.Querier) (store.Card, error) {
+		moved, ok := tenantScopedPublish(c, logger, tenantStore, publisher, "card.move.failed",
+			func(ctx context.Context, q store.Querier) (movedCard, error) {
 				return moveCard(ctx, q, cardID, columnID, afterCardID)
+			},
+			// The anchor is echoed rather than re-derived. MoveCard placed the
+			// card strictly between it and the next sibling, so it was the
+			// card's predecessor when the rank was computed — see
+			// cardMovedPayload for why that is not the same as a promise about
+			// the present. A rebalance may have renumbered the column
+			// afterwards, which changes every rank and no order, and clients
+			// never see a rank, so it needs no event of its own.
+			func(moved movedCard) BoardEvent {
+				return BoardEvent{
+					BoardID: moved.card.BoardID,
+					Type:    eventCardMoved,
+					Payload: cardMovedPayload{
+						Card:         newCardBody(moved.card),
+						FromColumnID: moved.fromColumnID.String(),
+						AfterCardID:  optionalID(afterCardID),
+					},
+				}
 			})
 		if !ok {
 			return
 		}
 
-		c.JSON(http.StatusOK, gin.H{subjectCard: newCardBody(card)})
+		c.JSON(http.StatusOK, gin.H{subjectCard: newCardBody(moved.card)})
 	}
 }
 
@@ -289,26 +326,26 @@ func moveCardHandler(logger *slog.Logger, tenantStore TenantStore) gin.HandlerFu
 //
 // Only one lock is ever waited for while another is held, so there is no cycle
 // and no deadlock between two concurrent moves.
-func moveCard(ctx context.Context, q store.Querier, cardID, columnID uuid.UUID, afterCardID *uuid.UUID) (store.Card, error) {
+func moveCard(ctx context.Context, q store.Querier, cardID, columnID uuid.UUID, afterCardID *uuid.UUID) (movedCard, error) {
 	column, err := q.LockColumn(ctx, columnID)
 
 	target, err := asNotFound(subjectColumn, column, err)
 	if err != nil {
-		return store.Card{}, err
+		return movedCard{}, err
 	}
 
 	card, err := q.GetCard(ctx, cardID)
 
 	current, err := asNotFound(subjectCard, card, err)
 	if err != nil {
-		return store.Card{}, err
+		return movedCard{}, err
 	}
 
 	// Cards do not change board. The composite foreign key would reject it
 	// anyway; checking here is what turns that into a 409 with a sentence rather
 	// than a 500 with a constraint name in the log.
 	if current.BoardID != target.BoardID {
-		return store.Card{}, conflict("column_id names a column on a different board")
+		return movedCard{}, conflict("column_id names a column on a different board")
 	}
 
 	moved, err := q.MoveCard(ctx, store.MoveCardParams{
@@ -321,11 +358,11 @@ func moveCard(ctx context.Context, q store.Querier, cardID, columnID uuid.UUID, 
 		// The card exists, the column exists, and they share a board — so the
 		// only remaining reason for no row is the anchor. A client that dragged
 		// past a card someone else has just moved or deleted gets this.
-		return store.Card{}, conflict("after_card_id is not a card in that column")
+		return movedCard{}, conflict("after_card_id is not a card in that column")
 	}
 
 	if err != nil {
-		return store.Card{}, err
+		return movedCard{}, err
 	}
 
 	if moved.NeedsRebalance {
@@ -333,44 +370,68 @@ func moveCard(ctx context.Context, q store.Querier, cardID, columnID uuid.UUID, 
 		// writes every row in a column, and it must not run while another move
 		// is comparing against a rank it is about to rewrite.
 		if err := q.RebalanceColumnCards(ctx, columnID); err != nil {
-			return store.Card{}, err
+			return movedCard{}, err
 		}
 	}
 
-	return store.Card{
-		ID:          moved.ID,
-		TenantID:    moved.TenantID,
-		BoardID:     moved.BoardID,
-		ColumnID:    moved.ColumnID,
-		Title:       moved.Title,
-		Description: moved.Description,
-		Position:    moved.Position,
-		AssigneeID:  moved.AssigneeID,
-		DueAt:       moved.DueAt,
-		CreatedAt:   moved.CreatedAt,
-		UpdatedAt:   moved.UpdatedAt,
+	return movedCard{
+		card: store.Card{
+			ID:          moved.ID,
+			TenantID:    moved.TenantID,
+			BoardID:     moved.BoardID,
+			ColumnID:    moved.ColumnID,
+			Title:       moved.Title,
+			Description: moved.Description,
+			Position:    moved.Position,
+			AssigneeID:  moved.AssigneeID,
+			DueAt:       moved.DueAt,
+			CreatedAt:   moved.CreatedAt,
+			UpdatedAt:   moved.UpdatedAt,
+		},
+		// Read inside the same transaction, before the update. It is the only
+		// place the card's previous column still exists, and a client keeping
+		// one list per column needs it to know which list to take the card out
+		// of.
+		fromColumnID: current.ColumnID,
 	}, nil
 }
 
-func deleteCardHandler(logger *slog.Logger, tenantStore TenantStore) gin.HandlerFunc {
+// movedCard is a move's result: the card as it now is, and the column it came
+// from. The second half exists only for the event — see events.go.
+type movedCard struct {
+	card         store.Card
+	fromColumnID uuid.UUID
+}
+
+// deleteCardHandler removes a card.
+//
+// DeleteCard returns the row it deleted rather than a count, because after the
+// statement runs the card's board is the one thing nothing else knows and the
+// event has to be addressed to it. "No row" is still the 404, and still means
+// the same thing for a card that never existed and for one belonging to another
+// organization.
+func deleteCardHandler(logger *slog.Logger, tenantStore TenantStore, publisher EventPublisher) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		cardID, ok := pathUUID(c, "card_id")
 		if !ok {
 			return
 		}
 
-		_, ok = tenantScoped(c, logger, tenantStore, "card.delete.failed",
-			func(ctx context.Context, q store.Querier) (struct{}, error) {
-				rows, err := q.DeleteCard(ctx, cardID)
-				if err != nil {
-					return struct{}{}, err
-				}
+		_, ok = tenantScopedPublish(c, logger, tenantStore, publisher, "card.delete.failed",
+			func(ctx context.Context, q store.Querier) (store.Card, error) {
+				card, err := q.DeleteCard(ctx, cardID)
 
-				if rows == 0 {
-					return struct{}{}, notFound(subjectCard)
+				return asNotFound(subjectCard, card, err)
+			},
+			func(card store.Card) BoardEvent {
+				return BoardEvent{
+					BoardID: card.BoardID,
+					Type:    eventCardDeleted,
+					Payload: cardDeletedPayload{
+						CardID:   card.ID.String(),
+						ColumnID: card.ColumnID.String(),
+					},
 				}
-
-				return struct{}{}, nil
 			})
 		if !ok {
 			return

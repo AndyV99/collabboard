@@ -55,7 +55,7 @@ func newColumnBody(column store.Column) columnBody {
 // cannot see, and it serialises the "one past the current maximum" read inside
 // CreateColumn against a concurrent create, so two columns cannot claim the same
 // position.
-func createColumnHandler(logger *slog.Logger, tenantStore TenantStore) gin.HandlerFunc {
+func createColumnHandler(logger *slog.Logger, tenantStore TenantStore, publisher EventPublisher) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		boardID, ok := pathUUID(c, "board_id")
 		if !ok {
@@ -72,7 +72,7 @@ func createColumnHandler(logger *slog.Logger, tenantStore TenantStore) gin.Handl
 			return
 		}
 
-		column, ok := tenantScoped(c, logger, tenantStore, "column.create.failed",
+		column, ok := tenantScopedPublish(c, logger, tenantStore, publisher, "column.create.failed",
 			func(ctx context.Context, q store.Querier) (store.Column, error) {
 				board, err := q.LockBoard(ctx, boardID)
 				if _, err := asNotFound(subjectBoard, board, err); err != nil {
@@ -85,6 +85,13 @@ func createColumnHandler(logger *slog.Logger, tenantStore TenantStore) gin.Handl
 				})
 
 				return asNotFound(subjectBoard, column, err)
+			},
+			func(column store.Column) BoardEvent {
+				return BoardEvent{
+					BoardID: column.BoardID,
+					Type:    eventColumnCreated,
+					Payload: columnEventPayload{Column: newColumnBody(column)},
+				}
 			})
 		if !ok {
 			return
@@ -118,7 +125,7 @@ func listColumnsHandler(logger *slog.Logger, tenantStore TenantStore) gin.Handle
 	}
 }
 
-func patchColumnHandler(logger *slog.Logger, tenantStore TenantStore) gin.HandlerFunc {
+func patchColumnHandler(logger *slog.Logger, tenantStore TenantStore, publisher EventPublisher) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		columnID, ok := pathUUID(c, "column_id")
 		if !ok {
@@ -141,7 +148,7 @@ func patchColumnHandler(logger *slog.Logger, tenantStore TenantStore) gin.Handle
 			return
 		}
 
-		column, ok := tenantScoped(c, logger, tenantStore, "column.update.failed",
+		column, ok := tenantScopedPublish(c, logger, tenantStore, publisher, "column.update.failed",
 			func(ctx context.Context, q store.Querier) (store.Column, error) {
 				column, err := q.UpdateColumn(ctx, store.UpdateColumnParams{
 					ColumnID: columnID,
@@ -149,6 +156,13 @@ func patchColumnHandler(logger *slog.Logger, tenantStore TenantStore) gin.Handle
 				})
 
 				return asNotFound(subjectColumn, column, err)
+			},
+			func(column store.Column) BoardEvent {
+				return BoardEvent{
+					BoardID: column.BoardID,
+					Type:    eventColumnUpdated,
+					Payload: columnEventPayload{Column: newColumnBody(column)},
+				}
 			})
 		if !ok {
 			return
@@ -162,7 +176,7 @@ func patchColumnHandler(logger *slog.Logger, tenantStore TenantStore) gin.Handle
 //
 // The board is not a parameter: it is read from the column, so there is no way
 // to ask for a column to be moved onto a board it does not belong to.
-func moveColumnHandler(logger *slog.Logger, tenantStore TenantStore) gin.HandlerFunc {
+func moveColumnHandler(logger *slog.Logger, tenantStore TenantStore, publisher EventPublisher) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		columnID, ok := pathUUID(c, "column_id")
 		if !ok {
@@ -179,9 +193,19 @@ func moveColumnHandler(logger *slog.Logger, tenantStore TenantStore) gin.Handler
 			return
 		}
 
-		column, ok := tenantScoped(c, logger, tenantStore, "column.move.failed",
+		column, ok := tenantScopedPublish(c, logger, tenantStore, publisher, "column.move.failed",
 			func(ctx context.Context, q store.Querier) (store.Column, error) {
 				return moveColumn(ctx, q, columnID, afterColumnID)
+			},
+			func(column store.Column) BoardEvent {
+				return BoardEvent{
+					BoardID: column.BoardID,
+					Type:    eventColumnMoved,
+					Payload: columnMovedPayload{
+						Column:        newColumnBody(column),
+						AfterColumnID: optionalID(afterColumnID),
+					},
+				}
 			})
 		if !ok {
 			return
@@ -245,25 +269,31 @@ func moveColumn(ctx context.Context, q store.Querier, columnID uuid.UUID, afterC
 	}, nil
 }
 
-func deleteColumnHandler(logger *slog.Logger, tenantStore TenantStore) gin.HandlerFunc {
+// deleteColumnHandler removes a column and, through the composite foreign keys,
+// its cards.
+//
+// One column.deleted rather than that plus a card.deleted per card: the cascade
+// is one user action, and a client that drops the column drops its contents with
+// it. See events.go.
+func deleteColumnHandler(logger *slog.Logger, tenantStore TenantStore, publisher EventPublisher) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		columnID, ok := pathUUID(c, "column_id")
 		if !ok {
 			return
 		}
 
-		_, ok = tenantScoped(c, logger, tenantStore, "column.delete.failed",
-			func(ctx context.Context, q store.Querier) (struct{}, error) {
-				rows, err := q.DeleteColumn(ctx, columnID)
-				if err != nil {
-					return struct{}{}, err
-				}
+		_, ok = tenantScopedPublish(c, logger, tenantStore, publisher, "column.delete.failed",
+			func(ctx context.Context, q store.Querier) (store.Column, error) {
+				column, err := q.DeleteColumn(ctx, columnID)
 
-				if rows == 0 {
-					return struct{}{}, notFound(subjectColumn)
+				return asNotFound(subjectColumn, column, err)
+			},
+			func(column store.Column) BoardEvent {
+				return BoardEvent{
+					BoardID: column.BoardID,
+					Type:    eventColumnDeleted,
+					Payload: columnDeletedPayload{ColumnID: column.ID.String()},
 				}
-
-				return struct{}{}, nil
 			})
 		if !ok {
 			return

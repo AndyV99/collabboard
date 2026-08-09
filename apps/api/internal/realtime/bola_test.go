@@ -65,6 +65,11 @@ type bolaFixture struct {
 	boardA uuid.UUID
 	boardB uuid.UUID
 
+	// cardA and cardB are movable cards on the two boards. The publish half of
+	// this test is now a real card move, so each tenant needs something to move.
+	cardA board
+	cardB board
+
 	aliceToken string
 	bobToken   string
 }
@@ -91,14 +96,15 @@ func newBOLAFixture(t *testing.T, authorizer Authorizer) *bolaFixture {
 	tenantStore := newRecordingStore()
 	tenantStore.seedMember(tenantA, alice.UserID)
 	tenantStore.seedMember(tenantB, bob.UserID)
-	tenantStore.seedBoard(tenantA, boardA)
-	tenantStore.seedBoard(tenantB, boardB)
 
 	if authorizer == nil {
 		authorizer = NewStoreAuthorizer(tenantStore)
 	}
 
-	inst := newInstance(t, instanceOptions{authorizer: authorizer})
+	// One store behind both the authorizer and the card routes, so "what alice
+	// may subscribe to" and "what alice may move" are answered by the same model
+	// of the same policies.
+	inst := newInstance(t, instanceOptions{authorizer: authorizer, store: tenantStore})
 
 	return &bolaFixture{
 		inst:       inst,
@@ -109,6 +115,8 @@ func newBOLAFixture(t *testing.T, authorizer Authorizer) *bolaFixture {
 		bob:        bob,
 		boardA:     boardA,
 		boardB:     boardB,
+		cardA:      inst.seedBoard(tenantA, boardA),
+		cardB:      inst.seedBoard(tenantB, boardB),
 		aliceToken: inst.token(t, alice),
 		bobToken:   inst.token(t, bob),
 	}
@@ -155,8 +163,8 @@ func TestAClientAuthenticatedForOneTenantCannotReceiveAnothersEvents(t *testing.
 	t.Run("control: alice watches her own board and receives her own events", func(t *testing.T) {
 		aliceClient.subscribe(t, ctx, f.boardA)
 
-		if resp := f.inst.publish(t, ctx, f.aliceToken, f.boardA, "card.moved"); resp.StatusCode != http.StatusAccepted {
-			t.Fatalf("alice could not publish to her own board: %d", resp.StatusCode)
+		if resp := f.inst.moveCard(t, ctx, f.aliceToken, f.cardA); resp.StatusCode != http.StatusOK {
+			t.Fatalf("alice could not move a card on her own board: %d %s", resp.StatusCode, resp.Body)
 		}
 
 		frame := aliceClient.expect(FrameEvent, 5*time.Second)
@@ -225,8 +233,8 @@ func TestAClientAuthenticatedForOneTenantCannotReceiveAnothersEvents(t *testing.
 
 		bobClient.subscribe(t, ctx, f.boardB)
 
-		if resp := f.inst.publish(t, ctx, f.bobToken, f.boardB, "card.moved"); resp.StatusCode != http.StatusAccepted {
-			t.Fatalf("bob could not publish to his own board: %d", resp.StatusCode)
+		if resp := f.inst.moveCard(t, ctx, f.bobToken, f.cardB); resp.StatusCode != http.StatusOK {
+			t.Fatalf("bob could not move a card on his own board: %d %s", resp.StatusCode, resp.Body)
 		}
 
 		// Bob receives it, so the event was genuinely fanned out.
@@ -238,18 +246,25 @@ func TestAClientAuthenticatedForOneTenantCannotReceiveAnothersEvents(t *testing.
 		// did.
 		opened := f.store.openedTenants()[before:]
 
-		t.Logf("tenant contexts opened while bob published: %v", opened)
+		t.Logf("tenant contexts opened while bob moved a card: %v", opened)
 
 		for _, tenantID := range opened {
 			if tenantID != f.tenantB {
-				t.Errorf("bob's publish opened %s, want only %s", tenantID, f.tenantB)
+				t.Errorf("bob's card move opened %s, want only %s", tenantID, f.tenantB)
 			}
 		}
 	})
 }
 
-// TestPublishingIntoAnotherTenantsBoardIsRefused attacks the REST half.
-func TestPublishingIntoAnotherTenantsBoardIsRefused(t *testing.T) {
+// TestWritingIntoAnotherTenantsBoardPublishesNothing attacks the REST half —
+// which since #45 is the card write path rather than a publish endpoint.
+//
+// The claim is stronger than it looks. It is not only "alice cannot move bob's
+// card", which crud_bola_test.go already proves across every endpoint; it is
+// that a refused write reaches the fan-out with nothing, so a member of one
+// organization cannot make a frame appear in another organization's browser
+// under any status code.
+func TestWritingIntoAnotherTenantsBoardPublishesNothing(t *testing.T) {
 	t.Parallel()
 
 	ctx, cancel := context.WithTimeout(t.Context(), 30*time.Second)
@@ -260,29 +275,49 @@ func TestPublishingIntoAnotherTenantsBoardIsRefused(t *testing.T) {
 	bobClient := f.inst.dial(ctx, t, f.bobToken)
 	bobClient.subscribe(t, ctx, f.boardB)
 
-	before := len(f.store.openedTenants())
+	// Alice also watches her own board, so an event that was mis-addressed into
+	// *her* room instead of refused would be caught rather than pass as silence.
+	aliceClient := f.inst.dial(ctx, t, f.aliceToken)
+	aliceClient.subscribe(t, ctx, f.boardA)
 
-	resp := f.inst.publish(t, ctx, f.aliceToken, f.boardB, "card.moved")
+	for _, attack := range []struct {
+		name             string
+		cardID, columnID uuid.UUID
+	}{
+		{
+			name:   "bob's card into bob's column: the whole operation transplanted",
+			cardID: f.cardB.cardID, columnID: f.cardB.columnID,
+		},
+		{
+			name:   "alice's own card into bob's column: every id real, one of them not hers",
+			cardID: f.cardA.cardID, columnID: f.cardB.columnID,
+		},
+		{
+			name:   "a card that exists nowhere",
+			cardID: uuid.New(), columnID: f.cardA.columnID,
+		},
+	} {
+		t.Run(attack.name, func(t *testing.T) {
+			before := len(f.store.openedTenants())
 
-	t.Logf("alice publishing into bob's board -> %d", resp.StatusCode)
+			resp := f.inst.moveCardByID(t, ctx, f.aliceToken, attack.cardID, attack.columnID)
 
-	if resp.StatusCode != http.StatusForbidden {
-		t.Fatalf("status = %d, want 403", resp.StatusCode)
-	}
+			t.Logf("%s -> %d %s", attack.name, resp.StatusCode, resp.Body)
 
-	// Nothing reached bob, so the refusal happened before the fan-out and not
-	// after it.
-	bobClient.expectNothing(500 * time.Millisecond)
+			// 404, not 403: answering 403 for a real id and 404 for a fictional
+			// one would make this an existence oracle across the tenant
+			// boundary. All three attacks answer identically.
+			if resp.StatusCode != http.StatusNotFound {
+				t.Errorf("status = %d, want 404", resp.StatusCode)
+			}
 
-	f.assertNoForeignTenantOpened(t, before)
+			// Nothing reached bob, so the refusal happened before the fan-out
+			// and not after it.
+			bobClient.expectNothing(300 * time.Millisecond)
+			aliceClient.expectNothing(300 * time.Millisecond)
 
-	// A board that does not exist anywhere answers the same 403, so this
-	// endpoint is not a board-existence oracle for other organizations.
-	fictional := f.inst.publish(t, ctx, f.aliceToken, uuid.New(), "card.moved")
-
-	if fictional.StatusCode != resp.StatusCode {
-		t.Errorf("an unowned-but-real board answers %d and a fictional one answers %d; the difference discloses existence",
-			resp.StatusCode, fictional.StatusCode)
+			f.assertNoForeignTenantOpened(t, before)
+		})
 	}
 }
 
@@ -425,7 +460,7 @@ func TestTheSubscriptionCheckHasTeeth(t *testing.T) {
 	bobClient := f.inst.dial(ctx, t, f.bobToken)
 	bobClient.subscribe(t, ctx, f.boardB)
 
-	f.inst.publish(t, ctx, f.bobToken, f.boardB, "card.moved")
+	f.inst.moveCard(t, ctx, f.bobToken, f.cardB)
 	bobClient.expect(FrameEvent, 5*time.Second)
 
 	aliceClient.expectNothing(500 * time.Millisecond)

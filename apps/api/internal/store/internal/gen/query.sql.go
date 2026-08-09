@@ -252,30 +252,58 @@ func (q *Queries) DeleteBoard(ctx context.Context, boardID uuid.UUID) (int64, er
 	return result.RowsAffected(), nil
 }
 
-const deleteCard = `-- name: DeleteCard :execrows
+const deleteCard = `-- name: DeleteCard :one
 DELETE FROM cards
 WHERE id = $1
+RETURNING id, tenant_id, board_id, column_id, title, description, position, assignee_id, due_at, created_at, updated_at
 `
 
-func (q *Queries) DeleteCard(ctx context.Context, cardID uuid.UUID) (int64, error) {
-	result, err := q.db.Exec(ctx, deleteCard, cardID)
-	if err != nil {
-		return 0, err
-	}
-	return result.RowsAffected(), nil
+// RETURNING for the same reason as DeleteColumn: after this statement the card's
+// board and column ids exist nowhere else, and both are needed to tell the
+// board's other clients which card left which column.
+func (q *Queries) DeleteCard(ctx context.Context, cardID uuid.UUID) (Card, error) {
+	row := q.db.QueryRow(ctx, deleteCard, cardID)
+	var i Card
+	err := row.Scan(
+		&i.ID,
+		&i.TenantID,
+		&i.BoardID,
+		&i.ColumnID,
+		&i.Title,
+		&i.Description,
+		&i.Position,
+		&i.AssigneeID,
+		&i.DueAt,
+		&i.CreatedAt,
+		&i.UpdatedAt,
+	)
+	return i, err
 }
 
-const deleteColumn = `-- name: DeleteColumn :execrows
+const deleteColumn = `-- name: DeleteColumn :one
 DELETE FROM columns
 WHERE id = $1
+RETURNING id, tenant_id, board_id, name, position, created_at, updated_at
 `
 
-func (q *Queries) DeleteColumn(ctx context.Context, columnID uuid.UUID) (int64, error) {
-	result, err := q.db.Exec(ctx, deleteColumn, columnID)
-	if err != nil {
-		return 0, err
-	}
-	return result.RowsAffected(), nil
+// RETURNING rather than a row count, because the deleted row is the only place
+// the column's board id still exists once the statement has run — and #45 needs
+// it to address the event that tells every other client the column is gone.
+// "No row" and "not this tenant's" remain the same answer, which is what the
+// 404 in internal/api/columns.go is built on.
+func (q *Queries) DeleteColumn(ctx context.Context, columnID uuid.UUID) (Column, error) {
+	row := q.db.QueryRow(ctx, deleteColumn, columnID)
+	var i Column
+	err := row.Scan(
+		&i.ID,
+		&i.TenantID,
+		&i.BoardID,
+		&i.Name,
+		&i.Position,
+		&i.CreatedAt,
+		&i.UpdatedAt,
+	)
+	return i, err
 }
 
 const getBoard = `-- name: GetBoard :one

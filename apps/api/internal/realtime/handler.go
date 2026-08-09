@@ -1,44 +1,43 @@
 package realtime
 
-// The two HTTP handlers.
+// The WebSocket upgrade handler.
 //
-// Both live here rather than in internal/api so that the principal can be read
+// It lives here rather than in internal/api so that the principal can be read
 // with api.PrincipalFromContext directly, from the package that owns the
-// context key. internal/api receives them as values (see its RealtimeDeps) and
-// decides the paths and the middleware; the import therefore runs
+// context key. internal/api receives it as a value (see its RealtimeDeps) and
+// decides the path and the middleware; the import therefore runs
 // realtime -> api and never the other way, which is what keeps that key
 // unexported and unforgeable.
+//
+// There used to be a second handler here — POST /api/v1/boards/:board_id/events
+// — which existed only so that issue #9's fan-out could be demonstrated before
+// anything could move a card. Issue #45 replaced it with the real thing: the
+// card and column write paths publish after their transactions commit. See
+// publisher.go and internal/api/events.go.
 
 import (
-	"encoding/json"
-	"errors"
-	"fmt"
 	"log/slog"
 	"net/http"
-	"time"
 
 	"github.com/coder/websocket"
 	"github.com/gin-gonic/gin"
-	"github.com/google/uuid"
 
 	"github.com/AndyV99/collabboard/apps/api/internal/api"
 )
 
-// maxEventPayloadBytes caps a published event's payload. Generous for a card
-// move, and small enough that an authenticated client cannot make the fleet
-// hold megabytes per event in every instance's buffers.
-const maxEventPayloadBytes = 16 << 10
-
 // Messages this package puts in an HTTP error body or a client error frame.
-// None of them describes stored state.
+// Neither describes stored state.
+//
+// The set shrank with the publish endpoint: an HTTP response from this package
+// is now only "you are not authenticated" or "this instance is draining", and
+// everything a client is told about a board it may not watch travels as a frame
+// reason instead.
 const (
 	messageBoardIDNotUUID  = "board_id must be a uuid"
 	messageUnauthenticated = "authentication required"
-	messageForbidden       = "not authorized for that board"
-	messageInternalError   = "internal server error"
 )
 
-// errorBody is the error shape these two handlers return. It matches
+// errorBody is the error shape this handler returns. It matches
 // internal/api's errorResponse deliberately — a client should not be able to
 // tell which package answered it — and is declared here because internal/api
 // cannot be imported for its unexported type.
@@ -106,139 +105,4 @@ func (h *Hub) ConnectHandler() gin.HandlerFunc {
 
 		newConn(h, ws, principal).serve(c.Request.Context())
 	}
-}
-
-// publishRequest is the body of the event endpoint.
-type publishRequest struct {
-	// Type names what happened. Required.
-	Type string `json:"type" binding:"required"`
-
-	// Payload is passed through to subscribers untouched.
-	Payload map[string]any `json:"payload"`
-}
-
-// PublishHandler publishes one event to a board's subscribers on every
-// instance.
-//
-// # Scope note
-//
-// This endpoint exists to demonstrate fan-out and for no other reason. Issue #9
-// is the realtime layer; board and card CRUD are somebody else's issue, and an
-// acceptance criterion that says "two clients on the same board see each
-// other's card moves" needs *something* to move a card. It writes nothing: the
-// event is a signal, not a mutation, and it is authorized by exactly the same
-// check a subscription is.
-//
-// When card CRUD lands, the card handler should call [Hub.Publish] in the same
-// transaction boundary that persists the move, and this endpoint should go.
-// Flagged in the pull request rather than left to be discovered.
-func (h *Hub) PublishHandler() gin.HandlerFunc {
-	return func(c *gin.Context) {
-		principal, ok := api.PrincipalFromContext(c.Request.Context())
-		if !ok {
-			c.AbortWithStatusJSON(http.StatusUnauthorized, errorBody{Error: messageUnauthenticated})
-
-			return
-		}
-
-		boardID, err := uuid.Parse(c.Param("board_id"))
-		if err != nil || boardID == uuid.Nil {
-			c.AbortWithStatusJSON(http.StatusBadRequest, errorBody{Error: messageBoardIDNotUUID})
-
-			return
-		}
-
-		var req publishRequest
-		if err := c.ShouldBindJSON(&req); err != nil {
-			c.AbortWithStatusJSON(http.StatusBadRequest, errorBody{Error: "request body is not valid"})
-
-			return
-		}
-
-		// The same authorizer the subscribe path uses, so "who may publish to a
-		// board" and "who may watch one" cannot drift apart. A board in another
-		// organization is a 403 here for the same reason it is a refusal there.
-		if err := h.cfg.Authorizer.AuthorizeBoard(c.Request.Context(), principal, boardID); err != nil {
-			h.writeAuthorizeError(c, boardID, err)
-
-			return
-		}
-
-		payload, err := encodePayload(req.Payload)
-		if err != nil {
-			c.AbortWithStatusJSON(http.StatusBadRequest, errorBody{Error: "payload is not valid"})
-
-			return
-		}
-
-		if len(payload) > maxEventPayloadBytes {
-			c.AbortWithStatusJSON(http.StatusRequestEntityTooLarge, errorBody{Error: "payload is too large"})
-
-			return
-		}
-
-		event := Event{
-			ID:   uuid.New(),
-			Type: req.Type,
-			// From the principal, never from the body: an event that could name
-			// its own actor would let any member forge another member's action
-			// in every open browser on the board.
-			ActorID:    principal.UserID,
-			OccurredAt: h.cfg.now().UTC(),
-			Payload:    payload,
-		}
-
-		// principal.TenantID. The room's tenant half is not reachable from the
-		// request, here or on the subscribe path.
-		room := principalRoom(principal, boardID)
-
-		if err := h.Publish(c.Request.Context(), room, event); err != nil {
-			h.logger.ErrorContext(c.Request.Context(), "publishing a realtime event failed",
-				slog.String("event", "realtime.publish.failed"),
-				slog.String("room", room.String()),
-				slog.Any("error", err),
-			)
-
-			c.AbortWithStatusJSON(http.StatusInternalServerError, errorBody{Error: messageInternalError})
-
-			return
-		}
-
-		c.JSON(http.StatusAccepted, gin.H{
-			"event_id":    event.ID.String(),
-			"board_id":    boardID.String(),
-			"occurred_at": event.OccurredAt.Format(time.RFC3339Nano),
-		})
-	}
-}
-
-// encodePayload renders the client's payload once, at the edge, so the fan-out
-// path carries bytes rather than a map it would have to encode per instance.
-func encodePayload(payload map[string]any) (json.RawMessage, error) {
-	if len(payload) == 0 {
-		return nil, nil
-	}
-
-	encoded, err := json.Marshal(payload)
-	if err != nil {
-		return nil, fmt.Errorf("encoding the event payload: %w", err)
-	}
-
-	return encoded, nil
-}
-
-func (h *Hub) writeAuthorizeError(c *gin.Context, boardID uuid.UUID, err error) {
-	if errors.Is(err, ErrForbidden) {
-		c.AbortWithStatusJSON(http.StatusForbidden, errorBody{Error: messageForbidden})
-
-		return
-	}
-
-	h.logger.ErrorContext(c.Request.Context(), "authorizing a realtime publish failed",
-		slog.String("event", "realtime.publish.authorize_failed"),
-		slog.String("board_id", boardID.String()),
-		slog.Any("error", err),
-	)
-
-	c.AbortWithStatusJSON(http.StatusInternalServerError, errorBody{Error: messageInternalError})
 }

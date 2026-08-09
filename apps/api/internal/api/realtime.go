@@ -23,17 +23,24 @@ import (
 	"github.com/gin-gonic/gin"
 )
 
-// RealtimeDeps are the WebSocket handlers, supplied by cmd/api.
+// RealtimeDeps is the realtime layer, supplied by cmd/api.
 //
-// Both are optional, so a build without realtime — the health-only
-// configuration several tests use — still produces a working engine.
+// Both fields are optional, so a build without realtime — the health-only
+// configuration several tests use — still produces a working engine. A nil
+// Publisher means the write path commits and announces nothing, which is the
+// correct behaviour for a router built without a hub and would be a wiring bug
+// in production; cmd/api always supplies one.
+//
+// There is deliberately no publish *endpoint* here. There used to be
+// (POST /api/v1/boards/:board_id/events, issue #9), and it let a client announce
+// a card move that never happened. The write path publishes now — see events.go
+// and issue #45.
 type RealtimeDeps struct {
 	// Connect upgrades to a WebSocket. Mounted at GET /api/v1/ws.
 	Connect gin.HandlerFunc
 
-	// PublishEvent fans one event out to a board.
-	// Mounted at POST /api/v1/boards/:board_id/events.
-	PublishEvent gin.HandlerFunc
+	// Publisher broadcasts a committed write to the board's subscribers.
+	Publisher EventPublisher
 }
 
 // bearerSubprotocolPrefix carries an access token on the WebSocket handshake.

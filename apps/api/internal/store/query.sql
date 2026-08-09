@@ -263,9 +263,15 @@ FROM (
 ) ranked
 WHERE c.id = ranked.id;
 
--- name: DeleteColumn :execrows
+-- name: DeleteColumn :one
+-- RETURNING rather than a row count, because the deleted row is the only place
+-- the column's board id still exists once the statement has run — and #45 needs
+-- it to address the event that tells every other client the column is gone.
+-- "No row" and "not this tenant's" remain the same answer, which is what the
+-- 404 in internal/api/columns.go is built on.
 DELETE FROM columns
-WHERE id = @column_id;
+WHERE id = @column_id
+RETURNING *;
 
 -- name: CreateCard :one
 -- Appends to the end of the column, taking board_id from the column rather than
@@ -378,6 +384,10 @@ FROM (
 ) ranked
 WHERE c.id = ranked.id;
 
--- name: DeleteCard :execrows
+-- name: DeleteCard :one
+-- RETURNING for the same reason as DeleteColumn: after this statement the card's
+-- board and column ids exist nowhere else, and both are needed to tell the
+-- board's other clients which card left which column.
 DELETE FROM cards
-WHERE id = @card_id;
+WHERE id = @card_id
+RETURNING *;

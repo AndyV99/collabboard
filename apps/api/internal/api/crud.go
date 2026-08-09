@@ -15,7 +15,10 @@ package api
 // With twenty-odd handlers, "the tenant comes from the claim" stops being a fact
 // anyone can check by reading them all, and becomes a fact about one function.
 // `grep -n 'principal.TenantID' internal/api` is the audit, and it should return
-// this file and auth.go's members handler.
+// three places: this file, auth.go's members handler, and events.go — which is
+// the *second* thing a tenant id decides, because it is half of the realtime
+// room key. Both halves of that key have to come from the claim for the same
+// reason, and neither is reachable from a request.
 //
 // # Why an id in the path is not an authorization decision
 //
@@ -155,6 +158,38 @@ func tenantScoped[T any](
 
 		return zero, false
 	}
+
+	return out, true
+}
+
+// tenantScopedPublish is [tenantScoped] plus the broadcast, and the order of
+// those two is the entire reason it exists.
+//
+// describe runs only after WithTenant has returned nil — that is, after the
+// transaction has committed. fn cannot publish instead, because fn is handed a
+// [store.Querier] and nothing else: the publisher is not in scope inside the
+// transaction, on this handler or on any future one. "A rolled-back write
+// broadcasts nothing" is therefore something the compiler enforces rather than
+// something a reviewer has to check. See events.go, and
+// TestARolledBackWriteBroadcastsNothing.
+//
+// describe may return the zero [BoardEvent] for a write with nothing worth
+// announcing; publishBoardEvent then does nothing.
+func tenantScopedPublish[T any](
+	c *gin.Context,
+	logger *slog.Logger,
+	tenantStore TenantStore,
+	publisher EventPublisher,
+	event string,
+	fn func(ctx context.Context, q store.Querier) (T, error),
+	describe func(T) BoardEvent,
+) (T, bool) {
+	out, ok := tenantScoped(c, logger, tenantStore, event, fn)
+	if !ok {
+		return out, false
+	}
+
+	publishBoardEvent(c, logger, publisher, describe(out))
 
 	return out, true
 }

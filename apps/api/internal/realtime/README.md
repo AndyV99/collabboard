@@ -246,18 +246,103 @@ go test -tags=integration ./internal/realtime/... -count=1  # ~10s, Postgres + R
 | File | Tag | What it covers |
 |---|---|---|
 | `hub_test.go` | — | fan-out, board isolation, deregistration, backpressure, reaping, token expiry, revocation, shutdown, upgrade auth |
-| `bola_test.go` | — | cross-tenant subscription and publish, plus three "has teeth" tests |
+| `bola_test.go` | — | cross-tenant subscription and cross-tenant *writes*, plus three "has teeth" tests |
 | `unit_test.go` | — | addressing, wiring checks, the misrouting guard, jitter |
+| `publisher_test.go` | — | the write path's adapter: room addressing, the payload cap, incomplete rooms |
 | `harness_test.go` | — | the real router + real WebSockets over a memory bus and an RLS-modelling fake |
-| `realtime_integration_test.go` | `integration` | two instances over real Redis, authorization against live RLS, revocation in the database, latency, restart handover |
+| `realtime_integration_test.go` | `integration` | two instances over real Redis, authorization against live RLS, revocation in the database, latency, restart handover, rollback, ordering |
+
+Every test that asserts something about the *write path* — fan-out, board
+isolation, cross-tenant refusal, ordering, rollback — drives it through
+`POST /api/v1/cards/:card_id/move` and gets its events because a row changed.
+
+`Hub.Publish` is still called directly in three places, all of them on purpose:
+the backpressure tests (`TestAFullSendBufferDropsTheClientAndNothingElse`,
+`TestASlowClientIsDroppedWithoutStallingOthers`), which need thousands of frames
+and care about buffers rather than about where a frame came from;
+`TestTheRoomKeyIsWhatKeepsTenantsApart`, which is deliberately modelling a
+mistake a correct publisher cannot make; and `publisher_test.go`, which is
+testing the adapter itself.
 
 The unit tests run against a `MemoryBus` and a fake store; the integration tests
 run the same code against real Redis and real policies. The fake could be wrong
 about what the policies say — which is exactly why both exist.
 
-## Scope note
+## What publishes, and when
 
-`POST /api/v1/boards/:board_id/events` exists **only** to demonstrate fan-out. It
-persists nothing. When card CRUD lands, the card handler should call
-`Hub.Publish` alongside the write that persists the move, and this endpoint
-should go.
+Nothing in this package publishes. The write path does, through
+`Hub.EventPublisher()` — an adapter satisfying `api.EventPublisher`, which
+`internal/api` declares in terms of its own types so the import keeps running
+`realtime -> api`. See `publisher.go` and `internal/api/events.go`.
+
+> `POST /api/v1/boards/:board_id/events` is **gone** (#45). It existed only to
+> demonstrate fan-out before anything could move a card, and it let a client
+> announce a move that never happened. It answers 404.
+
+**The publish happens after the transaction commits and before the HTTP response
+is written.** Both halves matter, and both are argued in
+[ADR 0005](../../../../docs/adr/0005-realtime-event-delivery.md):
+
+- *After the commit*, because an event published from inside a transaction that
+  then rolls back is a change every browser shows and the database never made.
+  `internal/api` enforces this structurally — the transaction callback is handed
+  a `store.Querier` and no publisher, so there is nothing to publish *with* until
+  `WithTenant` has returned.
+- *Before the response*, because that is what makes a client's own writes
+  causally ordered: a second move issued after the first one's response was
+  acknowledged is published second, at every client.
+
+A publish that fails **does not fail the write**. It is logged as
+`realtime.publish.failed`, and the client recovers the way it already recovers
+from a reconnect: by re-fetching on `subscribed`.
+
+### Events
+
+Event names are a wire contract. A `*.deleted` payload carries ids only; a
+`*.moved` payload carries the anchor with an explicit `null` for "first"; every
+other payload carries the same object body the REST endpoints return, so a client
+has one decoder rather than two.
+
+| Type | Payload |
+|---|---|
+| `card.created` | `{"card": {…}}` — appended to the end of its column |
+| `card.updated` | `{"card": {…}}` — the whole card, not a field diff |
+| `card.moved` | `{"card": {…}, "from_column_id": "…", "after_card_id": "<uuid>"\|null}` |
+| `card.deleted` | `{"card_id": "…", "column_id": "…"}` |
+| `column.created` | `{"column": {…}}` — appended to the end of the board |
+| `column.updated` | `{"column": {…}}` |
+| `column.moved` | `{"column": {…}, "after_column_id": "<uuid>"\|null}` |
+| `column.deleted` | `{"column_id": "…"}` — its cards go with it, no per-card event |
+| `board.updated` | `{"board": {…}}` |
+| `board.deleted` | `{"board_id": "…"}` — the last event the room will carry |
+
+No rank is ever published — see [ADR 0004](../../../../docs/adr/0004-card-ordering.md).
+Project writes and board *creation* publish nothing: a room is a board, so at the
+moment a board is created there is nobody who could be watching it.
+
+Two things a client should not over-read:
+
+- **`after_card_id` describes the past.** It was a card in the target column when
+  the rank was computed. Another client can delete it or move it away before this
+  event is read, so a client that cannot find it should place the card first and
+  wait for the anchor's own event. The card's position on the server is settled
+  either way.
+- **`board.deleted` is the last `event` frame a room carries, not the last
+  frame.** Up to `REALTIME_REAUTHORIZE_INTERVAL` later the sweep finds the board
+  no longer resolves and sends `unsubscribed` / `forbidden` for it. That is
+  expected after a delete and is not an authorization failure.
+
+### Ordering, exactly
+
+**Guaranteed.** One total order per board, identical at every client on every
+instance — one Redis channel per room, one dispatch goroutine per instance,
+per-connection FIFO buffers. And causal order for one client's own writes,
+because the publish precedes the response.
+
+**Not guaranteed.** That publish order matches commit order for two *concurrent*
+writers. Their transactions serialise in Postgres, but each request publishes
+from its own goroutine afterwards, and that race is narrow rather than closed.
+Every client still agrees with every other client; the disagreement with the
+database is corrected by the next event for that card or by any re-fetch. Nor is
+delivery guaranteed: this is at-most-once, as the "nothing is replayed" section
+above says.
