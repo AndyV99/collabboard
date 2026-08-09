@@ -57,3 +57,52 @@ export function projectHref(projectId: string): string {
 export function boardHref(projectId: string, boardId: string): string {
   return `${projectHref(projectId)}/boards/${seg(boardId)}`;
 }
+
+/** The query key that names the open card on a board. */
+export const CARD_PARAM = "card";
+
+/**
+ * One card, open on its board.
+ *
+ * A **search parameter on the board's own URL** rather than a path segment of
+ * its own, which is the one navigation decision in #63 worth arguing about.
+ *
+ * A card is not a page. It is a detail of the board, and the board has to stay
+ * on screen behind it — you open a card to read it *in context*, and the next
+ * thing you do is open another one. A `/cards/<id>` route would either lose the
+ * board or need Next's intercepting routes to fake keeping it, and the fake
+ * comes apart on a reload or a pasted link, which is precisely when the URL is
+ * doing its job.
+ *
+ * As a query parameter it costs nothing and keeps everything the rest of this
+ * app promises: the address identifies what is on screen, a reload restores it,
+ * a colleague opening the link sees the same card, and the back button closes
+ * it. It also costs no request — the board already fetched every card, so the
+ * open one is a lookup (see `lib/board/snapshot.ts`).
+ *
+ * The `#card` fragment is for narrow screens, where the detail panel is stacked
+ * rather than beside the board: following the link puts it in view without a
+ * line of JavaScript. On a wide screen the panel is already visible and the
+ * fragment is a no-op.
+ */
+export function cardHref(projectId: string, boardId: string, cardId: string): string {
+  const board = boardHref(projectId, boardId);
+
+  return `${board}?${CARD_PARAM}=${seg(cardId)}#card`;
+}
+
+/**
+ * Reads the open card's id out of a page's `searchParams`.
+ *
+ * `?card=a&card=b` arrives as an array. Rather than pick one, this reads it as
+ * no selection: a request naming two cards is not a request this screen can
+ * honour, and quietly obeying half of it would make the URL stop describing
+ * what is on screen. Same for an empty value.
+ */
+export function selectedCardId(
+  searchParams: Record<string, string | string[] | undefined>,
+): string | null {
+  const value = searchParams[CARD_PARAM];
+
+  return typeof value === "string" && value !== "" ? value : null;
+}
