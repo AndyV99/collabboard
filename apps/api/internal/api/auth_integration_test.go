@@ -108,8 +108,19 @@ type server struct {
 
 // newServer builds the router the way cmd/api does, with the login budgets a
 // test asks for.
-func newServer(t *testing.T, limits auth.RateLimitConfig) *server {
+//
+// wrapAuthStore, when supplied, sits between the auth service and the real
+// store. Exactly one test uses it — the one that has to make registration's
+// second transaction fail on purpose (issue #34) — and it is a parameter rather
+// than a field on the service because the seam being exercised *is* the boundary
+// between the auth service and the store. The router's own store stays the real
+// one, so only the flow under test can be interfered with.
+func newServer(t *testing.T, limits auth.RateLimitConfig, wrapAuthStore ...func(*store.Store) auth.Store) *server {
 	t.Helper()
+
+	if len(wrapAuthStore) > 1 {
+		t.Fatalf("newServer takes at most one auth-store wrapper, got %d", len(wrapAuthStore))
+	}
 
 	logs := &bytes.Buffer{}
 	logger := slog.New(slog.NewJSONHandler(logs, &slog.HandlerOptions{Level: slog.LevelDebug}))
@@ -127,8 +138,13 @@ func newServer(t *testing.T, limits auth.RateLimitConfig) *server {
 		t.Fatalf("building the issuer: %v", err)
 	}
 
+	var authStore auth.Store = dataStore
+	if len(wrapAuthStore) == 1 {
+		authStore = wrapAuthStore[0](dataStore)
+	}
+
 	service, err := auth.NewService(auth.ServiceDeps{
-		Store:      dataStore,
+		Store:      authStore,
 		Deriver:    auth.NewArgon2Deriver(4),
 		Issuer:     issuer,
 		Sessions:   auth.NewSessionStore(kv, time.Hour),

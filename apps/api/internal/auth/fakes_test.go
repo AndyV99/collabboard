@@ -218,6 +218,13 @@ type fakeStore struct {
 	tenants []uuid.UUID
 
 	failWith error
+
+	// failTenantWith fails the tenant-scoped door only, leaving the pre-tenant
+	// one working. That asymmetry is the whole point: it is registration's
+	// failure mode (issue #34) — the first transaction commits, the second one
+	// does not — and there is no way to reach that state by failing both doors
+	// with failWith.
+	failTenantWith error
 }
 
 type fakeCredential struct {
@@ -253,10 +260,35 @@ func (f *fakeStore) WithTenant(ctx context.Context, tenantID uuid.UUID, fn store
 	f.mu.Lock()
 	f.tenants = append(f.tenants, tenantID)
 	failure := f.failWith
+	tenantFailure := f.failTenantWith
 	f.mu.Unlock()
 
 	if failure != nil {
 		return failure
+	}
+
+	if tenantFailure != nil {
+		// The callback runs and its writes are then discarded, which is what a
+		// transaction that does not survive to COMMIT looks like from out here.
+		// Returning before calling fn would model only the narrower "the
+		// transaction never began" case and would not execute the statements at
+		// all — and the rollback has to be real, or the account would come out
+		// of a failed registration holding the membership the failure lost.
+		f.mu.Lock()
+		snapshot := make(map[uuid.UUID][]store.UserOrganization, len(f.memberships))
+
+		for id, orgs := range f.memberships {
+			snapshot[id] = append([]store.UserOrganization(nil), orgs...)
+		}
+		f.mu.Unlock()
+
+		_ = fn(ctx, fakeTenantQuerier{store: f, tenantID: tenantID})
+
+		f.mu.Lock()
+		f.memberships = snapshot
+		f.mu.Unlock()
+
+		return tenantFailure
 	}
 
 	return fn(ctx, fakeTenantQuerier{store: f, tenantID: tenantID})
