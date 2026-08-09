@@ -87,8 +87,8 @@ func (stubAuthService) SwitchOrganization(context.Context, auth.Principal, uuid.
 	panic("stubAuthService: SwitchOrganization is not reachable from the realtime routes")
 }
 
-func (stubAuthService) Organizations(context.Context, auth.Principal) ([]auth.Organization, error) {
-	panic("stubAuthService: Organizations is not reachable from the realtime routes")
+func (stubAuthService) Me(context.Context, auth.Principal) (auth.MeResult, error) {
+	panic("stubAuthService: Me is not reachable from the realtime routes")
 }
 
 func (stubAuthService) AddMember(context.Context, auth.AddMemberInput) (auth.AddMemberResult, error) {

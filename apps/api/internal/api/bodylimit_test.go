@@ -178,8 +178,8 @@ func (s *countingAuthService) SwitchOrganization(
 	return auth.LoginResult{}, auth.ErrNotAMember
 }
 
-func (s *countingAuthService) Organizations(context.Context, auth.Principal) ([]auth.Organization, error) {
-	return nil, nil
+func (s *countingAuthService) Me(context.Context, auth.Principal) (auth.MeResult, error) {
+	return auth.MeResult{}, nil
 }
 
 func (s *countingAuthService) AddMember(context.Context, auth.AddMemberInput) (auth.AddMemberResult, error) {

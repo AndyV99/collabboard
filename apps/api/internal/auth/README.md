@@ -38,11 +38,22 @@ exists, which is why it is the place the BOLA test attacks hardest.
 | `POST` | `/api/v1/auth/refresh` | — | rotates the refresh token, re-checks the membership |
 | `POST` | `/api/v1/auth/logout` | — | the refresh token is the credential; 204 even for an unknown one |
 | `POST` | `/api/v1/auth/organization` | bearer | switch active organization; 403 for a non-member |
-| `GET` | `/api/v1/me` | bearer | the principal and the organizations it could act in |
+| `GET` | `/api/v1/me` | bearer | the caller's own identity, and the organizations it could act in |
 | `GET` | `/api/v1/members` | bearer | tenant-scoped, through `store.WithTenant` |
 
 `/api/v1/members` exists to make "the tenant flows from the token into the data
 layer" testable end to end. Board and card CRUD are out of scope for issue #8.
+
+`GET /api/v1/me` answers in two halves, from two doors, and `Service.Me` is the
+one place they meet. The organization list spans tenants, so it goes through the
+pre-tenant path under `ReasonListOrganizations`. The caller's own `email` and
+`display_name` (issue #75) are an ordinary tenant-scoped read of their own
+`users` row: the derived policy on `users` makes a row visible when a membership
+joins it to the current tenant, and a caller is by definition a member of the
+tenant in their own token. Both halves take the subject from
+`Principal.UserID` — the endpoint accepts no parameters at all — and a token
+whose membership has since been revoked gets `ErrNotAMember` rather than an
+identity, because the database is the current answer and the claim is not.
 
 ## Credentials
 

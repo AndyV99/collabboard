@@ -45,6 +45,7 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"slices"
@@ -113,13 +114,13 @@ func (r *recordingStore) openedTenants() []uuid.UUID {
 	return slices.Clone(r.opened)
 }
 
-func (r *recordingStore) seed(tenantID uuid.UUID, email string) {
+func (r *recordingStore) seed(tenantID, userID uuid.UUID, email string) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
 	r.members[tenantID] = []store.ListMembersRow{{
 		MembershipID: uuid.New(),
-		UserID:       uuid.New(),
+		UserID:       userID,
 		Role:         "owner",
 		Email:        email,
 		DisplayName:  email,
@@ -147,6 +148,27 @@ func (q recordingQuerier) ListMembers(context.Context) ([]store.ListMembersRow, 
 	defer q.store.mu.Unlock()
 
 	return q.store.members[q.tenantID], nil
+}
+
+// GetUser models users_visible_via_membership rather than the users table: a
+// row comes back only when a membership joins it to *this transaction's*
+// tenant, which is precisely what the policy does.
+//
+// Modelling it that way is what gives the /me attacks below their teeth. A fake
+// that returned the row for any id would answer an attacker who managed to get
+// somebody else's id into the query, and the test would pass while the real
+// database was the only thing refusing.
+func (q recordingQuerier) GetUser(_ context.Context, userID uuid.UUID) (store.GetUserRow, error) {
+	q.store.mu.Lock()
+	defer q.store.mu.Unlock()
+
+	for _, member := range q.store.members[q.tenantID] {
+		if member.UserID == userID {
+			return store.GetUserRow{ID: member.UserID, Email: member.Email, DisplayName: member.DisplayName}, nil
+		}
+	}
+
+	return store.GetUserRow{}, store.ErrNoRows
 }
 
 // membershipService is an AuthService whose only real behaviour is membership:
@@ -179,8 +201,41 @@ func (s *membershipService) Logout(context.Context, string) error {
 	panic("membershipService: Logout is not modelled")
 }
 
-func (s *membershipService) Organizations(_ context.Context, principal auth.Principal) ([]auth.Organization, error) {
-	return s.memberships[principal.UserID], nil
+// Me models both halves of GET /me the way the real service does them: the
+// organization list from the principal's user id, and the identity from a
+// tenant-scoped read of the principal's own row.
+//
+// The tenant-scoped half goes through s.store deliberately, so that an attack
+// which managed to steer /me would show up in recordingStore.opened — the same
+// second assertion every other attack in this file gets. A fake that assembled
+// the profile from a map would make /me the one endpoint here whose steering
+// nobody was watching.
+func (s *membershipService) Me(ctx context.Context, principal auth.Principal) (auth.MeResult, error) {
+	var row store.GetUserRow
+
+	err := s.store.WithTenant(ctx, principal.TenantID, func(ctx context.Context, q store.Querier) error {
+		var qerr error
+
+		row, qerr = q.GetUser(ctx, principal.UserID)
+
+		return qerr
+	})
+
+	switch {
+	case errors.Is(err, store.ErrNoRows):
+		return auth.MeResult{}, auth.ErrNotAMember
+	case err != nil:
+		return auth.MeResult{}, err
+	}
+
+	return auth.MeResult{
+		Profile: auth.UserProfile{
+			UserID:      row.ID,
+			Email:       row.Email,
+			DisplayName: row.DisplayName,
+		},
+		Organizations: s.memberships[principal.UserID],
+	}, nil
 }
 
 // AddMember is modelled at the size these tests need, and the size is chosen to
@@ -254,6 +309,13 @@ type bolaFixture struct {
 	tenantA    uuid.UUID
 	tenantB    uuid.UUID
 
+	// aliceID and bobID are what the /me attacks need: an id to ask for, and an
+	// id to check the answer against. Alice knows bob's id in the same way an
+	// attacker would — she does not, which is why the attacks also try his
+	// address.
+	aliceID uuid.UUID
+	bobID   uuid.UUID
+
 	// carol has an account and belongs to neither organization. She is what
 	// alice tries to add — to her own organization in the control, and to bob's
 	// in the attack.
@@ -272,10 +334,11 @@ func newBOLAFixture(t *testing.T) *bolaFixture {
 	tenantB := uuid.New()
 
 	alice := uuid.New()
+	bob := uuid.New()
 
 	tenantStore := newRecordingStore()
-	tenantStore.seed(tenantA, "alice@example.com")
-	tenantStore.seed(tenantB, "bob@example.com")
+	tenantStore.seed(tenantA, alice, "alice@example.com")
+	tenantStore.seed(tenantB, bob, "bob@example.com")
 
 	carol := uuid.New()
 
@@ -315,6 +378,8 @@ func newBOLAFixture(t *testing.T) *bolaFixture {
 		aliceToken: token,
 		tenantA:    tenantA,
 		tenantB:    tenantB,
+		aliceID:    alice,
+		bobID:      bob,
 		carolEmail: "carol@example.com",
 		carolID:    carol,
 	}
@@ -345,12 +410,49 @@ func TestAnAuthenticatedUserCannotObtainAnotherTenantsContext(t *testing.T) {
 		}
 	})
 
+	// The second control, for the /me attacks below. Without it they would all
+	// hold against a /me that returned no identity at all — "the response does
+	// not contain bob's address" is trivially true of an empty answer.
+	t.Run("control: alice reads her own identity from /me", func(t *testing.T) {
+		rec := f.do(t, http.MethodGet, "/api/v1/me", nil, nil)
+
+		t.Logf("control -> %d %s", rec.Code, rec.Body.String())
+
+		if rec.Code != http.StatusOK {
+			t.Fatalf("status = %d, want 200 — nothing below proves anything", rec.Code)
+		}
+
+		var body struct {
+			UserID      string `json:"user_id"`
+			Email       string `json:"email"`
+			DisplayName string `json:"display_name"`
+		}
+
+		if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+			t.Fatalf("decoding /me: %v", err)
+		}
+
+		if body.UserID != f.aliceID.String() {
+			t.Errorf("/me user_id = %q, want alice (%s)", body.UserID, f.aliceID)
+		}
+
+		if body.Email != "alice@example.com" || body.DisplayName != "alice@example.com" {
+			t.Errorf("/me identity = %q / %q, want alice's own", body.Email, body.DisplayName)
+		}
+	})
+
 	for _, attack := range []struct {
 		name    string
 		method  string
 		path    string
 		headers map[string]string
 		body    any
+
+		// identity marks an attack on GET /me's *subject* rather than on its
+		// tenant. For those, "the body does not contain bob" is not enough: a
+		// response steered to some third account would satisfy it too. So a 200
+		// has to be alice's own row, positively.
+		identity bool
 	}{
 		{
 			name:    "X-Tenant-ID header",
@@ -384,6 +486,49 @@ func TestAnAuthenticatedUserCannotObtainAnotherTenantsContext(t *testing.T) {
 			name:   "organization_id query parameter on /me",
 			method: http.MethodGet,
 			path:   "/api/v1/me?organization_id=" + f.tenantB.String(),
+		},
+		// /me now reports an identity as well as an organization (#75), so it
+		// has a second thing worth stealing: somebody else's row. These attack
+		// the *subject* rather than the tenant. The two assertions the loop
+		// makes cover both halves — bob's address must not appear in the body,
+		// and no transaction may be opened for bob's tenant.
+		{
+			name:     "user_id query parameter on /me",
+			method:   http.MethodGet,
+			path:     "/api/v1/me?user_id=" + f.bobID.String(),
+			identity: true,
+		},
+		{
+			name:     "sub query parameter on /me",
+			method:   http.MethodGet,
+			path:     "/api/v1/me?sub=" + f.bobID.String(),
+			identity: true,
+		},
+		{
+			name:     "email query parameter on /me",
+			method:   http.MethodGet,
+			path:     "/api/v1/me?email=bob%40example.com",
+			identity: true,
+		},
+		{
+			name:     "X-User-ID header on /me",
+			method:   http.MethodGet,
+			path:     "/api/v1/me",
+			headers:  map[string]string{"X-User-Id": f.bobID.String()},
+			identity: true,
+		},
+		{
+			name:     "X-User-ID and X-Organization-ID together on /me",
+			method:   http.MethodGet,
+			path:     "/api/v1/me",
+			headers:  map[string]string{"X-User-Id": f.bobID.String(), "X-Organization-ID": f.tenantB.String()},
+			identity: true,
+		},
+		{
+			name:     "a user id in the path",
+			method:   http.MethodGet,
+			path:     "/api/v1/users/" + f.bobID.String(),
+			identity: true,
 		},
 		{
 			name:   "a path segment naming the organization",
@@ -439,6 +584,10 @@ func TestAnAuthenticatedUserCannotObtainAnotherTenantsContext(t *testing.T) {
 
 			if bytes.Contains(rec.Body.Bytes(), []byte(f.tenantB.String())) {
 				t.Errorf("BOLA: the response echoes the requested foreign tenant id\n%s", rec.Body.String())
+			}
+
+			if attack.identity && rec.Code == http.StatusOK {
+				f.assertIdentityIsAlices(t, rec)
 			}
 
 			f.assertNoForeignTenantOpened(t, before)
@@ -769,6 +918,34 @@ func (f *bolaFixture) assertNoForeignTenantOpened(t *testing.T, from int) {
 			t.Errorf("BOLA: a tenant context was opened for %s while authenticated as a member of %s only",
 				tenantID, f.tenantA)
 		}
+	}
+}
+
+// assertIdentityIsAlices checks that a successful /me answered with the
+// caller's own row.
+//
+// Positive rather than negative on purpose. "The body does not contain bob"
+// passes for a response steered to any third account, and for an empty one; the
+// claim GET /me makes is that the identity it returns is the *token's*, so that
+// is what gets asserted.
+func (f *bolaFixture) assertIdentityIsAlices(t *testing.T, rec *httptest.ResponseRecorder) {
+	t.Helper()
+
+	var body struct {
+		UserID string `json:"user_id"`
+		Email  string `json:"email"`
+	}
+
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatalf("decoding /me: %v (%s)", err, rec.Body.String())
+	}
+
+	if body.UserID != f.aliceID.String() {
+		t.Errorf("BOLA: /me reported user_id %q, want alice (%s)", body.UserID, f.aliceID)
+	}
+
+	if body.Email != "alice@example.com" {
+		t.Errorf("BOLA: /me reported email %q, want alice's own", body.Email)
 	}
 }
 
