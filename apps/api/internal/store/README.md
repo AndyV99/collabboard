@@ -195,14 +195,18 @@ for instance, is *not* pre-tenant: `CreateMembership` lives in `query.sql` and
 runs scoped to the admin's own tenant. An invite is deliberately split across
 both doors for exactly that reason.
 
-`login`, `password_params` and `verify_password` have a second caller since
-issue #34: `POST /api/v1/organizations`, the endpoint that gives an account
-stranded by a half-completed registration the organization it never got. No new
-reason was added, and none was needed — that endpoint performs a password
-verification keyed on an email address, which is what those three reasons
-describe, and it does it by calling the same `Service.verifyCredential` login
-calls. The reasons still name the operation rather than the route, which is why
-the audit log reads the same for both and why the anti-enumeration property
+Four of these reasons have a second caller since issue #34:
+`POST /api/v1/organizations`, the endpoint that gives an account stranded by a
+half-completed registration the organization it never got. `login`,
+`password_params` and `verify_password` because it verifies a password — it
+calls the same `Service.verifyCredential` login calls — and
+`list_organizations` because it has to establish that the account really has
+none before it creates one, which is the same cross-tenant question the org
+switcher asks.
+
+No new reason was added, and none was needed: the reasons name the *operation*
+rather than the route, and both routes perform the same operations. That is why
+the audit log reads the same for both, and why the anti-enumeration property
 holds at both. See [ADR 0009](../../../../docs/adr/0009-tenantless-account-recovery.md).
 
 ### Why this cannot become a general escape hatch

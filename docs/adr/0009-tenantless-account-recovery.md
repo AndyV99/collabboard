@@ -98,6 +98,18 @@ created by a registration that did not fail, owner membership included.
 Scope is the zero-organization case only. An account that already has one gets
 `409` and `ErrAlreadyHasOrganization`.
 
+That check is sequential, not serialized. The membership read and the
+provisioning are two transactions — necessarily, for the same structural reason
+registration's two are — so two concurrent calls holding the correct password can
+both observe zero memberships and both provision, leaving the account owning two
+workspaces. Accepted: it needs the account's own password and genuine
+concurrency, both organizations are correctly owned by that account, and no
+boundary is crossed. A single-flight key in the rate limiter's Redis would close
+it and was rejected, because a held or stuck key makes the repair path
+*unavailable*, and an account that cannot recover at all is worse than an account
+with a spare workspace. The guarantee is therefore "an account that already has
+an organization is refused", not "an account can never come to have two".
+
 ## Consequences
 
 **The blast radius is one route.** Because the subject is derived from a
@@ -128,11 +140,31 @@ address so the workspace can be created". There is now a self-service path, and
 nothing in `apps/web` calls it. Filed as a follow-up rather than folded in.
 
 **Reversal, and where this gets revisited.** When an authenticated account should
-be able to create *additional* workspaces, that is a bearer-token operation with a
-different authorization question (who may create a workspace, and how many). The
-honest expectation is that the same path grows a second, token-authenticated mode
-rather than that this one is deleted — the zero-org case still has no token to
-present. If a scoped pre-tenant token is ever wanted for other reasons (an
-invite-acceptance flow, say), that is the point at which the second option above
+be able to create *additional* workspaces (issue #86), that is a bearer-token
+operation with a different authorization question: who may create a workspace,
+how many, and — since an organization is a tenant — who may mint billable
+tenants.
+
+It cannot simply become a second mode on this same path, and it is worth
+recording why so the next author does not start there. Gin's router panics at
+construction on a duplicate method plus path, so
+`unauthenticated.POST("/organizations", …)` and
+`authenticated.POST("/organizations", …)` cannot both be mounted. That leaves two
+shapes: parse the bearer token optionally *inside* the one handler on the
+unauthenticated group, which moves an authentication decision out of
+`requireAuth` and is the thing this ADR spent its length arguing against; or give
+the authenticated operation its own path. The second is the one to prefer.
+
+If a scoped pre-tenant token is ever wanted for other reasons — an
+invite-acceptance flow, say — that is the point at which the second option above
 should be reconsidered on its own merits, with this endpoint as one of several
 callers rather than the only one.
+
+**One property was given up.** `POST /api/v1/organizations` is the first
+unauthenticated route not under `/auth/`, so the anonymous surface is no longer
+identifiable by path prefix — a property both `router.go` and `internal/api`'s
+file comments lean on when they enumerate what an anonymous caller can reach. The
+path came from issue #34 rather than being invented here, and the mitigation is
+that `router_test.go` now asserts the unauthenticated set exactly, so a route
+added to that group is a failing test rather than a reading-comprehension
+exercise.

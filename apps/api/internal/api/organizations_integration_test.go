@@ -29,9 +29,11 @@ import (
 	"context"
 	"encoding/json"
 	"net/http"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/google/uuid"
 
@@ -278,6 +280,52 @@ func TestCreatingAnOrganizationCannotBeAimedAtAnotherAccount(t *testing.T) {
 
 	t.Logf("victim %s still holds no membership; attacker %s holds %d",
 		victim.userID, attacker.userID, membershipCount(t, attacker.userID))
+}
+
+// TestCreatingAnOrganizationIsRateLimitedOverHTTP proves the 429 and its
+// Retry-After for this route specifically.
+//
+// The service-layer test asserts that the limiter fires; this asserts that the
+// firing reaches the client as the right status with the header a client needs
+// to back off. The mapping is shared code, but ADR 0009 leans on rate limiting
+// as a reason this endpoint is safe to expose anonymously, so the claim is
+// pinned at the surface it is made about.
+func TestCreatingAnOrganizationIsRateLimitedOverHTTP(t *testing.T) {
+	var breaker *brokenTenantDoor
+
+	s := newServer(t, auth.RateLimitConfig{PerAccount: 3, PerAddress: 1000, Window: time.Minute},
+		func(real *store.Store) auth.Store {
+			breaker = &brokenTenantDoor{Store: real}
+
+			return breaker
+		})
+
+	stranded := s.strand(t, breaker, "budgeted")
+
+	var limited response
+
+	for attempt := range 8 {
+		resp := s.do(t, http.MethodPost, "/api/v1/organizations", "",
+			map[string]string{"email": stranded.email, "password": "wrong password entirely"})
+		if resp.status == http.StatusTooManyRequests {
+			limited = resp
+
+			t.Logf("limited on attempt %d: %d %s", attempt+1, resp.status, resp.raw)
+
+			break
+		}
+	}
+
+	if limited.status != http.StatusTooManyRequests {
+		t.Fatal("eight wrong-password attempts against a budget of three were all allowed; " +
+			"this endpoint is a free password-guessing surface")
+	}
+
+	seconds, err := strconv.Atoi(limited.header.Get("Retry-After"))
+	if err != nil || seconds <= 0 {
+		t.Errorf("Retry-After = %q, want a positive number of seconds",
+			limited.header.Get("Retry-After"))
+	}
 }
 
 // strand registers an account whose second transaction fails, and returns it.

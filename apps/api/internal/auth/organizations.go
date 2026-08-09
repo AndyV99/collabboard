@@ -61,7 +61,30 @@ package auth
 // authorization question (who may create a workspace, and how many) and it is not
 // what the issue asked for. An account with memberships gets
 // [ErrAlreadyHasOrganization]. Lifting that is one condition plus an answer to
-// the authorization question; filed as a follow-up rather than guessed at here.
+// the authorization question; filed as issue #86 rather than guessed at here.
+//
+// # The one-organization check is sequential, not serialized
+//
+// Stated precisely because the rest of this file states things absolutely. The
+// membership read and the provisioning are two transactions — they have to be,
+// for the same structural reason registration's two are — so two *concurrent*
+// calls holding the correct password can both observe zero memberships and both
+// provision. The loser is not detected, and the account ends up owning two
+// workspaces, with [Service.Login] choosing between them by name.
+//
+// That is accepted rather than overlooked. It needs the account's own correct
+// password and genuine concurrency, both organizations are correctly owned by
+// that same account, and no boundary is crossed — it is a double-click producing
+// a spare workspace. The obvious guard, a single-flight key in the Redis the
+// rate limiter already uses, was considered and rejected: its failure mode is
+// that a held or stuck key makes the repair path *unavailable*, and an account
+// that cannot recover at all is a strictly worse outcome than an account with
+// one workspace too many. This endpoint exists precisely to stop accounts being
+// stuck.
+//
+// So the guarantee is "an account that already has an organization is refused",
+// which is what the code does and what the tests assert, and not "an account can
+// never come to have two", which nothing here enforces.
 //
 // It also does not issue a session. Token issuance stays in the three places the
 // package doc names — Login, Refresh, SwitchOrganization — each of which derives
@@ -145,7 +168,7 @@ func (s *Service) CreateFirstOrganization(ctx context.Context, in CreateOrganiza
 		return CreateOrganizationResult{}, &RateLimitError{RetryAfter: decision.RetryAfter}
 	}
 
-	subject, err := s.verifyCredential(ctx, email, in.Password, in.ClientIP)
+	subject, err := s.verifyCredential(ctx, operationCreateOrganization, email, in.Password, in.ClientIP)
 	if err != nil {
 		return CreateOrganizationResult{}, err
 	}
@@ -181,8 +204,9 @@ func (s *Service) CreateFirstOrganization(ctx context.Context, in CreateOrganiza
 
 	// The counterpart to auth.register.partial: that event says an account was
 	// left without an organization, this one says an account that had none now
-	// has one. An operator alerting on the first can close the alert on the
-	// second, matched by user_id.
+	// has one. Both carry user_id, so the two can be matched into "how many
+	// stranded accounts recovered themselves" by whoever reads the logs — today
+	// by hand, since this service has no metrics or alerting yet (issue #12).
 	s.logger.InfoContext(ctx, "first organization created for an account that had none",
 		slog.String("event", "auth.organization.created"),
 		slog.String("user_id", subject.ID.String()),

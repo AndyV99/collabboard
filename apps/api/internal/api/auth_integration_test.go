@@ -777,6 +777,15 @@ func TestNoTokenOrPasswordMaterialReachesTheLogs(t *testing.T) {
 	s.do(t, http.MethodPost, "/api/v1/auth/refresh", "",
 		map[string]string{"refresh_token": alice.refreshToken})
 
+	// The fourth endpoint that takes a password (issue #34), on both of its
+	// interesting paths: a wrong password, and a correct one that is refused
+	// because the account already has an organization. Both log, and neither
+	// may log the credential.
+	s.do(t, http.MethodPost, "/api/v1/organizations", "",
+		map[string]string{"email": alice.email, "password": "wrong"})
+	s.do(t, http.MethodPost, "/api/v1/organizations", "",
+		map[string]string{"email": alice.email, "password": integrationPass})
+
 	output := s.logs.String()
 
 	t.Logf("%d bytes of server log emitted during the flow", len(output))
@@ -796,7 +805,10 @@ func TestNoTokenOrPasswordMaterialReachesTheLogs(t *testing.T) {
 		}
 	}
 
-	for _, want := range []string{"auth.register.success", "auth.login.failed", "auth.refresh.success"} {
+	for _, want := range []string{
+		"auth.register.success", "auth.login.failed", "auth.refresh.success",
+		"auth.organization.already_exists",
+	} {
 		if !bytes.Contains([]byte(output), []byte(want)) {
 			t.Errorf("the logs do not contain %q; the assertions above would hold for a silent logger", want)
 		}

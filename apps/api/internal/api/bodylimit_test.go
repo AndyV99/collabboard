@@ -245,6 +245,19 @@ func TestOneByteOverTheLimitIsRefusedAndOneByteUnderIsNot(t *testing.T) {
 			wantUnder: http.StatusUnauthorized,
 		},
 		{
+			// The padding lands in organization_name, which is the one
+			// user-supplied field on this service with no length bound of its
+			// own (issue #67). This row is what makes "the body limit is the
+			// containment" a tested statement rather than an argument: the
+			// field is unbounded by validation and bounded by this.
+			name:      "an unauthenticated organization create, on the tighter limit",
+			limit:     authLimit,
+			path:      "/api/v1/organizations",
+			prefix:    `{"email":"someone@example.com","password":"pw","organization_name":"`,
+			suffix:    `"}`,
+			wantUnder: http.StatusUnauthorized,
+		},
+		{
 			name:         "an authenticated card create, on the global limit",
 			limit:        globalLimit,
 			path:         "/api/v1/columns/%s/cards",

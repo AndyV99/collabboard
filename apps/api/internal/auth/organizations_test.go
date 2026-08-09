@@ -190,6 +190,50 @@ func TestCreatingAFirstOrganizationRefusesAnAccountThatAlreadyHasOne(t *testing.
 	}
 }
 
+// TestTheAlreadyHasOneRefusalIsUnreachableWithoutThePassword pins the ordering
+// that makes the 409 safe to return at all.
+//
+// ErrAlreadyHasOrganization tells the caller that an address is registered *and*
+// has a workspace. That is only acceptable because it sits behind a correct
+// password, and nothing but statement order in CreateFirstOrganization makes it
+// so. The tempting optimization — read the memberships first and skip the
+// argon2id derivation when the account already has one — would turn this into
+// both an existence oracle and a free timing oracle, and would look like a
+// performance win to someone who did not know why the order was that way.
+//
+// So: a registered account with an organization, presented with the *wrong*
+// password, must be indistinguishable from any other credential failure.
+func TestTheAlreadyHasOneRefusalIsUnreachableWithoutThePassword(t *testing.T) {
+	t.Parallel()
+
+	h := newHarness(t, generousLimits())
+	h.register(t, "founder@example.com")
+
+	h.deriver.reset()
+
+	_, err := h.service.CreateFirstOrganization(context.Background(), auth.CreateOrganizationInput{
+		Email: "founder@example.com", Password: otherTestPassword, ClientIP: "198.51.100.7",
+	})
+
+	t.Logf("an account that has an organization, wrong password -> %v (%d derivations)",
+		err, h.deriver.count())
+
+	if errors.Is(err, auth.ErrAlreadyHasOrganization) {
+		t.Fatal("a wrong password was answered with ErrAlreadyHasOrganization; the refusal that " +
+			"discloses an account has a workspace is reachable without the credential")
+	}
+
+	if !errors.Is(err, auth.ErrInvalidCredentials) {
+		t.Fatalf("CreateFirstOrganization = %v, want %v", err, auth.ErrInvalidCredentials)
+	}
+
+	// And it cost the same derivation every other credential failure costs, so
+	// the membership read was not skipped ahead of the expensive step.
+	if got := h.deriver.count(); got != 1 {
+		t.Errorf("%d argon2id derivations, want exactly 1", got)
+	}
+}
+
 // TestCreatingAFirstOrganizationDoesTheSameWorkWhateverIsWrong is
 // TestLoginDoesTheSameWorkWhateverIsWrong for this endpoint.
 //

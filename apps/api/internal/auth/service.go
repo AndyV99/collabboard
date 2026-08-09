@@ -318,6 +318,14 @@ func (s *Service) Register(ctx context.Context, in RegisterInput) (RegisterResul
 // the organization.
 const RoleOwner = "owner"
 
+// The endpoints that accept a password, as they appear in a failed-attempt log
+// line. A closed set of literals rather than a caller-supplied string, so the
+// field cannot carry attacker-controlled text into the logs.
+const (
+	operationLogin              = "login"
+	operationCreateOrganization = "create_organization"
+)
+
 // provisionOrganization creates an organization and the owner membership that
 // makes userID its first member, in one tenant-scoped transaction.
 //
@@ -458,7 +466,7 @@ func (s *Service) Login(ctx context.Context, in LoginInput) (LoginResult, error)
 		return LoginResult{}, &RateLimitError{RetryAfter: decision.RetryAfter}
 	}
 
-	subject, err := s.verifyCredential(ctx, email, in.Password, in.ClientIP)
+	subject, err := s.verifyCredential(ctx, operationLogin, email, in.Password, in.ClientIP)
 	if err != nil {
 		return LoginResult{}, err
 	}
@@ -728,7 +736,14 @@ func (s *Service) startSession(ctx context.Context, userID uuid.UUID, org Organi
 // and it stays with the callers, because the budget is per *endpoint attempt*
 // and a caller that forgot it should be a missing line in a short function
 // rather than a silently absent behaviour inside a long one.
-func (s *Service) verifyCredential(ctx context.Context, email, password, clientIP string) (store.IdentityUser, error) {
+//
+// operation is the label a failed attempt is logged under, so that the two
+// endpoints presenting a password remain distinguishable to an operator. It
+// changes nothing a caller can observe — see [Service.logFailedLogin].
+func (s *Service) verifyCredential(
+	ctx context.Context,
+	operation, email, password, clientIP string,
+) (store.IdentityUser, error) {
 	userID, user, candidate := s.loginSubject(ctx, email)
 
 	key, err := s.derive(ctx, password, candidate.salt, candidate.params)
@@ -743,7 +758,7 @@ func (s *Service) verifyCredential(ctx context.Context, email, password, clientI
 
 	switch {
 	case errors.Is(err, store.ErrNotFound):
-		s.logFailedLogin(ctx, "credentials", clientIP)
+		s.logFailedLogin(ctx, operation, "credentials", clientIP)
 
 		return store.IdentityUser{}, ErrInvalidCredentials
 	case err != nil:
@@ -877,9 +892,19 @@ func (s *Service) organizations(ctx context.Context, userID uuid.UUID) ([]Organi
 // and none of them need the address — while a log full of addresses is a
 // credential-stuffing target list with timestamps. The rate limiter's counters
 // are keyed by a peppered hash for the same reason.
-func (s *Service) logFailedLogin(ctx context.Context, reason, clientIP string) {
-	s.logger.InfoContext(ctx, "login failed",
+//
+// operation names which endpoint the credential was presented to, because since
+// issue #34 there is more than one. Without it every wrong password on
+// POST /api/v1/organizations would be indistinguishable from one on
+// POST /auth/login, and an alert on the login-failure rate would silently be an
+// alert on two endpoints at once. It is a closed set of literals from the two
+// call sites, so it cannot carry attacker-controlled text, and it discloses
+// nothing: this is a server-side log, not a response, and the *response* still
+// has to be identical for every failing case.
+func (s *Service) logFailedLogin(ctx context.Context, operation, reason, clientIP string) {
+	s.logger.InfoContext(ctx, "credential presentation failed",
 		slog.String("event", "auth.login.failed"),
+		slog.String("operation", operation),
 		slog.String("reason", reason),
 		slog.String("client_ip", clientIP),
 	)

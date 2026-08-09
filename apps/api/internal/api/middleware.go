@@ -65,8 +65,10 @@ func requestLogger(logger *slog.Logger) gin.HandlerFunc {
 //
 // # Two limits
 //
-// The tighter one is applied to the four unauthenticated auth routes. The
-// arithmetic behind both numbers is on HTTPConfig in internal/config.
+// The tighter one is applied to the five routes an anonymous caller can reach:
+// the four under /auth, and POST /organizations, which takes a password for the
+// reason internal/auth/organizations.go explains. The arithmetic behind both
+// numbers is on HTTPConfig in internal/config.
 //
 // # What a refusal costs the connection
 //
