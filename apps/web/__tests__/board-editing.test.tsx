@@ -23,6 +23,27 @@
  * `next/navigation` is mocked because there is no router in a unit test.
  * Everything else — the validation, the request through `/api/proxy`, the error
  * mapping, the optimistic reducer — is the real thing.
+ *
+ * # Never assert optimistic DOM after an immediately-resolving `respond(...)`
+ *
+ * This is the one way to write a flaky test in this file, and it was written
+ * once. `refresh` here is a bare `vi.fn()`, so no new props ever arrive: on
+ * success the transition ends, React discards the optimistic value, and the
+ * board re-renders from the *unchanged* `snapshot` prop. The optimistic state
+ * therefore exists only between the click and the transition ending, and with
+ * `respond(...)` that is not a state — it is a race, which loses under
+ * full-suite load.
+ *
+ * So each assertion belongs to exactly one of three shapes:
+ *
+ *   - **the change is visible before the answer** → use {@link pending}, which
+ *     holds the response open so the window genuinely lasts;
+ *   - **the right request went out** → assert on the stub, or on `refresh` /
+ *     `push` having been called; a mock call is permanent once it happens;
+ *   - **the change stuck** → `respond(...)`, wait for `refresh`, then
+ *     `rerender` with the board the server would now return. That is what
+ *     `router.refresh()` does in production, and it is the only honest way to
+ *     assert a *durable* result here.
  */
 
 import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
@@ -680,7 +701,9 @@ describe("deleting a column", () => {
     const fetchStub = respond(204);
 
     vi.stubGlobal("fetch", fetchStub);
-    renderBoard();
+
+    const view = renderBoard();
+
     openColumnTools("Doing");
     fireEvent.click(screen.getByRole("button", { name: "Delete column" }));
     fireEvent.click(screen.getByRole("button", { name: "Delete column and 3 cards" }));
@@ -689,7 +712,43 @@ describe("deleting a column", () => {
     expect(sentTo(fetchStub)).toBe("/api/proxy/columns/c-doing");
     expect(sentMethod(fetchStub)).toBe("DELETE");
 
+    // The board is re-read rather than patched, so this is where the delete
+    // actually becomes permanent.
+    await waitFor(() => expect(refresh).toHaveBeenCalled());
+
+    // The load-bearing assertion on this path: a 204 with no body was read as a
+    // success. `DELETE` is the only endpoint here that answers with nothing, so
+    // it is the only one whose success depends on `expectNoContent` and
+    // `parseEmpty` agreeing — get that wrong and the delete "works", the row is
+    // gone from the database, and the UI rolls back and reports a failure.
+    expect(failureBanner()).toBeNull();
+
+    // What `router.refresh()` produces in production: the Server Component runs
+    // again and the page re-renders without the column or its cards.
+    //
+    // Asserting the *optimistic* disappearance here instead would be a race, and
+    // was one — `refresh` is a bare `vi.fn()`, so nothing new ever arrives, and
+    // on success React drops the optimistic value and re-renders from the
+    // unchanged `snapshot` prop, which still has all three columns. With an
+    // immediately-resolving `respond()` that window is already closed before
+    // `waitFor` first samples the DOM, roughly three runs in eight under
+    // full-suite load. The optimistic disappearance is covered by the ROLLBACK
+    // test below, which holds the request open so the window is real.
+    view.rerender(
+      <BoardView
+        boardId={BOARD}
+        projectId={PROJECT}
+        selectedCardId={null}
+        snapshot={groupCardsIntoColumns(
+          COLUMNS.filter((entry) => entry.id !== "c-doing") as never,
+          CARDS.filter((entry) => entry.columnId !== "c-doing") as never,
+        )}
+      />,
+    );
+
     await waitFor(() => expect(columnOrder()).toEqual(["To do", "Done"]));
+    expect(screen.queryByText("Zebra")).not.toBeInTheDocument();
+    expect(screen.queryByText("Kilo")).not.toBeInTheDocument();
   });
 
   it("ROLLBACK: brings the column and every card in it back when the delete fails", async () => {
