@@ -25,12 +25,14 @@
 
 import type { Endpoint } from "./http";
 import {
+  type AddedMember,
   type Board,
   type Card,
   type Column,
   type CurrentUser,
   type Member,
   type Project,
+  parseAddedMember,
   parseBoard,
   parseCard,
   parseColumn,
@@ -65,6 +67,32 @@ export function currentUser(): Endpoint<CurrentUser> {
 /** `GET /members` — everyone in the token's organization. */
 export function listMembers(): Endpoint<Member[]> {
   return { method: "GET", path: "/members", parse: parseList("members", parseMember) };
+}
+
+/**
+ * `POST /members` — put an existing account into the caller's organization.
+ *
+ * There is no organization field and deliberately nowhere to put one: the
+ * tenant is the caller's verified org claim, on this side of the wire as on the
+ * other. See ADR 0008 for why this is a direct add rather than an invitation,
+ * and `apps/api/internal/auth/members.go` for the statuses — 403 when the
+ * caller's role does not permit it, 404 when the address has no account, 409
+ * when the account is already a member.
+ *
+ * `role` is omitted rather than sent empty when the caller does not choose one;
+ * `JSON.stringify` drops an `undefined` value, and the API reads an absent role
+ * as `member`.
+ */
+export function addMember(input: {
+  email: string;
+  role?: string;
+}): Endpoint<AddedMember> {
+  return {
+    method: "POST",
+    path: "/members",
+    body: input,
+    parse: envelope("member", parseAddedMember),
+  };
 }
 
 export function listProjects(): Endpoint<Project[]> {
