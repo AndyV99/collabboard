@@ -5,7 +5,7 @@ services:
       # The cluster's bootstrap superuser. Nothing in the application connects
       # as it: it exists to create collabboard_owner on first start, which is
       # the one thing a migration cannot do for itself. See
-      # docs/adr/0005-database-role-provisioning.md.
+      # docs/adr/0006-database-role-provisioning.md.
       POSTGRES_USER: collabboard
       POSTGRES_PASSWORD: dev
       POSTGRES_DB: collabboard
