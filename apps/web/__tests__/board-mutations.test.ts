@@ -14,7 +14,11 @@ import { describe, expect, it } from "vitest";
 import type { Card, Column } from "@/lib/api/types";
 import {
   applyBoardChange,
+  cardDropTarget,
+  cardNudge,
+  cardPosition,
   isPendingId,
+  isRedundantMove,
   moveAnchor,
   pendingId,
 } from "@/lib/board/mutations";
@@ -284,6 +288,338 @@ describe("moveAnchor", () => {
     });
 
     expect(names(back)).toEqual(["To do", "Doing", "Done"]);
+  });
+});
+
+describe("moving a card", () => {
+  /** Applies a move and reports the column it landed in, top to bottom. */
+  function afterMove(
+    cardId: string,
+    columnId: string,
+    afterCardId: string | null,
+    snapshot = SNAPSHOT,
+  ) {
+    return applyBoardChange(snapshot, {
+      kind: "card.moved",
+      cardId,
+      columnId,
+      afterCardId,
+    });
+  }
+
+  it("re-inserts the card after the anchor, within its own column", () => {
+    // Zebra, Kilo, Alpha → Kilo, Alpha, Zebra.
+    expect(titles(afterMove("card-3", "c-2", "card-1"), "c-2")).toEqual([
+      "Kilo",
+      "Alpha",
+      "Zebra",
+    ]);
+  });
+
+  it("reads a null anchor as first, the way the API does", () => {
+    expect(titles(afterMove("card-1", "c-2", null), "c-2")).toEqual([
+      "Alpha",
+      "Zebra",
+      "Kilo",
+    ]);
+  });
+
+  it("resolves the anchor after lifting the card out, so a one-place nudge works", () => {
+    // Moving Zebra after Kilo means one place down, not two. The anchor is
+    // resolved against the list with Zebra already removed — `MoveCard`'s
+    // anchor CTE excludes the moving row for exactly this reason.
+    expect(titles(afterMove("card-3", "c-2", "card-2"), "c-2")).toEqual([
+      "Kilo",
+      "Zebra",
+      "Alpha",
+    ]);
+  });
+
+  it("takes the card out of the column it was in when it crosses", () => {
+    const moved = afterMove("card-3", "c-1", "card-4");
+
+    expect(titles(moved, "c-1")).toEqual(["Mike", "Zebra"]);
+    expect(titles(moved, "c-2")).toEqual(["Kilo", "Alpha"]);
+  });
+
+  it("moves a card into an empty column", () => {
+    expect(titles(afterMove("card-3", "c-3", null), "c-3")).toEqual(["Zebra"]);
+  });
+
+  it("rewrites the card's own columnId, not just which bucket it sits in", () => {
+    // The detail panel names the column from `card.columnId`. A card drawn in
+    // Done that still says it is in Doing is a screen contradicting itself.
+    const moved = afterMove("card-3", "c-3", null);
+
+    expect(moved.columns[2].cards[0].columnId).toBe("c-3");
+  });
+
+  it("does nothing when the anchor is not in the target column", () => {
+    // The stale drag. The API answers 409 and this answers by leaving the board
+    // alone: the optimistic move that declines to guess is the one that still
+    // agrees with the server a moment later.
+    expect(titles(afterMove("card-3", "c-2", "card-4"), "c-2")).toEqual([
+      "Zebra",
+      "Kilo",
+      "Alpha",
+    ]);
+  });
+
+  it("does nothing when the target column is not on the board", () => {
+    expect(titles(afterMove("card-3", "c-gone", null), "c-2")).toEqual([
+      "Zebra",
+      "Kilo",
+      "Alpha",
+    ]);
+  });
+
+  it("does nothing when the card has been deleted underneath the move", () => {
+    expect(titles(afterMove("card-gone", "c-1", null), "c-1")).toEqual(["Mike"]);
+  });
+
+  it("does not mutate the snapshot it was given", () => {
+    afterMove("card-3", "c-1", "card-4");
+
+    expect(titles(SNAPSHOT, "c-2")).toEqual(["Zebra", "Kilo", "Alpha"]);
+    expect(titles(SNAPSHOT, "c-1")).toEqual(["Mike"]);
+  });
+});
+
+describe("cardPosition", () => {
+  it("reports the column and a 1-based place in it", () => {
+    expect(cardPosition(SNAPSHOT, "card-2")).toEqual({
+      columnName: "Doing",
+      index: 2,
+      total: 3,
+    });
+  });
+
+  it("is undefined for a card that is not on the board", () => {
+    expect(cardPosition(SNAPSHOT, "card-gone")).toBeUndefined();
+  });
+});
+
+describe("cardNudge — the keyboard reaching every placement", () => {
+  it("moves down by naming the card below as the anchor", () => {
+    expect(cardNudge(SNAPSHOT, "card-3", "down")).toEqual({
+      cardId: "card-3",
+      columnId: "c-2",
+      afterCardId: "card-2",
+    });
+  });
+
+  it("moves up by naming the card two places above, or null at the top", () => {
+    // Alpha is third. To land second it goes after Zebra, which is first.
+    expect(cardNudge(SNAPSHOT, "card-1", "up")).toEqual({
+      cardId: "card-1",
+      columnId: "c-2",
+      afterCardId: "card-3",
+    });
+
+    // Kilo is second. To land first there is no anchor to name.
+    expect(cardNudge(SNAPSHOT, "card-2", "up")).toEqual({
+      cardId: "card-2",
+      columnId: "c-2",
+      afterCardId: null,
+    });
+  });
+
+  it("refuses to move past either end of a column", () => {
+    expect(cardNudge(SNAPSHOT, "card-3", "up")).toBeUndefined();
+    expect(cardNudge(SNAPSHOT, "card-1", "down")).toBeUndefined();
+  });
+
+  it("crosses to the next column keeping the card's row", () => {
+    // Kilo is second in Doing; To do has one card, so second is after Mike.
+    expect(cardNudge(SNAPSHOT, "card-2", "left")).toEqual({
+      cardId: "card-2",
+      columnId: "c-1",
+      afterCardId: "card-4",
+    });
+  });
+
+  it("clamps to the end of a shorter column rather than inventing a row", () => {
+    // Alpha is third in Doing and To do has one card: the third row does not
+    // exist there, so the card goes after the last one that does.
+    expect(cardNudge(SNAPSHOT, "card-1", "left")).toEqual({
+      cardId: "card-1",
+      columnId: "c-1",
+      afterCardId: "card-4",
+    });
+  });
+
+  it("crosses into an empty column with a null anchor", () => {
+    expect(cardNudge(SNAPSHOT, "card-2", "right")).toEqual({
+      cardId: "card-2",
+      columnId: "c-3",
+      afterCardId: null,
+    });
+  });
+
+  it("refuses to move past either end of the board", () => {
+    expect(cardNudge(SNAPSHOT, "card-4", "left")).toBeUndefined();
+    expect(cardNudge(applyBoardChange(SNAPSHOT, {
+      kind: "card.moved",
+      cardId: "card-3",
+      columnId: "c-3",
+      afterCardId: null,
+    }), "card-3", "right")).toBeUndefined();
+  });
+
+  it("reaches any position in any column by repetition, which is the whole claim", () => {
+    // Alpha, bottom of Doing, to the top of To do. Left clamps it to the end of
+    // the shorter column, then one Up puts it first — and the board is the same
+    // one a drag there would have produced.
+    let board = SNAPSHOT;
+
+    for (const direction of ["left", "up"] as const) {
+      const move = cardNudge(board, "card-1", direction);
+
+      expect(move).toBeDefined();
+      board = applyBoardChange(board, { kind: "card.moved", ...move! });
+    }
+
+    expect(titles(board, "c-1")).toEqual(["Alpha", "Mike"]);
+    expect(titles(board, "c-2")).toEqual(["Zebra", "Kilo"]);
+  });
+
+  it("skips a card the server has not acknowledged when picking an anchor", () => {
+    // A `pending:` id is not a uuid and the API answers 400 to one. Pending
+    // cards are always at the bottom, so the nearest real anchor is the last
+    // settled card — which is also the truest thing that can be said.
+    const invented = pendingId();
+    const withPending = groupCardsIntoColumns(COLUMNS, [
+      ...CARDS,
+      card(invented, "c-1", "Not yet"),
+    ]);
+
+    // Alpha is third in Doing. To do is now [Mike, Not yet], so the third row
+    // clamps to the second — which is the unacknowledged card. The anchor walks
+    // back to Mike rather than naming an id the API would answer 400 to.
+    expect(cardNudge(withPending, "card-1", "left")?.afterCardId).toBe("card-4");
+  });
+});
+
+describe("cardDropTarget — the pointer's landing place", () => {
+  it("lands after the card it was dragged down onto", () => {
+    // Zebra is first, dragged onto Alpha which is third: the sortable strategy
+    // has opened the gap below Alpha, so the anchor is Alpha.
+    expect(cardDropTarget(SNAPSHOT, "card-3", { card: "card-1" }, false)).toEqual({
+      cardId: "card-3",
+      columnId: "c-2",
+      afterCardId: "card-1",
+    });
+  });
+
+  it("lands before the card it was dragged up onto", () => {
+    // Alpha is third, dragged onto Zebra which is first: the gap is above
+    // Zebra, so there is no anchor to name.
+    expect(cardDropTarget(SNAPSHOT, "card-1", { card: "card-3" }, true)).toEqual({
+      cardId: "card-1",
+      columnId: "c-2",
+      afterCardId: null,
+    });
+  });
+
+  it("ignores which side of the card the pointer is on, within a column", () => {
+    // Deliberate: the library is already drawing the gap from the indices, and
+    // committing anything else puts the card one place from where the user was
+    // looking. Both calls differ only in `after` and must agree.
+    expect(cardDropTarget(SNAPSHOT, "card-3", { card: "card-1" }, true)).toEqual(
+      cardDropTarget(SNAPSHOT, "card-3", { card: "card-1" }, false),
+    );
+  });
+
+  it("uses the pointer's side when the card is entering another column", () => {
+    expect(
+      cardDropTarget(SNAPSHOT, "card-3", { card: "card-4" }, false)?.afterCardId,
+    ).toBeNull();
+
+    expect(
+      cardDropTarget(SNAPSHOT, "card-3", { card: "card-4" }, true)?.afterCardId,
+    ).toBe("card-4");
+  });
+
+  it("appends when the drop is on the column rather than on a card", () => {
+    // The empty space under the last card, which is the only way to reach the
+    // bottom of a full column with a pointer.
+    expect(cardDropTarget(SNAPSHOT, "card-3", { column: "c-2" }, false)).toEqual({
+      cardId: "card-3",
+      columnId: "c-2",
+      afterCardId: "card-1",
+    });
+  });
+
+  it("drops into an empty column with a null anchor", () => {
+    expect(cardDropTarget(SNAPSHOT, "card-3", { column: "c-3" }, false)).toEqual({
+      cardId: "card-3",
+      columnId: "c-3",
+      afterCardId: null,
+    });
+  });
+
+  it("has no answer for a card dropped on itself", () => {
+    expect(cardDropTarget(SNAPSHOT, "card-3", { card: "card-3" }, false)).toBeUndefined();
+  });
+
+  it("has no answer for a card or column that is not on the board", () => {
+    expect(cardDropTarget(SNAPSHOT, "gone", { card: "card-1" }, false)).toBeUndefined();
+    expect(cardDropTarget(SNAPSHOT, "card-3", { card: "gone" }, false)).toBeUndefined();
+    expect(cardDropTarget(SNAPSHOT, "card-3", { column: "gone" }, false)).toBeUndefined();
+  });
+});
+
+describe("isRedundantMove", () => {
+  it("is true for the placement a card already has", () => {
+    // Kilo is second in Doing, which is "after Zebra".
+    expect(
+      isRedundantMove(SNAPSHOT, {
+        cardId: "card-2",
+        columnId: "c-2",
+        afterCardId: "card-3",
+      }),
+    ).toBe(true);
+  });
+
+  it("is true for the first card being asked to go first", () => {
+    expect(
+      isRedundantMove(SNAPSHOT, {
+        cardId: "card-3",
+        columnId: "c-2",
+        afterCardId: null,
+      }),
+    ).toBe(true);
+  });
+
+  it("is true for a card anchored on itself, which the API answers with 409", () => {
+    // `MoveCard`'s anchor CTE excludes the moving row, so this matches nothing
+    // and is refused rather than being the no-op it looks like. It is what
+    // "drop the card back where it came from" computes to, so it is not rare.
+    expect(
+      isRedundantMove(SNAPSHOT, {
+        cardId: "card-2",
+        columnId: "c-2",
+        afterCardId: "card-2",
+      }),
+    ).toBe(true);
+  });
+
+  it("is false for a real move, including one that only changes column", () => {
+    expect(
+      isRedundantMove(SNAPSHOT, {
+        cardId: "card-2",
+        columnId: "c-2",
+        afterCardId: null,
+      }),
+    ).toBe(false);
+
+    expect(
+      isRedundantMove(SNAPSHOT, {
+        cardId: "card-4",
+        columnId: "c-3",
+        afterCardId: null,
+      }),
+    ).toBe(false);
   });
 });
 
