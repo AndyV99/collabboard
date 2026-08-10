@@ -42,6 +42,8 @@ docs/adr/            architecture decision records
 ## Getting started
 
 ```bash
+scripts/setup-hooks.sh               # once per clone: pre-commit secret scan
+
 docker compose up -d                 # Postgres + Redis, and collabboard_owner
 
 cd apps/api
@@ -177,9 +179,51 @@ application cannot connect as a role that bypasses row-level security, because
 it cannot read that role's password. Provisioning the real `collabboard_owner`
 and `collabboard_app` credentials is issue #56.
 
+## Secret scanning
+
+Nothing in this repository is a credential, and three separate things keep it
+that way — deliberately, because they fail in different ways:
+
+| | Where it runs | Needs setup? | Catches |
+|---|---|---|---|
+| `.githooks/pre-commit` | your machine, before the commit exists | yes, once | the mistake while it is still free to fix |
+| GitHub push protection | GitHub, on `git push` | no | anything the hook missed or never ran on |
+| `secret-scan` in CI | GitHub Actions, on every PR | no | the full history of the branch, and blocks the merge |
+
+Only the first one prevents an incident. Once a commit is pushed, the credential
+in it is compromised whether or not a later commit removes it — the commit is on
+GitHub's servers and stays reachable. So the other two are damage control that
+tell you to go and rotate something, which is why the hook is worth a manual
+setup step:
+
+```bash
+scripts/setup-hooks.sh
+```
+
+Skip it and nothing warns you; `git commit` just behaves as it always did. That
+is a limitation of git, not a choice — a repository cannot install its own
+hooks, or cloning one would be arbitrary code execution.
+
+All three run the same gitleaks build against the same `.gitleaks.toml`, because
+both entry points go through `scripts/gitleaks.sh`, which pins the version and
+its checksum. To scan by hand:
+
+```bash
+scripts/gitleaks.sh git --no-banner .    # full history, what CI does
+scripts/gitleaks.sh dir --no-banner .    # working tree only
+```
+
+**False positives.** This repo is full of realistic-looking fixtures, and a few
+of them trip the default rules. The allowlist in `.gitleaks.toml` is scoped to
+specific *values*, never to paths — a test file is exactly where someone pastes a
+real value "just to check something", so switching the scanner off there would
+defeat the point. If you add a fixture that trips a rule, add a value-scoped
+entry with a note on why it cannot be a real credential.
+
 ## Commands
 
 - API: `go build ./...` · `go test ./...` · `go test -tags=integration ./...` · `golangci-lint run` · `sqlc generate`
 - Web: `npm run dev` · `npm test` · `npm run lint`
 - E2E: `npx playwright test` (needs both services, or the compose stack)
 - Infra: `terraform fmt -recursive` · `terraform validate` (in `bootstrap/` or an environment)
+- Secrets: `scripts/setup-hooks.sh` (once) · `scripts/gitleaks.sh git --no-banner .`

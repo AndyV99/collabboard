@@ -25,18 +25,34 @@ root="$(git rev-parse --show-toplevel)"
 # would itself become a place the secret is stored, while this output goes to
 # the terminal of the person who just typed the secret. Seeing the matched value
 # is what makes a false positive quick to recognise.
-if "${root}/scripts/gitleaks.sh" git --staged --no-banner --verbose; then
+#
+# --exit-code 2 moves "found something" off gitleaks' default exit 1, because
+# gitleaks also exits 1 when it could not run at all -- a malformed config, for
+# instance. Without this the two are indistinguishable and the hook confidently
+# tells you there is a credential in your diff when in fact it never looked.
+# With it: 0 clean, 2 findings, anything else the scanner itself failed.
+#
+# `set -e` is off around the call and the status is captured from the command
+# itself. Writing this as `if ! gitleaks; then status=$?; ...` looks equivalent
+# and is not: the `if` resets `$?`, so `status` reads 0 on a finding and the
+# hook prints the leak and then exits 0, allowing the commit. That is not
+# hypothetical -- it is what the first version of this file did, and the drill
+# that found it is the reason #106 asked for a planted credential instead of a
+# clean-repo run. A hook that reports and does not block is the worst outcome
+# available, so keep the status capture exactly as it is.
+set +e
+"${root}/scripts/gitleaks.sh" git --staged --no-banner --verbose --exit-code 2
+status=$?
+set -e
+
+if [ "$status" -eq 0 ]; then
 	exit 0
 fi
 
-status=$?
-
-# gitleaks exits 1 for findings and something else for an error it could not
-# recover from (no network on a cold cache, a checksum mismatch, a malformed
-# config). Both block the commit -- a scanner that silently passes when it
-# failed to run is worse than no scanner, because it produces confidence
-# without coverage -- but they need different advice.
-if [ "$status" -ne 1 ]; then
+# Both paths block the commit -- a scanner that silently passes when it failed
+# to run is worse than no scanner, because it produces confidence without
+# coverage -- but they need different advice.
+if [ "$status" -ne 2 ]; then
 	cat >&2 <<-EOF
 
 		gitleaks could not run (exit ${status}), so the staged changes were NOT scanned.

@@ -37,11 +37,18 @@ Standard Go project layout: `cmd/api/main.go` as the entrypoint, business logic 
 
 `docker-compose.yml` at the repo root brings up Postgres + Redis. `apps/web` talks to `apps/api` on `localhost:8080` in dev.
 
+Run `scripts/setup-hooks.sh` once per clone. It points `core.hooksPath` at `.githooks/`, which installs a pre-commit gitleaks scan. Git cannot install this itself and nothing warns you if you skip it — see the README's "Secret scanning" section for what still covers you if you do.
+
 ## Commands
 
 - API: `go build ./...` · `go test ./...` · `golangci-lint run`
 - Web: `npm run dev` · `npm test` · `npm run lint`
 - E2E: `npx playwright test` (requires both services running, or the compose stack)
+- Secrets: `scripts/gitleaks.sh git --no-banner .` — same binary and same `.gitleaks.toml` the hook and CI use
+
+## Adding a test fixture that looks like a credential
+
+`.gitleaks.toml`'s allowlist is scoped to values, never to paths, and should stay that way: excluding `**/*_test.go` would turn the scanner off in the place a real value is most likely to be pasted temporarily. If a new fixture trips a rule, add the literal value with a note on why it cannot be a real credential, or put a `gitleaks:allow` comment on the line for a one-off.
 
 ## Repo-specific notes
 

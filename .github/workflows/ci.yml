@@ -390,6 +390,17 @@ jobs:
       # version and its checksum. An action here would drift from the hook the
       # first time either side moved, and would do it silently -- both would
       # still report "no leaks found", just about different rulesets.
+      #
+      # --redact keeps the matched value out of the log. A findings line still
+      # carries file, line and commit, which is enough to go and look; the value
+      # itself would turn a public, retained build log into a second place the
+      # credential is published. The hook does not redact, because that output
+      # goes to the terminal of the person who just typed it.
+      #
+      # No --exit-code juggling here, unlike the hook. The hook has to tell "a
+      # secret is staged" apart from "the scanner failed" because it prints
+      # different advice for each and gitleaks uses exit 1 for both; this job
+      # just needs to go red, and whoever opens the log sees which it was.
       - name: gitleaks (full history)
         run: ./scripts/gitleaks.sh git --no-banner --redact --verbose .
 
