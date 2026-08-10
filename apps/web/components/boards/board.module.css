@@ -499,6 +499,61 @@
   clip-path: inset(50%);
 }
 
+/* --- live connection -------------------------------------------------- */
+
+/*
+ * Whether this board is still hearing about other people's changes.
+ *
+ * Above the columns rather than in the page header, because the header is a
+ * Server Component and this state is only knowable on the client. Keeping it
+ * inside the client boundary also puts it next to the failure message it is a
+ * sibling of — those are the board's two ways of saying something is not right,
+ * and stacking them in one place stops them competing for a corner of the
+ * screen.
+ *
+ * The colours are the health vocabulary from `globals.css` (`--ok`,
+ * `--degraded`, `--down`) rather than new ones: "this connection is fine /
+ * struggling / gone" is the same question the landing page asks about the API,
+ * and answering it in a second palette would make the two look unrelated.
+ */
+.connection {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  flex-wrap: wrap;
+  font-size: 0.8125rem;
+  color: var(--muted);
+}
+
+.connectionDot {
+  width: 0.5rem;
+  height: 0.5rem;
+  border-radius: 50%;
+  flex: none;
+  background: var(--muted);
+}
+
+.connectionLive {
+  background: var(--ok);
+}
+
+.connectionWaiting {
+  background: var(--degraded);
+}
+
+.connectionStopped {
+  background: var(--down);
+}
+
+.connectionLabel {
+  font-weight: 500;
+  color: var(--foreground);
+}
+
+.connectionDetail {
+  color: var(--muted);
+}
+
 /* --- loading ---------------------------------------------------------- */
 
 .skeletonColumn {

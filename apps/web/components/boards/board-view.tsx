@@ -22,6 +22,8 @@ import { CardDetail, CardNotOnBoard } from "./card-detail";
 import { CardDragArea, CardDropZone, DraggableCard, PendingCard } from "./card-drag";
 import type { DragReport } from "./card-drag";
 import { useCardMoves } from "./card-moves";
+import { ConnectionStatus } from "./connection-status";
+import { hasPendingEntities, useBoardLive } from "./use-board-live";
 import styles from "./board.module.css";
 import workspace from "@/components/workspace/workspace.module.css";
 
@@ -122,7 +124,25 @@ export function BoardView({
    */
   selectedCardId: string | null;
 }) {
-  const [board, applyChange] = useOptimistic(snapshot, applyBoardChange);
+  /**
+   * Whether anything on screen is waiting for the server, read asynchronously
+   * by the live layer when an inbound create arrives. Written below, once the
+   * optimistic board for this frame is known — see `use-board-live.ts` for why
+   * it is a ref and not a prop.
+   */
+  const pendingWrites = useRef(false);
+
+  // #66's middle layer. `live` is the server's snapshot with everyone else's
+  // events folded over it; the optimistic store then sits on top, so this
+  // user's own unconfirmed edit is applied last and wins. That ordering is what
+  // stops a card jumping out from under a drag — see `use-board-live.ts`.
+  const { board: live, status: connection } = useBoardLive({
+    boardId,
+    pending: pendingWrites,
+    snapshot,
+  });
+
+  const [board, applyChange] = useOptimistic(live, applyBoardChange);
 
   // Keyed so that the same message reported twice still moves focus: a second
   // failure that reads identically to the first is still news.
@@ -159,6 +179,12 @@ export function BoardView({
   // edit React is holding, plus the move being proposed. Only the last of those
   // is undecided, and it is undone by setting it back to null.
   const shown = proposal === null ? board : applyBoardChange(board, { kind: "card.moved", ...proposal });
+
+  // After the optimistic board is known, so the live layer's check covers a
+  // create that has been drawn but not yet acknowledged.
+  useEffect(() => {
+    pendingWrites.current = hasPendingEntities(board);
+  }, [board]);
 
   const columns = shown.columns.map((entry) => entry.column);
   const cards = [...shown.columns.flatMap((entry) => entry.cards), ...shown.unplaced];
@@ -360,6 +386,8 @@ export function BoardView({
       }
     >
       <div className={styles.boardArea}>
+        <ConnectionStatus status={connection} />
+
         {failure !== null && (
           <FormMessage messageRef={alertRef} title="That change was not saved">
             <p>{failure.message}</p>
