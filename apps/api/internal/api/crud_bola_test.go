@@ -34,7 +34,9 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"slices"
@@ -59,10 +61,22 @@ type tenantObjects struct {
 	board   store.Board
 	column  store.Column
 	card    store.Card
+
+	// otherColumn is a second column on the same board, holding no card.
+	//
+	// The cross-tenant questions need only one of everything, and for a long
+	// time there was only one. #93 added the second, because with a single
+	// column a card move's from_column_id and to_column_id are necessarily the
+	// same uuid — so a test asserting both would pass just as happily against a
+	// handler that had them swapped. It is the destination in
+	// movelog_test.go's move cases, and it is on the same board so that it is a
+	// legal destination rather than a conflict.
+	otherColumn store.Column
 }
 
 func newTenantObjects(tenantID uuid.UUID, marker string) *tenantObjects {
 	projectID, boardID, columnID, cardID := uuid.New(), uuid.New(), uuid.New(), uuid.New()
+	otherColumnID := uuid.New()
 
 	return &tenantObjects{
 		marker: marker,
@@ -74,6 +88,9 @@ func newTenantObjects(tenantID uuid.UUID, marker string) *tenantObjects {
 		},
 		column: store.Column{
 			ID: columnID, TenantID: tenantID, BoardID: boardID, Name: marker + "-column",
+		},
+		otherColumn: store.Column{
+			ID: otherColumnID, TenantID: tenantID, BoardID: boardID, Name: marker + "-other-column",
 		},
 		card: store.Card{
 			ID: cardID, TenantID: tenantID, BoardID: boardID, ColumnID: columnID,
@@ -99,6 +116,23 @@ type crudStore struct {
 	// only one where a handler could plausibly have already decided the write
 	// happened. See TestARolledBackWriteBroadcastsNothing.
 	failCommit error
+
+	// needsRebalance makes every move report that it crossed the renumbering
+	// threshold, which the real MoveCard/MoveColumn decide from a gap between
+	// ranks that a fake with no ranks cannot reach. It is the only way to get
+	// the branch under test — see movelog_test.go.
+	needsRebalance bool
+
+	// rebalanced records the parent id each renumbering ran for, so a test can
+	// tell "the log line was written" from "the renumbering actually happened".
+	rebalanced []uuid.UUID
+
+	// joinOnError models what store.Store.WithTenant does when the rollback of
+	// an already-failing transaction itself fails: it *joins* that onto the
+	// callback's error rather than replacing it. The joined error still
+	// satisfies errors.As for the apiError inside it, which is what made a
+	// discarded connection invisible behind a tidy 404 — see writeStoreError.
+	joinOnError error
 }
 
 func newCRUDStore() *crudStore {
@@ -119,16 +153,36 @@ func (s *crudStore) WithTenant(ctx context.Context, tenantID uuid.UUID, fn store
 	s.mu.Lock()
 	s.opened = append(s.opened, tenantID)
 	failCommit := s.failCommit
+	joinOnError := s.joinOnError
 	s.mu.Unlock()
 
 	if err := fn(ctx, crudQuerier{store: s, tenantID: tenantID}); err != nil {
-		return err
+		if joinOnError == nil {
+			// Returned unchanged, not through errors.Join: Join wraps even a
+			// single error, and writeStoreError distinguishes a bare refusal
+			// from a joined one by identity. Wrapping here would make every
+			// refusal in every test look like it carried a rollback failure.
+			return err
+		}
+
+		// Joined, not replaced — the real WithTenant's deferred rollback does
+		// exactly this, and the difference is the whole point of the knob.
+		return errors.Join(err, joinOnError)
 	}
 
 	// The commit, modelled: the callback returned nil and the transaction still
 	// did not survive. Store.WithTenant reports exactly this, and nothing the
 	// callback did is durable afterwards.
 	return failCommit
+}
+
+// joinRollbackFailure makes every subsequent failing transaction come back with
+// err joined onto whatever the callback returned.
+func (s *crudStore) joinRollbackFailure(err error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	s.joinOnError = err
 }
 
 // breakCommit makes every subsequent transaction fail at commit time.
@@ -144,6 +198,35 @@ func (s *crudStore) openedTenants() []uuid.UUID {
 	defer s.mu.Unlock()
 
 	return slices.Clone(s.opened)
+}
+
+// rebalanceEveryMove makes every subsequent move report NeedsRebalance.
+func (s *crudStore) rebalanceEveryMove() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	s.needsRebalance = true
+}
+
+func (s *crudStore) rebalancing() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	return s.needsRebalance
+}
+
+func (s *crudStore) recordRebalance(parentID uuid.UUID) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	s.rebalanced = append(s.rebalanced, parentID)
+}
+
+func (s *crudStore) rebalancedParents() []uuid.UUID {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	return slices.Clone(s.rebalanced)
 }
 
 // crudQuerier answers every query in the board surface against one tenant's
@@ -276,7 +359,7 @@ func (q crudQuerier) ListColumnsByBoard(_ context.Context, id uuid.UUID) ([]stor
 		return []store.Column{}, nil
 	}
 
-	return []store.Column{own.column}, nil
+	return []store.Column{own.column, own.otherColumn}, nil
 }
 
 func (q crudQuerier) GetColumn(_ context.Context, id uuid.UUID) (store.Column, error) {
@@ -289,11 +372,19 @@ func (q crudQuerier) LockColumn(_ context.Context, id uuid.UUID) (store.Column, 
 
 func (q crudQuerier) column(id uuid.UUID) (store.Column, error) {
 	own, ok := q.own()
-	if !ok || own.column.ID != id {
+	if !ok {
 		return store.Column{}, store.ErrNoRows
 	}
 
-	return own.column, nil
+	switch id {
+	case own.column.ID:
+		return own.column, nil
+	case own.otherColumn.ID:
+		return own.otherColumn, nil
+	default:
+		// Including, and this is the point, the other tenant's column.
+		return store.Column{}, store.ErrNoRows
+	}
 }
 
 func (q crudQuerier) UpdateColumn(_ context.Context, arg store.UpdateColumnParams) (store.Column, error) {
@@ -313,6 +404,7 @@ func (q crudQuerier) MoveColumn(_ context.Context, arg store.MoveColumnParams) (
 
 	return store.MoveColumnRow{
 		ID: column.ID, TenantID: column.TenantID, BoardID: column.BoardID, Name: column.Name,
+		NeedsRebalance: q.store.rebalancing(),
 	}, nil
 }
 
@@ -380,9 +472,9 @@ func (q crudQuerier) MoveCard(_ context.Context, arg store.MoveCardParams) (stor
 		return store.MoveCardRow{}, err
 	}
 
-	own, ok := q.own()
-	if !ok || own.column.ID != arg.ColumnID {
-		return store.MoveCardRow{}, store.ErrNoRows
+	// Either of this tenant's columns is a legal destination; nothing else is.
+	if _, err := q.column(arg.ColumnID); err != nil {
+		return store.MoveCardRow{}, err
 	}
 
 	if arg.AfterCardID != nil {
@@ -392,6 +484,7 @@ func (q crudQuerier) MoveCard(_ context.Context, arg store.MoveCardParams) (stor
 	return store.MoveCardRow{
 		ID: card.ID, TenantID: card.TenantID, BoardID: card.BoardID, ColumnID: arg.ColumnID,
 		Title: card.Title, Description: card.Description,
+		NeedsRebalance: q.store.rebalancing(),
 	}, nil
 }
 
@@ -400,11 +493,15 @@ func (q crudQuerier) DeleteCard(_ context.Context, id uuid.UUID) (store.Card, er
 	return q.cardByID(id)
 }
 
-func (q crudQuerier) RebalanceBoardColumns(context.Context, uuid.UUID) error {
+func (q crudQuerier) RebalanceBoardColumns(_ context.Context, boardID uuid.UUID) error {
+	q.store.recordRebalance(boardID)
+
 	return nil
 }
 
-func (q crudQuerier) RebalanceColumnCards(context.Context, uuid.UUID) error {
+func (q crudQuerier) RebalanceColumnCards(_ context.Context, columnID uuid.UUID) error {
+	q.store.recordRebalance(columnID)
+
 	return nil
 }
 
@@ -422,6 +519,18 @@ type boardFixture struct {
 	events *recordingPublisher
 	issuer *auth.Issuer
 	token  string
+
+	// logs is everything the router logged while the test ran, in the JSON
+	// shape a deployed instance emits. A buffer rather than discardLogger()
+	// because #93 made the log an assertable output of a move rather than a
+	// side effect — see movelog_test.go, which decodes it a line at a time.
+	//
+	// logger is the one the router was built with. Tests that mount a handler
+	// of their own use it rather than wrapping logs in a second handler: two
+	// handlers over one buffer would be two mutexes over one unsynchronised
+	// writer, which is safe only for as long as nobody writes concurrently.
+	logs   *bytes.Buffer
+	logger *slog.Logger
 
 	tenantA uuid.UUID
 	tenantB uuid.UUID
@@ -441,15 +550,19 @@ func newBoardFixture(t *testing.T) *boardFixture {
 
 	tenantStore := newCRUDStore()
 	publisher := &recordingPublisher{}
+	logs := &bytes.Buffer{}
+	logger := slog.New(slog.NewJSONHandler(logs, &slog.HandlerOptions{Level: slog.LevelDebug}))
 
 	f := &boardFixture{
-		router: NewRouter(discardLogger(),
+		router: NewRouter(logger,
 			BodyLimits{},
 			HealthDeps{Postgres: stubPinger{}, Redis: stubPinger{}},
 			AuthDeps{Service: &membershipService{issuer: issuer}, Verifier: issuer, Store: tenantStore},
 			RealtimeDeps{Publisher: publisher}),
 		store:   tenantStore,
 		events:  publisher,
+		logs:    logs,
+		logger:  logger,
 		issuer:  issuer,
 		tenantA: tenantA,
 		tenantB: tenantB,
