@@ -308,6 +308,20 @@ func moveCardHandler(logger *slog.Logger, tenantStore TenantStore, publisher Eve
 			return
 		}
 
+		// After the commit, and after the broadcast, so the line is only ever
+		// written about a move that happened. The refused half of this is in
+		// crud.go's logRefusal — see movelog.go for what is deliberately absent
+		// from both.
+		logDomainEvent(c, logger, slog.LevelInfo, "card moved", logEventCardMoved,
+			cardMoveAttrs(moved.card.ID, moved.card.BoardID, moved.fromColumnID, moved.card.ColumnID, afterCardID)...)
+
+		if moved.rebalanced {
+			logDomainEvent(c, logger, slog.LevelInfo, "renumbered a column's cards", logEventCardOrderRebalanced,
+				slog.String("board_id", moved.card.BoardID.String()),
+				slog.String("column_id", moved.card.ColumnID.String()),
+			)
+		}
+
 		c.JSON(http.StatusOK, gin.H{subjectCard: newCardBody(moved.card)})
 	}
 }
@@ -345,7 +359,15 @@ func moveCard(ctx context.Context, q store.Querier, cardID, columnID uuid.UUID, 
 	// anyway; checking here is what turns that into a 409 with a sentence rather
 	// than a 500 with a constraint name in the log.
 	if current.BoardID != target.BoardID {
-		return movedCard{}, conflict("column_id names a column on a different board")
+		return movedCard{}, conflict("column_id names a column on a different board").
+			loggedAs(logEventCardMoveRefused, append(
+				cardMoveAttrs(cardID, current.BoardID, current.ColumnID, columnID, afterCardID),
+				slog.String("reason", reasonCrossBoardColumn),
+				// The only refusal where the two boards differ, so the target's
+				// board is worth naming: without it the line says a column was
+				// on "a different board" without saying which.
+				slog.String("to_board_id", target.BoardID.String()),
+			)...)
 	}
 
 	moved, err := q.MoveCard(ctx, store.MoveCardParams{
@@ -358,7 +380,15 @@ func moveCard(ctx context.Context, q store.Querier, cardID, columnID uuid.UUID, 
 		// The card exists, the column exists, and they share a board — so the
 		// only remaining reason for no row is the anchor. A client that dragged
 		// past a card someone else has just moved or deleted gets this.
-		return movedCard{}, conflict("after_card_id is not a card in that column")
+		//
+		// The anchor is on the refusal's log line, because "which anchor was
+		// stale" is the whole question a refused drag raises and the status code
+		// alone cannot answer it.
+		return movedCard{}, conflict("after_card_id is not a card in that column").
+			loggedAs(logEventCardMoveRefused, append(
+				cardMoveAttrs(cardID, current.BoardID, current.ColumnID, columnID, afterCardID),
+				slog.String("reason", reasonStaleCardAnchor),
+			)...)
 	}
 
 	if err != nil {
@@ -375,6 +405,10 @@ func moveCard(ctx context.Context, q store.Querier, cardID, columnID uuid.UUID, 
 	}
 
 	return movedCard{
+		// Reported rather than logged here: this is inside the transaction, and
+		// a renumbering that is about to roll back did not happen. The handler
+		// logs it once the commit has returned.
+		rebalanced: moved.NeedsRebalance,
 		card: store.Card{
 			ID:          moved.ID,
 			TenantID:    moved.TenantID,
@@ -396,11 +430,22 @@ func moveCard(ctx context.Context, q store.Querier, cardID, columnID uuid.UUID, 
 	}, nil
 }
 
-// movedCard is a move's result: the card as it now is, and the column it came
-// from. The second half exists only for the event — see events.go.
+// movedCard is a move's result: the card as it now is, the column it came from,
+// and whether the move renumbered the column. The second half exists only for
+// the event — see events.go — and the third only for the log.
 type movedCard struct {
 	card         store.Card
 	fromColumnID uuid.UUID
+
+	// rebalanced is true when this move drove RebalanceColumnCards. ADR 0004
+	// set the threshold low on purpose "so that the renumbering path runs often
+	// enough to be a tested path rather than a theoretical one", and until this
+	// field existed there was no way to tell whether it ever did.
+	//
+	// It is not on the realtime event: renumbering changes every rank and no
+	// order, and a client never sees a rank, so there is nothing for one to do
+	// about it.
+	rebalanced bool
 }
 
 // deleteCardHandler removes a card.

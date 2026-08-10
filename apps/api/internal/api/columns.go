@@ -193,16 +193,16 @@ func moveColumnHandler(logger *slog.Logger, tenantStore TenantStore, publisher E
 			return
 		}
 
-		column, ok := tenantScopedPublish(c, logger, tenantStore, publisher, "column.move.failed",
-			func(ctx context.Context, q store.Querier) (store.Column, error) {
+		moved, ok := tenantScopedPublish(c, logger, tenantStore, publisher, "column.move.failed",
+			func(ctx context.Context, q store.Querier) (movedColumn, error) {
 				return moveColumn(ctx, q, columnID, afterColumnID)
 			},
-			func(column store.Column) BoardEvent {
+			func(moved movedColumn) BoardEvent {
 				return BoardEvent{
-					BoardID: column.BoardID,
+					BoardID: moved.column.BoardID,
 					Type:    eventColumnMoved,
 					Payload: columnMovedPayload{
-						Column:        newColumnBody(column),
+						Column:        newColumnBody(moved.column),
 						AfterColumnID: optionalID(afterColumnID),
 					},
 				}
@@ -211,17 +211,35 @@ func moveColumnHandler(logger *slog.Logger, tenantStore TenantStore, publisher E
 			return
 		}
 
-		c.JSON(http.StatusOK, gin.H{subjectColumn: newColumnBody(column)})
+		// After the commit, for the same reason as the card move — see cards.go.
+		logDomainEvent(c, logger, slog.LevelInfo, "column moved", logEventColumnMoved,
+			columnMoveAttrs(moved.column.ID, moved.column.BoardID, afterColumnID)...)
+
+		if moved.rebalanced {
+			logDomainEvent(c, logger, slog.LevelInfo, "renumbered a board's columns", logEventColumnOrderRebalanced,
+				slog.String("board_id", moved.column.BoardID.String()),
+			)
+		}
+
+		c.JSON(http.StatusOK, gin.H{subjectColumn: newColumnBody(moved.column)})
 	}
 }
 
+// movedColumn is a move's result: the column as it now is, and whether the move
+// renumbered the board. The second half exists only for the log — see
+// [movedCard], which carries the same field for the same reason.
+type movedColumn struct {
+	column     store.Column
+	rebalanced bool
+}
+
 // moveColumn is the body of the move, inside the tenant transaction.
-func moveColumn(ctx context.Context, q store.Querier, columnID uuid.UUID, afterColumnID *uuid.UUID) (store.Column, error) {
+func moveColumn(ctx context.Context, q store.Querier, columnID uuid.UUID, afterColumnID *uuid.UUID) (movedColumn, error) {
 	found, err := q.GetColumn(ctx, columnID)
 
 	current, err := asNotFound(subjectColumn, found, err)
 	if err != nil {
-		return store.Column{}, err
+		return movedColumn{}, err
 	}
 
 	// One lock, on the board, held for the rest of the transaction. Every write
@@ -229,7 +247,7 @@ func moveColumn(ctx context.Context, q store.Querier, columnID uuid.UUID, afterC
 	// computed against an order nobody else is changing.
 	board, err := q.LockBoard(ctx, current.BoardID)
 	if _, err := asNotFound(subjectBoard, board, err); err != nil {
-		return store.Column{}, err
+		return movedColumn{}, err
 	}
 
 	moved, err := q.MoveColumn(ctx, store.MoveColumnParams{
@@ -242,30 +260,39 @@ func moveColumn(ctx context.Context, q store.Querier, columnID uuid.UUID, afterC
 		// The column is known to exist and the board lock is held, so the only
 		// remaining reason for no row is the anchor: an after_column_id that is
 		// not a sibling. That is what a stale client sends after someone else
-		// deleted the column it was dragging past.
-		return store.Column{}, conflict("after_column_id is not another column on this board")
+		// deleted the column it was dragging past — and the anchor is on the
+		// refusal's log line for exactly that reason.
+		return movedColumn{}, conflict("after_column_id is not another column on this board").
+			loggedAs(logEventColumnMoveRefused, append(
+				columnMoveAttrs(columnID, current.BoardID, afterColumnID),
+				slog.String("reason", reasonStaleColumnAnchor),
+			)...)
 	}
 
 	if err != nil {
-		return store.Column{}, err
+		return movedColumn{}, err
 	}
 
 	if moved.NeedsRebalance {
 		// Still under the board lock, so this cannot rewrite a position a
 		// concurrent move is midway through comparing against.
 		if err := q.RebalanceBoardColumns(ctx, current.BoardID); err != nil {
-			return store.Column{}, err
+			return movedColumn{}, err
 		}
 	}
 
-	return store.Column{
-		ID:        moved.ID,
-		TenantID:  moved.TenantID,
-		BoardID:   moved.BoardID,
-		Name:      moved.Name,
-		Position:  moved.Position,
-		CreatedAt: moved.CreatedAt,
-		UpdatedAt: moved.UpdatedAt,
+	return movedColumn{
+		column: store.Column{
+			ID:        moved.ID,
+			TenantID:  moved.TenantID,
+			BoardID:   moved.BoardID,
+			Name:      moved.Name,
+			Position:  moved.Position,
+			CreatedAt: moved.CreatedAt,
+			UpdatedAt: moved.UpdatedAt,
+		},
+		// Reported rather than logged here: see moveCard.
+		rebalanced: moved.NeedsRebalance,
 	}, nil
 }
 

@@ -79,10 +79,38 @@ const (
 type apiError struct {
 	status  int
 	message string
+
+	// logEvent and logAttrs are how a refusal describes itself to
+	// [writeStoreError], which is the only place that knows the response is
+	// about to be written and the last place the error still exists.
+	//
+	// They are here rather than logged at the point the error is constructed
+	// because that point is inside the tenant transaction. A conflict is
+	// terminal today, so logging there would be correct today — but it would be
+	// a line claiming a refusal happened, written before the transaction that
+	// decides it has unwound. Carrying the description out and emitting it next
+	// to the status keeps "what was logged" and "what the caller was told" the
+	// same event, in the same way tenantScopedPublish keeps a broadcast on the
+	// far side of the commit.
+	logEvent string
+	logAttrs []slog.Attr
 }
 
 func (e *apiError) Error() string {
 	return e.message
+}
+
+// loggedAs annotates a refusal with the log event name and the fields that
+// identify its subject.
+//
+// Optional: an un-annotated conflict is still logged, just with the handler's
+// generic event name and no subject. That is the fallback and not the intent —
+// see [writeStoreError].
+func (e *apiError) loggedAs(event string, attrs ...slog.Attr) *apiError {
+	e.logEvent = event
+	e.logAttrs = attrs
+
+	return e
 }
 
 // notFound is the answer for every id that names nothing the caller can see.
@@ -97,6 +125,13 @@ func notFound(subject string) *apiError {
 
 // conflict is for a request that is well-formed and authorized but disagrees
 // with the current state of the board — a stale drag-and-drop, usually.
+//
+// The message is used twice: as the response body, and as the `detail` field on
+// the WARN line [logRefusal] writes. So it must stay a constant sentence — never
+// a Sprintf that interpolates a title, a name, or anything else read out of the
+// database. Those are user content, and movelog.go's reasoning about keeping
+// them out of the log applies to this string even though it does not look like a
+// log field from here.
 func conflict(message string) *apiError {
 	return &apiError{status: http.StatusConflict, message: message}
 }
@@ -206,6 +241,36 @@ func writeStoreError(c *gin.Context, logger *slog.Logger, event string, tenantID
 
 	switch {
 	case errors.As(err, &apiErr):
+		// The apiError decides the status, but it may not be the only error
+		// here: [store.Store.WithTenant] *joins* a failed rollback onto whatever
+		// the callback returned, and a failed rollback costs the pool a
+		// connection. errors.As still finds the apiError inside that join, so
+		// without this the pool churn is invisible behind a tidy 404 — the same
+		// "returns early and logs nothing" shape this function was changed to
+		// end, one level down.
+		//
+		// Identity rather than errors.Is, which is what errorlint wants here and
+		// is exactly wrong for this test: errors.Is walks *into* the join and
+		// finds the apiError there too, so it answers true for both a bare
+		// refusal and a joined one and can never distinguish them. The question
+		// is not "is this an apiError" — errors.As already answered that — but
+		// "is this *only* the apiError". Anything else is carrying something
+		// that would otherwise be dropped.
+		//
+		//nolint:errorlint // identity is the intent; see above.
+		if err != error(apiErr) {
+			logger.ErrorContext(c.Request.Context(), "a refusal carried an additional failure",
+				slog.String("event", event),
+				slog.String("request_id", requestIDFrom(c)),
+				slog.String("path", c.FullPath()),
+				slog.String("tenant_id", tenantID.String()),
+				slog.Int("status", apiErr.status),
+				slog.Any("error", err),
+			)
+		}
+
+		logRefusal(c, logger, event, apiErr)
+
 		c.AbortWithStatusJSON(apiErr.status, errorResponse{Error: apiErr.message})
 
 	case errors.Is(err, store.ErrNoRows):
@@ -214,6 +279,7 @@ func writeStoreError(c *gin.Context, logger *slog.Logger, event string, tenantID
 	default:
 		logger.ErrorContext(c.Request.Context(), "request failed",
 			slog.String("event", event),
+			slog.String("request_id", requestIDFrom(c)),
 			slog.String("path", c.FullPath()),
 			slog.String("tenant_id", tenantID.String()),
 			slog.Any("error", err),
@@ -221,6 +287,55 @@ func writeStoreError(c *gin.Context, logger *slog.Logger, event string, tenantID
 
 		c.AbortWithStatusJSON(http.StatusInternalServerError, errorResponse{Error: messageInternalError})
 	}
+}
+
+// logRefusal writes the line a 409 previously did not have.
+//
+// # Why every conflict on this surface, and not just a move's
+//
+// A 409 here is always the same thing: the request was well-formed, the caller
+// was authorized, and the board disagreed. It is rare, it is never the client's
+// syntax and never the server's fault, and "why was this refused" is a question
+// somebody asks about every one of them. So the line is written where the status
+// is decided rather than at each site that decides to raise one, which means the
+// next handler to call [conflict] cannot forget it. Today [conflict] is reached
+// only from the two move paths, so this is the same change as logging the moves;
+// it is written centrally because that is where it stops being a change somebody
+// has to remember to repeat.
+//
+// The guarantee is bounded to the store-backed surface, and deliberately not
+// claimed service-wide: writeAuthError raises three 409s of its own
+// (`email is already registered`, and the two membership conflicts) straight
+// through AbortWithStatusJSON without passing here, and those are still silent.
+// Same defect, different function, filed rather than folded in.
+//
+// # Why a 404 still logs nothing
+//
+// A 404 here is the deliberate answer for an id that names nothing the caller
+// can see, which under row-level security includes every id belonging to
+// another tenant. It is ordinary — a stale tab produces them — so a line per
+// 404 would be volume rather than signal at this level, and the interesting
+// version of it is not "one 404 happened" but "this principal just probed forty
+// ids", which is a rate question and a different design. Left alone
+// deliberately, and filed separately rather than folded in here.
+func logRefusal(c *gin.Context, logger *slog.Logger, event string, apiErr *apiError) {
+	if apiErr.status != http.StatusConflict {
+		return
+	}
+
+	// An un-annotated conflict falls back to the handler's generic event name.
+	// It is a worse line — no subject — but it is a line, which is the property
+	// this function exists to guarantee.
+	name := apiErr.logEvent
+	if name == "" {
+		name = event
+	}
+
+	attrs := make([]slog.Attr, 0, 1+len(apiErr.logAttrs))
+	attrs = append(attrs, slog.String("detail", apiErr.message))
+	attrs = append(attrs, apiErr.logAttrs...)
+
+	logDomainEvent(c, logger, slog.LevelWarn, "refusing a write that disagrees with the board", name, attrs...)
 }
 
 // pathUUID reads a uuid route parameter.
