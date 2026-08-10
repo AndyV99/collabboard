@@ -18,6 +18,11 @@ output "private_subnet_ids" {
   value       = aws_subnet.private[*].id
 }
 
+output "private_subnet_cidrs" {
+  description = "CIDR blocks of the private subnets. Exported for #33: these are the addresses the API sees as its peer once an ALB is in front of it, and therefore what a trusted-proxy list would have to contain."
+  value       = aws_subnet.private[*].cidr_block
+}
+
 output "data_subnet_ids" {
   description = "Data subnet IDs, one per AZ. RDS and ElastiCache only; these have no route off the VPC."
   value       = aws_subnet.data[*].id

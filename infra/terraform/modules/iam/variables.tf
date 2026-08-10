@@ -69,7 +69,13 @@ variable "denied_secret_arns" {
 }
 
 variable "log_retention_days" {
-  description = "CloudWatch Logs retention for the API log group."
+  description = "CloudWatch Logs retention for the API and web log groups."
   type        = number
   default     = 30
+}
+
+variable "exec_log_retention_days" {
+  description = "CloudWatch Logs retention for the ECS Exec session transcripts and the administrative task's own output. Longer than the service logs: this is the audit trail for every break-glass session against the database, and it is a few kilobytes a year."
+  type        = number
+  default     = 365
 }
