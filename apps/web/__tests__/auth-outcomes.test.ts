@@ -11,9 +11,11 @@ import { describe, expect, it } from "vitest";
 
 import {
   NO_ORGANIZATION,
+  ORGANIZATION_EXISTS,
   REFUSAL_CROSS_ORIGIN,
   REFUSAL_HEADER,
   UNCONFIRMED,
+  describeFirstOrganizationFailure,
   describeLoginFailure,
   describeRegistrationFailure,
   describeWait,
@@ -73,7 +75,16 @@ describe("403 means two completely different things", () => {
   it("tells the user not to sign up again", () => {
     // The harm in this state is a user who re-registers and collects a 409.
     expect(NO_ORGANIZATION).toMatch(/signing up again .* will not fix it/i);
-    expect(NO_ORGANIZATION).toMatch(/contact support/i);
+  });
+
+  it("no longer sends the user to support, because #34 gave them a way out", () => {
+    // The copy is pinned here precisely so that removing this dead end is a
+    // deliberate edit. `POST /api/v1/organizations` does what the support
+    // ticket used to ask for, with no operator involved, so the sentence names
+    // the affordance instead.
+    expect(NO_ORGANIZATION).not.toMatch(/contact support/i);
+    expect(NO_ORGANIZATION).not.toMatch(/support/i);
+    expect(NO_ORGANIZATION).toMatch(/create the missing workspace/i);
   });
 
   it("reads a 403 marked by our own CSRF guard as a refusal, not a missing workspace", () => {
@@ -81,6 +92,20 @@ describe("403 means two completely different things", () => {
 
     expect(failure.kind).toBe("blocked");
     expect(failure.message).not.toBe(NO_ORGANIZATION);
+  });
+
+  it("keeps the two 403s apart on kind and on copy, which is the whole point", () => {
+    // Load-bearing. The status alone cannot distinguish "this account has no
+    // workspace" from "this app refused a cross-origin post", and the only
+    // signal is the private header — matching on message text instead would
+    // make the copy above load-bearing, which is what REFUSAL_HEADER avoids.
+    const bare = describeLoginFailure(403, "this account does not belong to an organization", none);
+    const guarded = describeLoginFailure(403, "This request did not come from this site.", refused);
+
+    expect(bare.kind).toBe("no_organization");
+    expect(guarded.kind).toBe("blocked");
+    expect(bare.kind).not.toBe(guarded.kind);
+    expect(bare.message).not.toBe(guarded.message);
   });
 });
 
@@ -147,6 +172,81 @@ describe("registration", () => {
   it("does not confuse a CSRF refusal with anything else", () => {
     expect(describeRegistrationFailure(403, "…", refused).kind).toBe("blocked");
     expect(describeRegistrationFailure(403, "…", none).kind).toBe("unavailable");
+  });
+});
+
+describe("creating the workspace a stranded account never got", () => {
+  it("treats a 409 as the situation having resolved itself, not as an error", () => {
+    // The account already has an organization: another tab, or two clicks that
+    // raced. Nothing is wrong and nothing needs creating — the next step is the
+    // sign-in the user was trying to do in the first place.
+    const failure = describeFirstOrganizationFailure(409, "this account already belongs to an organization", none);
+
+    expect(failure.kind).toBe("organization_exists");
+    expect(failure.message).toBe(ORGANIZATION_EXISTS);
+    expect(failure.message).toMatch(/sign in/i);
+    expect(failure.message).not.toMatch(/error|failed|went wrong|try again/i);
+  });
+
+  it("surfaces a 429 with its wait, because this shares the sign-in budget", () => {
+    // The route is charged against the same per-account and per-address
+    // counters as login, *before* the credential is checked. So a user who has
+    // just failed a few sign-ins can be refused on their first click here, and
+    // "something went wrong" would be a much worse answer than "wait 15
+    // minutes" when the real answer is the second one.
+    const failure = describeFirstOrganizationFailure(429, "too many attempts, try again later", withRetry("900"));
+
+    expect(failure.kind).toBe("rate_limited");
+    expect(failure.retryAfterSeconds).toBe(900);
+    expect(failure.message).toMatch(/about 15 minutes/);
+    expect(failure.message).toMatch(/sign-in/i);
+  });
+
+  it("still explains a 429 that arrived without a Retry-After", () => {
+    const failure = describeFirstOrganizationFailure(429, null, none);
+
+    expect(failure.kind).toBe("rate_limited");
+    expect(failure.retryAfterSeconds).toBeUndefined();
+    expect(failure.message).toMatch(/too many/i);
+  });
+
+  it("says exactly what login says for a 401, and blames no field", () => {
+    // Reachable only when the password was edited after the 403. The endpoint
+    // shares `verifyCredential` with login, so an unknown address and a wrong
+    // password are the same answer here too.
+    const failure = describeFirstOrganizationFailure(401, "invalid email or password", none);
+
+    expect(failure.kind).toBe("invalid_credentials");
+    expect(failure.message).toBe("Email or password is incorrect.");
+    expect(failure.message).not.toMatch(/no account|not found|unknown|does not exist/i);
+  });
+
+  it("never reads a bare 403 as a missing workspace, unlike login", () => {
+    // `CreateFirstOrganization` cannot return `ErrNoOrganization` — that state
+    // is the precondition of the call, not one of its answers. So an unmarked
+    // 403 on this route is something we do not understand, and claiming it
+    // means "no workspace" would offer the user a button that just failed.
+    const guarded = describeFirstOrganizationFailure(403, "This request did not come from this site.", refused);
+    const bare = describeFirstOrganizationFailure(403, "…", none);
+
+    expect(guarded.kind).toBe("blocked");
+    expect(bare.kind).toBe("unavailable");
+    expect(bare.kind).not.toBe("no_organization");
+    expect(bare.message).not.toBe(NO_ORGANIZATION);
+  });
+
+  it("keeps a 400's message and falls back when the body was not the envelope", () => {
+    expect(describeFirstOrganizationFailure(400, "Workspace name must be text.", none)).toEqual({
+      kind: "invalid_input",
+      message: "Workspace name must be text.",
+    });
+    expect(describeFirstOrganizationFailure(400, null, none).message).toMatch(/check the details/i);
+  });
+
+  it("does not claim to know what a 5xx did", () => {
+    for (const status of [500, 502, 503]) {
+      expect(describeFirstOrganizationFailure(status, null, none).kind).toBe("unavailable");
+    }
   });
 });
 

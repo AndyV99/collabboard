@@ -188,6 +188,38 @@ export function parseRegisteredUser(value: unknown): RegisteredUser | null {
   return { userId, email, displayName, organization };
 }
 
+/**
+ * `POST /organizations` — the workspace a stranded account just created.
+ *
+ * Deliberately not {@link SessionTokens}, and the difference is the whole point
+ * of ADR 0009: the endpoint answers 201 with the organization and *no tokens at
+ * all*, because a subject with zero memberships cannot hold one. The caller's
+ * next request is an ordinary login, which now succeeds.
+ *
+ * The shape is `registeredUser` minus the address and the display name —
+ * `createOrganizationResponse` in `apps/api/internal/api/auth.go` echoes back
+ * nothing that was read out of the account, only the row it just wrote.
+ */
+export type CreatedOrganization = {
+  userId: string;
+  organization: Organization;
+};
+
+export function parseCreatedOrganization(value: unknown): CreatedOrganization | null {
+  if (!isRecord(value)) {
+    return null;
+  }
+
+  const userId = str(value, "user_id");
+  const organization = parseOrganization(value.organization);
+
+  if (userId === null || organization === null) {
+    return null;
+  }
+
+  return { userId, organization };
+}
+
 /** `GET /me`. */
 export type CurrentUser = {
   userId: string;

@@ -23,6 +23,15 @@ import {
 export const LOGIN_PATH = "/api/auth/login";
 export const REGISTER_PATH = "/api/auth/register";
 
+/**
+ * The recovery path for an account with no workspace.
+ *
+ * Third of the three that carry a password, and it goes through a Route Handler
+ * for exactly the same reason as the other two, even though the endpoint behind
+ * it returns no token at all.
+ */
+export const FIRST_ORGANIZATION_PATH = "/api/auth/first-organization";
+
 export type SubmitResult = { ok: true } | { ok: false; failure: AuthFailure };
 
 /** Maps a failed response onto copy. One per form; see `lib/auth/outcomes.ts`. */

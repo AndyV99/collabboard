@@ -376,10 +376,34 @@ impossibility. It surfaces in two places:
 
 **Signing in gets a 403.** The form does not show "email or password is
 incorrect" — the credentials were right — and does not offer a retry. It says
-the account exists, is not attached to a workspace, that signing up again will
-not fix it, and to contact support. The last two sentences are the important
-ones: the natural reaction to any other message is to re-register, which collects
-a 409 on the address that already exists.
+the account exists, is not attached to a workspace, and that signing up again
+will not fix it. That last part is the important one: the natural reaction to any
+other message is to re-register, which collects a 409 on the address that already
+exists.
+
+It used to end there, with "contact support", because it had to — nothing created
+an organization for an existing account. `POST /api/v1/organizations` (#34, [ADR
+0009](../../docs/adr/0009-tenantless-account-recovery.md)) removed that dead end,
+so the 403 now renders `components/auth/workspace-recovery.tsx` instead of a
+sentence: an optional workspace name, a button, and a sign-in on the way out.
+
+The endpoint takes an email and a password rather than a token, because an
+account with zero memberships **cannot hold one** — login refuses to issue it,
+the issuer refuses a nil tenant, the verifier refuses a zero `org` claim. The
+user typed both into the form a moment ago, so the affordance uses what is
+already there rather than asking twice. The password therefore lives across the
+transition, exactly where a controlled input already kept it: in the sign-in
+form's `useState`, never copied into the recovery component (which receives a
+*getter*, not a value), and never in `localStorage`, a cookie, a URL or a log
+line. `workspace-recovery.tsx`'s module comment argues that decision in full,
+including why re-prompting was rejected.
+
+Two answers on that route are not failures and are not drawn as ones. A **409**
+means the workspace already exists — another tab, or two clicks that raced — so
+the screen switches to a notice pointing at the sign-in form. A **429** is the
+likely one, because the route is charged against the *sign-in* budget and charged
+before the credential is checked; it reports the wait rather than a generic
+error, and stops both buttons until it elapses.
 
 **Registration gets a 5xx**, and nothing in the response says whether an account
 was created — it could be that, or a failure before the user row, or a lost
@@ -437,7 +461,8 @@ delete from memberships m using users u
 ```
 app/(auth)/             /login and /register, plus the card they sit in
 app/(protected)/        the signed-in shell; being in here is the access rule
-components/auth/        the two forms, the labelled field, the error summary
+components/auth/        the two forms, the workspace-recovery affordance,
+                        the labelled field, the error summary
 components/app-shell.tsx  the signed-in frame (pure; takes resolved props)
 lib/auth/rules.ts       validation, mirroring apps/api's numbers exactly
 lib/auth/outcomes.ts    status → copy, including the enumeration-safe wording
@@ -608,7 +633,8 @@ lib/session/cookies.ts  the three cookies and their attributes
 lib/session/refresh.ts  single-flight + the post-rotation grace window
 lib/session/origin.ts   the same-origin (CSRF) check
 proxy.ts                refreshes before the render
-app/api/auth/*          login, register, refresh, logout, session, organization
+app/api/auth/*          login, register, refresh, logout, session, organization,
+                        first-organization (the tenantless recovery path)
 app/api/proxy/*         authenticated pass-through for Client Components
 ```
 

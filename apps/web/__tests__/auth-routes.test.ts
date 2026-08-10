@@ -53,6 +53,9 @@ const { POST: refresh } = await import("@/app/api/auth/refresh/route");
 const { POST: logout } = await import("@/app/api/auth/logout/route");
 const { GET: sessionRoute } = await import("@/app/api/auth/session/route");
 const { POST: switchOrg } = await import("@/app/api/auth/organization/route");
+const { POST: firstOrganization } = await import(
+  "@/app/api/auth/first-organization/route"
+);
 const { GET: proxyGet, POST: proxyPost } = await import(
   "@/app/api/proxy/[...path]/route"
 );
@@ -650,6 +653,199 @@ describe("POST /api/auth/register", () => {
         .status,
     ).toBe(400);
     expect(fetchImpl).not.toHaveBeenCalled();
+  });
+});
+
+describe("POST /api/auth/first-organization", () => {
+  const CREATED_BODY = {
+    user_id: SESSION_BODY.user_id,
+    organization: { id: "org-9", name: "Acme", slug: "acme", role: "owner" },
+  };
+
+  it("relays the 201 and writes no cookies, because this is not a session", async () => {
+    // The invariant ADR 0009 rests on: `POST /organizations` answers with the
+    // organization and no tokens, so the recovery path mints nothing. A session
+    // still comes only from presenting a password to `/api/auth/login`, which
+    // is the very next request the form makes.
+    vi.stubGlobal("fetch", (async () => json(CREATED_BODY, 201)) as typeof fetch);
+
+    const response = await firstOrganization(
+      post("/api/auth/first-organization", { email: "a@b.c", password: "x" }),
+    );
+
+    expect(response.status).toBe(201);
+    expect(await response.json()).toEqual(CREATED_BODY);
+    expect(jar.size).toBe(0);
+    expect(response.headers.get("cache-control")).toBe("no-store");
+  });
+
+  it("forwards the credentials and the chosen name, and omits an absent name", async () => {
+    const bodies: unknown[] = [];
+    const fetchImpl = vi.fn(async (_url: string, init: RequestInit) => {
+      bodies.push(JSON.parse(String(init.body)));
+
+      return json(CREATED_BODY, 201);
+    });
+
+    vi.stubGlobal("fetch", fetchImpl as unknown as typeof fetch);
+
+    await firstOrganization(
+      post("/api/auth/first-organization", {
+        email: "a@b.c",
+        password: "x",
+        organization_name: "Acme",
+      }),
+    );
+    await firstOrganization(
+      post("/api/auth/first-organization", { email: "a@b.c", password: "x" }),
+    );
+
+    expect(bodies[0]).toEqual({ email: "a@b.c", password: "x", organization_name: "Acme" });
+    expect(bodies[1]).toEqual({ email: "a@b.c", password: "x" });
+  });
+
+  it("relays the statuses the recovery screen branches on", async () => {
+    // 409 drives a notice rather than an error, and 429 carries the wait. Both
+    // are normal answers here, so both have to survive the relay intact.
+    for (const [status, body, retryAfter] of [
+      [401, { error: "invalid email or password" }, undefined],
+      [409, { error: "this account already belongs to an organization" }, undefined],
+      [429, { error: "too many attempts, try again later" }, "900"],
+    ] as const) {
+      vi.stubGlobal(
+        "fetch",
+        (async () =>
+          new Response(JSON.stringify(body), {
+            status,
+            headers: {
+              "content-type": "application/json",
+              ...(retryAfter === undefined ? {} : { "retry-after": retryAfter }),
+            },
+          })) as typeof fetch,
+      );
+
+      const response = await firstOrganization(
+        post("/api/auth/first-organization", { email: "a@b.c", password: "x" }),
+      );
+
+      expect(response.status).toBe(status);
+      expect(await response.json()).toEqual(body);
+      expect(jar.size).toBe(0);
+    }
+  });
+
+  it("carries Retry-After through, because the form disables itself on it", async () => {
+    vi.stubGlobal(
+      "fetch",
+      (async () =>
+        new Response(JSON.stringify({ error: "too many attempts, try again later" }), {
+          status: 429,
+          headers: { "content-type": "application/json", "retry-after": "900" },
+        })) as typeof fetch,
+    );
+
+    const response = await firstOrganization(
+      post("/api/auth/first-organization", { email: "a@b.c", password: "x" }),
+    );
+
+    expect(response.headers.get("retry-after")).toBe("900");
+  });
+
+  it("rejects a request that did not come from this site, and marks the refusal", async () => {
+    const fetchImpl = vi.fn();
+
+    vi.stubGlobal("fetch", fetchImpl);
+
+    const response = await firstOrganization(
+      new NextRequest("http://localhost:3000/api/auth/first-organization", {
+        method: "POST",
+        headers: { "sec-fetch-site": "cross-site" },
+        body: JSON.stringify({ email: "a@b.c", password: "x" }),
+      }),
+    );
+
+    expect(response.status).toBe(403);
+    expect(fetchImpl).not.toHaveBeenCalled();
+
+    // Load-bearing on this route too, and in the opposite direction from login:
+    // the Go API cannot answer 403 here at all, so `describeFirstOrganization\
+    // Failure` reads a *marked* 403 as a CSRF refusal and an unmarked one as
+    // something it does not understand. Drop this header and a refused
+    // cross-origin post starts telling the user the server is unreachable.
+    expect(response.headers.get("x-collabboard-refusal")).toBe("cross-origin");
+  });
+
+  it("rejects an incomplete body without spending a rate-limit slot", async () => {
+    // This route is charged against the sign-in budget *before* the credential
+    // is checked, so a body the API would reject out of hand still costs a real
+    // attempt. Cheaper and kinder to refuse it here.
+    const fetchImpl = vi.fn();
+
+    vi.stubGlobal("fetch", fetchImpl);
+
+    const bad = [
+      { email: "a@b.c" },
+      { password: "x" },
+      { email: 1, password: "x" },
+      { email: "a@b.c", password: "x", organization_name: 7 },
+      undefined,
+    ];
+
+    for (const body of bad) {
+      const response = await firstOrganization(post("/api/auth/first-organization", body));
+
+      expect(response.status).toBe(400);
+    }
+
+    expect(fetchImpl).not.toHaveBeenCalled();
+  });
+
+  it("never writes the address or the password into a log line", async () => {
+    // The handler's comment promises this, and a log keyed by email is an
+    // enumeration oracle for anyone who can read logs. Asserted rather than
+    // trusted, because "let's add the email for debugging" is a one-line edit.
+    const lines: string[] = [];
+    const capture = (line: string) => {
+      lines.push(line);
+    };
+
+    vi.spyOn(console, "info").mockImplementation(capture);
+    vi.spyOn(console, "warn").mockImplementation(capture);
+    vi.spyOn(console, "error").mockImplementation(capture);
+
+    try {
+      vi.stubGlobal(
+        "fetch",
+        (async () => json({ error: "invalid email or password" }, 401)) as typeof fetch,
+      );
+      await firstOrganization(
+        post("/api/auth/first-organization", {
+          email: "orphan@example.com",
+          password: "correct horse battery",
+        }),
+      );
+
+      vi.stubGlobal("fetch", (async () => json(CREATED_BODY, 201)) as typeof fetch);
+      await firstOrganization(
+        post("/api/auth/first-organization", {
+          email: "orphan@example.com",
+          password: "correct horse battery",
+        }),
+      );
+
+      expect(lines.length).toBeGreaterThan(0);
+
+      const logged = lines.join("\n");
+
+      expect(logged).not.toContain("orphan@example.com");
+      expect(logged).not.toContain("correct horse battery");
+      expect(logged).not.toContain("password");
+      // The successful one does identify the account — by id, which is not an
+      // address and not a credential.
+      expect(logged).toContain(SESSION_BODY.user_id);
+    } finally {
+      vi.restoreAllMocks();
+    }
   });
 });
 
