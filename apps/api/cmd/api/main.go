@@ -41,6 +41,7 @@ import (
 	"github.com/AndyV99/collabboard/apps/api/internal/migrate"
 	"github.com/AndyV99/collabboard/apps/api/internal/provision"
 	"github.com/AndyV99/collabboard/apps/api/internal/realtime"
+	"github.com/AndyV99/collabboard/apps/api/internal/redisclient"
 	"github.com/AndyV99/collabboard/apps/api/internal/store"
 )
 
@@ -155,7 +156,7 @@ func runServe(logger *slog.Logger, cfg config.Config) error {
 	}
 	defer pool.Close()
 
-	redisClient := newRedisClient(cfg.Redis)
+	redisClient := redisclient.New(logger, cfg.Redis)
 	defer func() {
 		if cerr := redisClient.Close(); cerr != nil {
 			logger.Error("closing redis client", slog.Any("error", cerr))
@@ -418,14 +419,6 @@ func deriveKey(secret []byte, label string, length int) ([]byte, error) {
 	}
 
 	return out, nil
-}
-
-func newRedisClient(cfg config.RedisConfig) *redis.Client {
-	return redis.NewClient(&redis.Options{
-		Addr:     cfg.Addr(),
-		Password: cfg.Password,
-		DB:       cfg.DB,
-	})
 }
 
 // pgxPinger and redisPinger adapt the driver clients to api.Pinger so that
