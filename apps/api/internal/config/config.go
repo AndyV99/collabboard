@@ -222,11 +222,32 @@ func (p PostgresConfig) dsn(user, password string) string {
 }
 
 // RedisConfig configures the go-redis client.
+//
+// TLSEnabled is a boolean rather than a mode string mirroring
+// [PostgresConfig.SSLMode], despite the inconsistency that introduces between
+// two settings that look like they should rhyme. The reason is that libpq's
+// vocabulary encodes a distinction this service will not offer: "require" means
+// encrypt but do not verify the certificate, which for go-redis is spelled
+// InsecureSkipVerify, and an unverified TLS connection is an unauthenticated
+// one with extra steps. A REDIS_TLS_MODE accepting "require" would either have
+// to mis-implement the word or reject it at load, and a vocabulary with a word
+// in it that does not work is worse than a vocabulary without the word.
+// "sslmode" is also a real libpq connection parameter that pgx passes through,
+// whereas Redis has no such notion — so the mode string would be an invention
+// that merely looks like a standard. Two states exist, so the setting has two.
+//
+// See internal/redisclient for what the flag turns on.
 type RedisConfig struct {
 	Host     string
 	Port     int
 	Password string
 	DB       int
+
+	// TLSEnabled turns on TLS for every connection this service opens to Redis.
+	// Off by default, which matches the local compose stack; on in any deployed
+	// environment, because ElastiCache is created with
+	// transit_encryption_enabled = true and refuses a plaintext client.
+	TLSEnabled bool
 }
 
 // Addr renders the host:port go-redis expects.
@@ -265,10 +286,11 @@ func Load() (Config, error) {
 			MaxConns:          int32(envInt("POSTGRES_MAX_CONNS", 10, &errs)), //nolint:gosec // bounded small int from config
 		},
 		Redis: RedisConfig{
-			Host:     envString("REDIS_HOST", "localhost"),
-			Port:     envInt("REDIS_PORT", 6379, &errs),
-			Password: envString("REDIS_PASSWORD", ""),
-			DB:       envInt("REDIS_DB", 0, &errs),
+			Host:       envString("REDIS_HOST", "localhost"),
+			Port:       envInt("REDIS_PORT", 6379, &errs),
+			Password:   envString("REDIS_PASSWORD", ""),
+			DB:         envInt("REDIS_DB", 0, &errs),
+			TLSEnabled: envBool("REDIS_TLS_ENABLED", false, &errs),
 		},
 		Auth: AuthConfig{
 			JWTSecret:     envString("AUTH_JWT_SECRET", ""),
@@ -453,6 +475,31 @@ func envInt(key string, def int, errs *[]string) int {
 	v, err := strconv.Atoi(raw)
 	if err != nil {
 		*errs = append(*errs, fmt.Sprintf("%s=%q is not an integer", key, raw))
+
+		return def
+	}
+
+	return v
+}
+
+// envBool reads a boolean setting, refusing a value it does not understand
+// rather than falling back to the default.
+//
+// The strictness is the point for a security switch. strconv.ParseBool accepts
+// "1"/"t"/"true"/"0"/"f"/"false" and their cased variants, but not "yes" or
+// "on" — and an operator who writes REDIS_TLS_ENABLED=yes meaning to turn
+// encryption on must not get a silently plaintext client out of it. Failing to
+// start names the variable; defaulting to false would not.
+func envBool(key string, def bool, errs *[]string) bool {
+	raw, ok := os.LookupEnv(key)
+	if !ok || raw == "" {
+		return def
+	}
+
+	v, err := strconv.ParseBool(raw)
+	if err != nil {
+		*errs = append(*errs, fmt.Sprintf(
+			"%s=%q is not a boolean; use true or false", key, raw))
 
 		return def
 	}

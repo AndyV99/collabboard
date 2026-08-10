@@ -133,3 +133,50 @@ func TestDSNEscapesPassword(t *testing.T) {
 		t.Errorf("DSN %q is missing sslmode", dsn)
 	}
 }
+
+// REDIS_TLS_ENABLED is a security switch, so an unparseable value has to stop
+// the service rather than quietly resolve to the default. "yes" is the
+// realistic typo: an operator writes it meaning to turn encryption on, and
+// falling back to false would hand them a plaintext client that reports itself
+// as configured.
+func TestRedisTLSRejectsUnparseableValue(t *testing.T) {
+	t.Setenv("REDIS_TLS_ENABLED", "yes")
+
+	_, err := Load()
+	if err == nil {
+		t.Fatal("Load() accepted REDIS_TLS_ENABLED=yes; it must refuse a value it cannot parse")
+	}
+
+	if !strings.Contains(err.Error(), "REDIS_TLS_ENABLED") {
+		t.Errorf("error %q does not name the offending variable", err)
+	}
+}
+
+// The accepted spellings, and the default. Off is what the local compose stack
+// needs; on is what ElastiCache needs.
+func TestRedisTLSParsing(t *testing.T) {
+	for _, tc := range []struct {
+		raw  string
+		want bool
+	}{
+		{raw: "", want: false},
+		{raw: "false", want: false},
+		{raw: "0", want: false},
+		{raw: "true", want: true},
+		{raw: "1", want: true},
+		{raw: "TRUE", want: true},
+	} {
+		t.Run("REDIS_TLS_ENABLED="+tc.raw, func(t *testing.T) {
+			t.Setenv("REDIS_TLS_ENABLED", tc.raw)
+
+			cfg, err := Load()
+			if err != nil {
+				t.Fatalf("Load() returned error: %v", err)
+			}
+
+			if got := cfg.Redis.TLSEnabled; got != tc.want {
+				t.Errorf("Redis.TLSEnabled = %t, want %t", got, tc.want)
+			}
+		})
+	}
+}
