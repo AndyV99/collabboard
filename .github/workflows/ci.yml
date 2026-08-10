@@ -31,6 +31,10 @@ env:
   GOLANGCI_LINT_VERSION: 'v2.12.2'
   GOVULNCHECK_VERSION: 'v1.6.0'
   SQLC_VERSION: '1.31.1'
+  # ubuntu-latest ships a Terraform, but an unpinned one: a runner image update
+  # could change the formatting rules `fmt -check` enforces without a commit
+  # that says so. 1.10+ is required by the S3-native state locking in ADR 0011.
+  TERRAFORM_VERSION: '1.15.8'
 
 jobs:
   # Cheap (~5s) job that decides which app jobs need to run. Its outputs gate
@@ -49,6 +53,7 @@ jobs:
     outputs:
       api: ${{ steps.filter.outputs.api }}
       web: ${{ steps.filter.outputs.web }}
+      infra: ${{ steps.filter.outputs.infra }}
     steps:
       - uses: actions/checkout@v7
 
@@ -61,6 +66,9 @@ jobs:
               - '.github/workflows/ci.yml'
             web:
               - 'apps/web/**'
+              - '.github/workflows/ci.yml'
+            infra:
+              - 'infra/**'
               - '.github/workflows/ci.yml'
 
   # Stage order follows CI-CD Standards.md: lint first (fails fast), then unit
@@ -254,6 +262,64 @@ jobs:
       - name: npm audit (gate, high+ in production deps)
         run: npm audit --omit=dev --audit-level=high
 
+  # IaC gets the same rigor as application code, so it gets the same two cheap
+  # gates the app jobs get: a formatter check and a static validity check.
+  #
+  # What this job deliberately does NOT do is plan. A plan needs credentials for
+  # a real AWS account, and this workflow references no repository secrets at
+  # all so that it runs unchanged on a fork PR. `validate` without a backend is
+  # a real check — it resolves the provider schema, so an argument that does not
+  # exist, a type mismatch, or a reference to a nonexistent output all fail
+  # here. What it cannot catch is anything the AWS API only rejects at apply
+  # time. A `plan` gate belongs with #103, which is where a deploy identity and
+  # its OIDC role get designed.
+  infra:
+    name: infra
+    needs: changes
+    if: needs.changes.outputs.infra == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    defaults:
+      run:
+        working-directory: infra/terraform
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: hashicorp/setup-terraform@dfe3c3f87815947d99a8997f908cb6525fc44e9e # v4.0.1
+        with:
+          terraform_version: ${{ env.TERRAFORM_VERSION }}
+          # The wrapper rewrites stdout to feed step outputs, which mangles the
+          # diff `fmt -check -diff` prints. Nothing here reads those outputs.
+          terraform_wrapper: false
+
+      # 1. Lint. -recursive covers bootstrap/, every module and every
+      # environment in one pass.
+      - name: terraform fmt
+        run: terraform fmt -check -recursive -diff
+
+      # 2. Validate, once per root module. Child modules under modules/ are
+      # validated transitively as part of the root that calls them, so they need
+      # no entry here -- but a module nothing calls would go unchecked, which is
+      # the same silent-hole shape as #30. The `test -d` guard is what makes
+      # adding environments/prod/ later require no change to this workflow.
+      #
+      # -backend=false skips backend initialisation, so no S3 bucket and no
+      # credentials are needed. Provider plugins still download, and
+      # .terraform.lock.hcl is committed, so this resolves the same provider
+      # build the author validated against.
+      - name: terraform validate
+        run: |
+          set -euo pipefail
+          status=0
+          for dir in bootstrap environments/*/; do
+            [ -d "$dir" ] || continue
+            echo "::group::terraform validate ${dir}"
+            terraform -chdir="$dir" init -backend=false -input=false -no-color
+            terraform -chdir="$dir" validate -no-color || status=1
+            echo '::endgroup::'
+          done
+          exit $status
+
   # The one job to mark as a required status check in branch protection.
   #
   # It has `if: always()` and no path gating, so it runs and reports a
@@ -264,7 +330,10 @@ jobs:
   # `skipped` needs are treated as success; only `failure` or `cancelled` fail.
   ci:
     name: ci
-    needs: [changes, api, integration, web]
+    # Every job above must appear here. A job missing from this list still runs
+    # and still reports, but cannot block a merge -- the exact silent hole #30
+    # exists to make impossible to introduce.
+    needs: [changes, api, integration, web, infra]
     if: always()
     runs-on: ubuntu-latest
     timeout-minutes: 5
