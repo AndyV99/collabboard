@@ -38,7 +38,18 @@ import type { StreamMessage } from "@/lib/realtime/stream";
 const BOARD = "11111111-1111-4111-8111-111111111111";
 const OTHER_BOARD = "99999999-9999-4999-8999-999999999999";
 
-/** Lets the stream's pending `reader.read()` settle. */
+/**
+ * Lets the stream's pending `reader.read()` settle.
+ *
+ * The only `setTimeout` in this file, and it is a zero-delay yield rather than a
+ * wait: it hands control back to the event loop so an already-resolvable read
+ * can run, and it is never racing a budget. The reconnect *schedule* is the list
+ * of timers this harness owns, so a delay here would be measuring nothing.
+ *
+ * Worth stating because the sibling `board-live.test.tsx` had a real backoff
+ * timer racing `waitFor`'s default budget and a header that said it did not.
+ * This one genuinely does not — checked, not assumed.
+ */
 function flush(): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, 0));
 }

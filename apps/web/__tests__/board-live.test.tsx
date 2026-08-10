@@ -12,19 +12,44 @@
  * comment, because it is the behaviour a live demo shows off and the one a
  * refactor would quietly break.
  *
- * # No real sockets, no real timers, no waiting on delays
+ * # No real sockets, and every real timer is bounded and deterministic
  *
- * `support/realtime.ts` is a stream this test enqueues into directly, so
- * "the server sent this event" is a synchronous call. The one place a real
- * timer is involved is the coalesced re-read, and it is only ever observed
- * through `refresh` having been called — a mock call is permanent, which is the
- * assertion shape `board-editing.test.tsx`'s header says is safe. Nothing below
- * asserts a transient window against an immediately-resolving stub.
+ * `support/realtime.ts` is a stream this test enqueues into directly, so "the
+ * server sent this event" is a synchronous call, and nothing below asserts a
+ * transient window against an immediately-resolving stub.
+ *
+ * Two real timers *are* involved, and an earlier version of this header claimed
+ * neither was. Saying so cost a flake that ran for a while before it was
+ * characterised, so they are both named here:
+ *
+ * 1. **The coalesced re-read**, a fixed 120 ms. Only ever observed through
+ *    `refresh` having been called, which is a mock call and therefore permanent
+ *    once it happens — the assertion shape `board-editing.test.tsx`'s header
+ *    says is safe.
+ * 2. **The reconnect backoff**, which is the one that bit. It is exponential
+ *    with *full jitter*: a 1006 close escalates the attempt counter, so the wait
+ *    is `max(100, round(1000 × Math.random()))` — anywhere from 100 ms to a full
+ *    second. `waitFor`'s default budget is also one second, so on a high draw
+ *    under full-suite load the reconnect assertion had no headroom at all and
+ *    failed roughly one run in seven.
+ *
+ * **`Math.random` is therefore pinned to 0 for this whole file**, which puts
+ * every backoff on its 100 ms floor. That removes the race rather than making it
+ * rarer, which a longer timeout would not have done: a widened budget is still
+ * probabilistic, it just relocates the failure to a machine nobody is watching.
+ * The jitter's *distribution* is a property of `backoffDelayMs` and is tested
+ * where it belongs, in `realtime-recovery.test.ts`, against an injected `random`.
+ *
+ * Pinning also gives the "stops trying after a 4003" test teeth it did not have.
+ * It asserts that no reconnect happens within 250 ms; with a random 100–1000 ms
+ * backoff, a client that *did* wrongly retry would often have been scheduled
+ * past that window and the test would have passed anyway. At a fixed 100 ms, a
+ * wrongful retry lands well inside it.
  */
 
 import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import type { ReactNode } from "react";
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { fakeRealtime } from "./support/realtime";
 
@@ -95,13 +120,26 @@ function columnBody(id: string, name: string) {
   };
 }
 
+/**
+ * A counter for event ids.
+ *
+ * `Math.random()` is pinned to 0 for this file, so it can no longer make a
+ * distinct id — and an id is the one field the server guarantees is unique per
+ * event. Nothing here depends on that yet, because the live log does not dedupe
+ * on it, but a fixture that silently emits the same id for every event is a trap
+ * for whoever adds the test that does.
+ */
+let nextEventId = 0;
+
 /** An `event` frame exactly as the Go API writes it. */
 function event(type: string, payload: unknown, boardId = BOARD) {
+  nextEventId += 1;
+
   return {
     type: "event",
     board_id: boardId,
     event: {
-      id: `e-${Math.random()}`,
+      id: `e-${nextEventId}`,
       type,
       actor_id: "someone-else",
       occurred_at: "2026-08-10T01:19:58.424746926Z",
@@ -189,6 +227,16 @@ beforeEach(() => {
   refresh.mockClear();
   vi.unstubAllGlobals();
   __resetBrowserApiForTests();
+
+  // Pins every reconnect backoff to its 100 ms floor. See the note on timers in
+  // this file's header: without it the first reconnect waits a uniformly random
+  // 100–1000 ms against `waitFor`'s 1000 ms budget, which is not a slow test but
+  // a race, and it lost about one run in seven under full-suite load.
+  vi.spyOn(Math, "random").mockReturnValue(0);
+});
+
+afterEach(() => {
+  vi.restoreAllMocks();
 });
 
 describe("re-reading the board on every subscribe", () => {
