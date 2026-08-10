@@ -31,6 +31,8 @@ import { fireEvent, render, screen, waitFor, within } from "@testing-library/rea
 import type { ReactNode } from "react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
+import { withRealtime } from "./support/realtime";
+
 const push = vi.fn();
 const refresh = vi.fn();
 
@@ -237,7 +239,7 @@ describe("what a move puts on the wire", () => {
   it("posts an anchor to the card's own move endpoint, through the proxy", async () => {
     const fetchStub = respond(200, { card: cardBody("card-3", "c-doing", "Zebra") });
 
-    vi.stubGlobal("fetch", fetchStub);
+    vi.stubGlobal("fetch", withRealtime(fetchStub));
     renderBoard();
 
     lift("Zebra");
@@ -262,7 +264,7 @@ describe("what a move puts on the wire", () => {
     // keys and this is the test that fails if a third ever appears.
     const fetchStub = respond(200, { card: cardBody("card-1", "c-todo", "Alpha") });
 
-    vi.stubGlobal("fetch", fetchStub);
+    vi.stubGlobal("fetch", withRealtime(fetchStub));
     renderBoard();
 
     lift("Alpha");
@@ -280,7 +282,7 @@ describe("what a move puts on the wire", () => {
   it("sends a null anchor for the top of a column, not an id it made up", async () => {
     const fetchStub = respond(200, { card: cardBody("card-2", "c-doing", "Kilo") });
 
-    vi.stubGlobal("fetch", fetchStub);
+    vi.stubGlobal("fetch", withRealtime(fetchStub));
     renderBoard();
 
     lift("Kilo");
@@ -298,7 +300,7 @@ describe("what a move puts on the wire", () => {
   it("names the target column when the card crosses into an empty one", async () => {
     const fetchStub = respond(200, { card: cardBody("card-1", "c-done", "Alpha") });
 
-    vi.stubGlobal("fetch", fetchStub);
+    vi.stubGlobal("fetch", withRealtime(fetchStub));
     renderBoard();
 
     lift("Alpha");
@@ -319,7 +321,7 @@ describe("what a move puts on the wire", () => {
     // somebody else's edit to land in the middle of one gesture.
     const fetchStub = respond(200, { card: cardBody("card-3", "c-todo", "Zebra") });
 
-    vi.stubGlobal("fetch", fetchStub);
+    vi.stubGlobal("fetch", withRealtime(fetchStub));
     renderBoard();
 
     lift("Zebra");
@@ -340,7 +342,7 @@ describe("what a move puts on the wire", () => {
   it("sends nothing for a lift that was cancelled", () => {
     const fetchStub = respond(200);
 
-    vi.stubGlobal("fetch", fetchStub);
+    vi.stubGlobal("fetch", withRealtime(fetchStub));
     renderBoard();
 
     lift("Zebra");
@@ -356,7 +358,7 @@ describe("what a move puts on the wire", () => {
     // than a no-op, so a client that posted this would be manufacturing errors.
     const fetchStub = respond(200);
 
-    vi.stubGlobal("fetch", fetchStub);
+    vi.stubGlobal("fetch", withRealtime(fetchStub));
     renderBoard();
 
     lift("Zebra");
@@ -372,7 +374,7 @@ describe("the board while the server is deciding", () => {
   it("shows the card in its new place before the answer arrives", async () => {
     const { fetchStub, settle } = pending();
 
-    vi.stubGlobal("fetch", fetchStub);
+    vi.stubGlobal("fetch", withRealtime(fetchStub));
     renderBoard();
 
     lift("Zebra");
@@ -388,7 +390,7 @@ describe("the board while the server is deciding", () => {
   it("moves the card between columns before the answer arrives", async () => {
     const { fetchStub, settle } = pending();
 
-    vi.stubGlobal("fetch", fetchStub);
+    vi.stubGlobal("fetch", withRealtime(fetchStub));
     renderBoard();
 
     lift("Alpha");
@@ -405,7 +407,7 @@ describe("the board while the server is deciding", () => {
   it("keeps the move once the server has confirmed it and the board is re-read", async () => {
     const fetchStub = respond(200, { card: cardBody("card-3", "c-doing", "Zebra") });
 
-    vi.stubGlobal("fetch", fetchStub);
+    vi.stubGlobal("fetch", withRealtime(fetchStub));
     const { rerender } = renderBoard();
 
     lift("Zebra");
@@ -441,7 +443,7 @@ describe("two moves of one card, both in flight", () => {
   it("holds the second request until the first has been answered", async () => {
     const { fetchStub, settle } = concurrent();
 
-    vi.stubGlobal("fetch", fetchStub);
+    vi.stubGlobal("fetch", withRealtime(fetchStub));
     renderBoard();
 
     // Zebra down one: first → second, so it lands after Kilo.
@@ -490,7 +492,7 @@ describe("two moves of one card, both in flight", () => {
     // because that is the granularity the fractional ranks make independent.
     const { fetchStub, settle } = concurrent();
 
-    vi.stubGlobal("fetch", fetchStub);
+    vi.stubGlobal("fetch", withRealtime(fetchStub));
     renderBoard();
 
     lift("Zebra");
@@ -519,7 +521,7 @@ describe("two moves of one card, both in flight", () => {
     // move the user has just been told did not happen.
     const { fetchStub, settle } = concurrent();
 
-    vi.stubGlobal("fetch", fetchStub);
+    vi.stubGlobal("fetch", withRealtime(fetchStub));
     renderBoard();
 
     lift("Alpha");
@@ -552,7 +554,7 @@ describe("two moves of one card, both in flight", () => {
     // unmovable for the life of the page.
     const { fetchStub, settle } = concurrent();
 
-    vi.stubGlobal("fetch", fetchStub);
+    vi.stubGlobal("fetch", withRealtime(fetchStub));
     renderBoard();
 
     lift("Zebra");
@@ -579,7 +581,7 @@ describe("a stale anchor", () => {
   it("puts the card back, re-reads the board, and says why", async () => {
     const { fetchStub, settle } = pending();
 
-    vi.stubGlobal("fetch", fetchStub);
+    vi.stubGlobal("fetch", withRealtime(fetchStub));
     renderBoard();
 
     lift("Alpha");
@@ -611,7 +613,7 @@ describe("a stale anchor", () => {
   it("says the ordinary thing for a failure that is not a conflict", async () => {
     const { fetchStub, settle } = pending();
 
-    vi.stubGlobal("fetch", fetchStub);
+    vi.stubGlobal("fetch", withRealtime(fetchStub));
     renderBoard();
 
     lift("Alpha");
@@ -636,7 +638,7 @@ describe("saying where the card went", () => {
     // silent for anyone who cannot see the card move.
     const fetchStub = respond(200);
 
-    vi.stubGlobal("fetch", fetchStub);
+    vi.stubGlobal("fetch", withRealtime(fetchStub));
     renderBoard();
 
     lift("Zebra");
@@ -652,7 +654,7 @@ describe("saying where the card went", () => {
   it("says so when the card cannot go any further", () => {
     const fetchStub = respond(200);
 
-    vi.stubGlobal("fetch", fetchStub);
+    vi.stubGlobal("fetch", withRealtime(fetchStub));
     renderBoard();
 
     lift("Zebra");
@@ -664,7 +666,7 @@ describe("saying where the card went", () => {
   it("says where the card ended up, and where it went back to", () => {
     const fetchStub = respond(200);
 
-    vi.stubGlobal("fetch", fetchStub);
+    vi.stubGlobal("fetch", withRealtime(fetchStub));
     renderBoard();
 
     lift("Zebra");
@@ -684,7 +686,7 @@ describe("saying where the card went", () => {
     // would be aimed at a card they no longer hold.
     const fetchStub = respond(200);
 
-    vi.stubGlobal("fetch", fetchStub);
+    vi.stubGlobal("fetch", withRealtime(fetchStub));
     renderBoard();
 
     lift("Kilo");
@@ -700,7 +702,7 @@ describe("saying where the card went", () => {
     // then silence — indistinguishable from the key not working.
     const fetchStub = respond(200);
 
-    vi.stubGlobal("fetch", fetchStub);
+    vi.stubGlobal("fetch", withRealtime(fetchStub));
     renderBoard();
 
     lift("Zebra");
@@ -725,7 +727,7 @@ describe("the grip, as a control", () => {
     // feature gone.
     const fetchStub = respond(200);
 
-    vi.stubGlobal("fetch", fetchStub);
+    vi.stubGlobal("fetch", withRealtime(fetchStub));
     renderBoard();
 
     fireEvent.click(grip("Zebra"));
@@ -737,7 +739,7 @@ describe("the grip, as a control", () => {
   it("reports itself pressed only while the card is held", () => {
     const fetchStub = respond(200);
 
-    vi.stubGlobal("fetch", fetchStub);
+    vi.stubGlobal("fetch", withRealtime(fetchStub));
     renderBoard();
 
     expect(grip("Zebra")).toHaveAttribute("aria-pressed", "false");
@@ -757,7 +759,7 @@ describe("the grip, as a control", () => {
     // move was announced correctly and never sent.
     const fetchStub = respond(200);
 
-    vi.stubGlobal("fetch", fetchStub);
+    vi.stubGlobal("fetch", withRealtime(fetchStub));
     renderBoard();
 
     grip("Alpha").focus();
@@ -775,7 +777,7 @@ describe("the grip, as a control", () => {
   it("gives the move up when focus leaves for another control", () => {
     const fetchStub = respond(200);
 
-    vi.stubGlobal("fetch", fetchStub);
+    vi.stubGlobal("fetch", withRealtime(fetchStub));
     renderBoard();
 
     lift("Zebra");
@@ -793,7 +795,7 @@ describe("the grip, as a control", () => {
     // cross-column move in the act of making it.
     const fetchStub = respond(200);
 
-    vi.stubGlobal("fetch", fetchStub);
+    vi.stubGlobal("fetch", withRealtime(fetchStub));
     renderBoard();
 
     lift("Zebra");
@@ -808,7 +810,7 @@ describe("what cannot be moved", () => {
   it("gives no grip to a card the server has not acknowledged", () => {
     const fetchStub = respond(201, { card: cardBody("card-new", "c-done", "Fresh") });
 
-    vi.stubGlobal("fetch", fetchStub);
+    vi.stubGlobal("fetch", withRealtime(fetchStub));
     renderBoard();
 
     fireEvent.click(screen.getByRole("button", { name: "Add a card to Done" }));

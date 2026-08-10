@@ -216,10 +216,10 @@ export default async function BoardPage({ params, searchParams }: Props) {
       <p className={styles.sectionNote}>
         Cards appear in the order the server returns them — the rank behind that order
         is never sent to the browser, by design (ADR 0004), so a column is reordered by
-        naming its new neighbour and re-reading rather than by sorting here. Cards
-        cannot be dragged between columns yet: that is issue #65. Live updates from
-        other people editing this board are #9, so a colleague&rsquo;s change appears
-        on your next reload rather than as it happens.
+        naming its new neighbour and re-reading rather than by sorting here. This board
+        updates as other people edit it; the indicator above the columns says whether it
+        is still connected, because a board that has quietly stopped listening looks
+        exactly like one nobody else is working on.
       </p>
     </div>
   );

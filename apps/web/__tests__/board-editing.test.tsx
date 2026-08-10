@@ -50,6 +50,8 @@ import { fireEvent, render, screen, waitFor, within } from "@testing-library/rea
 import type { ReactNode } from "react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
+import { withRealtime } from "./support/realtime";
+
 const push = vi.fn();
 const refresh = vi.fn();
 
@@ -272,7 +274,7 @@ describe("adding a card", () => {
   it("posts the title to the column's own endpoint, through the proxy", async () => {
     const fetchStub = respond(201, { card: cardBody("card-new", "c-doing", "Fresh") });
 
-    vi.stubGlobal("fetch", fetchStub);
+    vi.stubGlobal("fetch", withRealtime(fetchStub));
     renderBoard();
     openCardComposer("Doing");
     fireEvent.change(screen.getByLabelText("New card in Doing"), {
@@ -292,7 +294,7 @@ describe("adding a card", () => {
   it("shows the card at the bottom of the column before the server answers", async () => {
     const { fetchStub, settle } = pending();
 
-    vi.stubGlobal("fetch", fetchStub);
+    vi.stubGlobal("fetch", withRealtime(fetchStub));
     renderBoard();
     openCardComposer("Doing");
     fireEvent.change(screen.getByLabelText("New card in Doing"), {
@@ -321,7 +323,7 @@ describe("adding a card", () => {
   it("does not make the unconfirmed card a link, because its id is invented", async () => {
     const { fetchStub, settle } = pending();
 
-    vi.stubGlobal("fetch", fetchStub);
+    vi.stubGlobal("fetch", withRealtime(fetchStub));
     renderBoard();
     openCardComposer("Doing");
     fireEvent.change(screen.getByLabelText("New card in Doing"), {
@@ -342,7 +344,7 @@ describe("adding a card", () => {
   it("clears the field and keeps the composer open, so the next card is one sentence away", async () => {
     const fetchStub = respond(201, { card: cardBody("card-new", "c-doing", "Fresh") });
 
-    vi.stubGlobal("fetch", fetchStub);
+    vi.stubGlobal("fetch", withRealtime(fetchStub));
     renderBoard();
     openCardComposer("Doing");
 
@@ -358,7 +360,7 @@ describe("adding a card", () => {
   it("refuses a title over the API's limit without sending anything", () => {
     const fetchStub = respond(201, {});
 
-    vi.stubGlobal("fetch", fetchStub);
+    vi.stubGlobal("fetch", withRealtime(fetchStub));
     renderBoard();
     openCardComposer("Doing");
     fireEvent.change(screen.getByLabelText("New card in Doing"), {
@@ -375,7 +377,7 @@ describe("adding a card", () => {
   it("accepts a title of exactly the limit, because the API does", async () => {
     const fetchStub = respond(201, { card: cardBody("card-new", "c-doing", "x") });
 
-    vi.stubGlobal("fetch", fetchStub);
+    vi.stubGlobal("fetch", withRealtime(fetchStub));
     renderBoard();
     openCardComposer("Doing");
     fireEvent.change(screen.getByLabelText("New card in Doing"), {
@@ -391,7 +393,7 @@ describe("adding a card", () => {
   it("refuses a blank title without sending anything", () => {
     const fetchStub = respond(201, {});
 
-    vi.stubGlobal("fetch", fetchStub);
+    vi.stubGlobal("fetch", withRealtime(fetchStub));
     renderBoard();
     openCardComposer("Doing");
     fireEvent.change(screen.getByLabelText("New card in Doing"), {
@@ -406,7 +408,7 @@ describe("adding a card", () => {
   it("ROLLBACK: takes the card back off the board when the server refuses it", async () => {
     const { fetchStub, settle } = pending();
 
-    vi.stubGlobal("fetch", fetchStub);
+    vi.stubGlobal("fetch", withRealtime(fetchStub));
     renderBoard();
     openCardComposer("Doing");
     fireEvent.change(screen.getByLabelText("New card in Doing"), {
@@ -430,7 +432,7 @@ describe("adding a card", () => {
   it("gives back what was typed when the write fails, so nothing is lost", async () => {
     const { fetchStub, settle } = pending();
 
-    vi.stubGlobal("fetch", fetchStub);
+    vi.stubGlobal("fetch", withRealtime(fetchStub));
     renderBoard();
     openCardComposer("Doing");
     fireEvent.change(screen.getByLabelText("New card in Doing"), {
@@ -448,7 +450,7 @@ describe("adding a card", () => {
   it("shows the server's own card once the refreshed board arrives", async () => {
     const fetchStub = respond(201, { card: cardBody("card-new", "c-doing", "Fresh") });
 
-    vi.stubGlobal("fetch", fetchStub);
+    vi.stubGlobal("fetch", withRealtime(fetchStub));
 
     const view = renderBoard();
 
@@ -489,7 +491,7 @@ describe("adding a column", () => {
   it("posts the name to the board's columns endpoint", async () => {
     const fetchStub = respond(201, { column: columnBody("c-new", "Blocked") });
 
-    vi.stubGlobal("fetch", fetchStub);
+    vi.stubGlobal("fetch", withRealtime(fetchStub));
     renderBoard();
     fireEvent.click(screen.getByRole("button", { name: "+ Add a column" }));
     fireEvent.change(screen.getByLabelText("New column name"), {
@@ -505,7 +507,7 @@ describe("adding a column", () => {
   it("refuses a name over the API's limit without sending anything", () => {
     const fetchStub = respond(201, {});
 
-    vi.stubGlobal("fetch", fetchStub);
+    vi.stubGlobal("fetch", withRealtime(fetchStub));
     renderBoard();
     fireEvent.click(screen.getByRole("button", { name: "+ Add a column" }));
     fireEvent.change(screen.getByLabelText("New column name"), {
@@ -520,7 +522,7 @@ describe("adding a column", () => {
   it("offers the form on a board with no columns at all", async () => {
     const fetchStub = respond(201, { column: columnBody("c-new", "To do") });
 
-    vi.stubGlobal("fetch", fetchStub);
+    vi.stubGlobal("fetch", withRealtime(fetchStub));
     renderBoard([], []);
 
     expect(screen.getByText("This board has no columns yet")).toBeInTheDocument();
@@ -537,7 +539,7 @@ describe("adding a column", () => {
   it("ROLLBACK: takes the column back off the board when the server refuses it", async () => {
     const { fetchStub, settle } = pending();
 
-    vi.stubGlobal("fetch", fetchStub);
+    vi.stubGlobal("fetch", withRealtime(fetchStub));
     renderBoard();
     fireEvent.click(screen.getByRole("button", { name: "+ Add a column" }));
     fireEvent.change(screen.getByLabelText("New column name"), {
@@ -558,7 +560,7 @@ describe("renaming a column", () => {
   it("patches the column and shows the new name immediately", async () => {
     const { fetchStub, settle } = pending();
 
-    vi.stubGlobal("fetch", fetchStub);
+    vi.stubGlobal("fetch", withRealtime(fetchStub));
     renderBoard();
     openColumnTools("Doing");
     fireEvent.change(screen.getByLabelText("Column name"), {
@@ -577,7 +579,7 @@ describe("renaming a column", () => {
   it("closes without a request when the name was not changed", () => {
     const fetchStub = respond(200, {});
 
-    vi.stubGlobal("fetch", fetchStub);
+    vi.stubGlobal("fetch", withRealtime(fetchStub));
     renderBoard();
     openColumnTools("Doing");
     fireEvent.submit(screen.getByRole("button", { name: "Save name" }).closest("form")!);
@@ -591,7 +593,7 @@ describe("renaming a column", () => {
   it("ROLLBACK: puts the old name back when the server refuses the rename", async () => {
     const { fetchStub, settle } = pending();
 
-    vi.stubGlobal("fetch", fetchStub);
+    vi.stubGlobal("fetch", withRealtime(fetchStub));
     renderBoard();
     openColumnTools("Doing");
     fireEvent.change(screen.getByLabelText("Column name"), {
@@ -612,7 +614,7 @@ describe("reordering a column", () => {
   it("names the new neighbour rather than a position", async () => {
     const fetchStub = respond(200, { column: columnBody("c-todo", "To do") });
 
-    vi.stubGlobal("fetch", fetchStub);
+    vi.stubGlobal("fetch", withRealtime(fetchStub));
     renderBoard();
     openColumnTools("To do");
     fireEvent.click(screen.getByRole("button", { name: "Move right →" }));
@@ -628,7 +630,7 @@ describe("reordering a column", () => {
   it("sends a null anchor when a column moves to the front", async () => {
     const fetchStub = respond(200, { column: columnBody("c-doing", "Doing") });
 
-    vi.stubGlobal("fetch", fetchStub);
+    vi.stubGlobal("fetch", withRealtime(fetchStub));
     renderBoard();
     openColumnTools("Doing");
     fireEvent.click(screen.getByRole("button", { name: "← Move left" }));
@@ -641,7 +643,7 @@ describe("reordering a column", () => {
   it("re-reads the board rather than trusting its own splice", async () => {
     const fetchStub = respond(200, { column: columnBody("c-todo", "To do") });
 
-    vi.stubGlobal("fetch", fetchStub);
+    vi.stubGlobal("fetch", withRealtime(fetchStub));
     renderBoard();
     openColumnTools("To do");
     fireEvent.click(screen.getByRole("button", { name: "Move right →" }));
@@ -652,7 +654,7 @@ describe("reordering a column", () => {
   });
 
   it("has no move at the ends of the board", () => {
-    vi.stubGlobal("fetch", respond(200, {}));
+    vi.stubGlobal("fetch", withRealtime(respond(200, {})));
     renderBoard();
     openColumnTools("To do");
 
@@ -663,7 +665,7 @@ describe("reordering a column", () => {
   it("ROLLBACK: puts the order back when the server refuses the move", async () => {
     const { fetchStub, settle } = pending();
 
-    vi.stubGlobal("fetch", fetchStub);
+    vi.stubGlobal("fetch", withRealtime(fetchStub));
     renderBoard();
     openColumnTools("To do");
     fireEvent.click(screen.getByRole("button", { name: "Move right →" }));
@@ -683,7 +685,7 @@ describe("deleting a column", () => {
   it("says how many cards go with it, and sends nothing until confirmed", () => {
     const fetchStub = respond(204);
 
-    vi.stubGlobal("fetch", fetchStub);
+    vi.stubGlobal("fetch", withRealtime(fetchStub));
     renderBoard();
     openColumnTools("Doing");
     fireEvent.click(screen.getByRole("button", { name: "Delete column" }));
@@ -697,7 +699,7 @@ describe("deleting a column", () => {
   });
 
   it("says so plainly when the column is empty", () => {
-    vi.stubGlobal("fetch", respond(204));
+    vi.stubGlobal("fetch", withRealtime(respond(204)));
     renderBoard();
     openColumnTools("Done");
     fireEvent.click(screen.getByRole("button", { name: "Delete column" }));
@@ -709,7 +711,7 @@ describe("deleting a column", () => {
   it("can be backed out of", () => {
     const fetchStub = respond(204);
 
-    vi.stubGlobal("fetch", fetchStub);
+    vi.stubGlobal("fetch", withRealtime(fetchStub));
     renderBoard();
     openColumnTools("Doing");
     fireEvent.click(screen.getByRole("button", { name: "Delete column" }));
@@ -722,7 +724,7 @@ describe("deleting a column", () => {
   it("deletes the column and its cards once confirmed", async () => {
     const fetchStub = respond(204);
 
-    vi.stubGlobal("fetch", fetchStub);
+    vi.stubGlobal("fetch", withRealtime(fetchStub));
 
     const view = renderBoard();
 
@@ -776,7 +778,7 @@ describe("deleting a column", () => {
   it("ROLLBACK: brings the column and every card in it back when the delete fails", async () => {
     const { fetchStub, settle } = pending();
 
-    vi.stubGlobal("fetch", fetchStub);
+    vi.stubGlobal("fetch", withRealtime(fetchStub));
     renderBoard();
     openColumnTools("Doing");
     fireEvent.click(screen.getByRole("button", { name: "Delete column" }));
@@ -806,7 +808,7 @@ describe("editing a card", () => {
   it("sends only the field that changed", async () => {
     const fetchStub = respond(200, { card: cardBody("card-2", "c-doing", "Kilo two", "Some detail") });
 
-    vi.stubGlobal("fetch", fetchStub);
+    vi.stubGlobal("fetch", withRealtime(fetchStub));
     openEditor();
     fireEvent.change(screen.getByLabelText("Title"), { target: { value: "Kilo two" } });
     fireEvent.submit(screen.getByRole("button", { name: "Save card" }).closest("form")!);
@@ -821,7 +823,7 @@ describe("editing a card", () => {
   it("can clear a description, because the API allows an empty one", async () => {
     const fetchStub = respond(200, { card: cardBody("card-2", "c-doing", "Kilo") });
 
-    vi.stubGlobal("fetch", fetchStub);
+    vi.stubGlobal("fetch", withRealtime(fetchStub));
     openEditor();
     fireEvent.change(screen.getByLabelText(/Description/), { target: { value: "" } });
     fireEvent.submit(screen.getByRole("button", { name: "Save card" }).closest("form")!);
@@ -833,7 +835,7 @@ describe("editing a card", () => {
   it("closes without a request when nothing was changed", () => {
     const fetchStub = respond(200, {});
 
-    vi.stubGlobal("fetch", fetchStub);
+    vi.stubGlobal("fetch", withRealtime(fetchStub));
     openEditor();
     fireEvent.submit(screen.getByRole("button", { name: "Save card" }).closest("form")!);
 
@@ -845,7 +847,7 @@ describe("editing a card", () => {
   it("refuses an over-long description without sending anything", () => {
     const fetchStub = respond(200, {});
 
-    vi.stubGlobal("fetch", fetchStub);
+    vi.stubGlobal("fetch", withRealtime(fetchStub));
     openEditor();
     fireEvent.change(screen.getByLabelText(/Description/), {
       target: { value: "x".repeat(10_001) },
@@ -862,7 +864,7 @@ describe("editing a card", () => {
   it("refuses an emptied title, which PATCH rejects where it accepts an empty description", () => {
     const fetchStub = respond(200, {});
 
-    vi.stubGlobal("fetch", fetchStub);
+    vi.stubGlobal("fetch", withRealtime(fetchStub));
     openEditor();
     fireEvent.change(screen.getByLabelText("Title"), { target: { value: "  " } });
     fireEvent.submit(screen.getByRole("button", { name: "Save card" }).closest("form")!);
@@ -874,7 +876,7 @@ describe("editing a card", () => {
   it("ROLLBACK: puts the old title back on the tile when the save is refused", async () => {
     const { fetchStub, settle } = pending();
 
-    vi.stubGlobal("fetch", fetchStub);
+    vi.stubGlobal("fetch", withRealtime(fetchStub));
     openEditor();
     fireEvent.change(screen.getByLabelText("Title"), { target: { value: "Kilo two" } });
     fireEvent.submit(screen.getByRole("button", { name: "Save card" }).closest("form")!);
@@ -904,7 +906,7 @@ describe("deleting a card", () => {
   it("confirms before deleting, and sends nothing until then", () => {
     const fetchStub = respond(204);
 
-    vi.stubGlobal("fetch", fetchStub);
+    vi.stubGlobal("fetch", withRealtime(fetchStub));
     openDeleteConfirm();
 
     expect(screen.getByText(/cannot be undone/)).toBeInTheDocument();
@@ -914,7 +916,7 @@ describe("deleting a card", () => {
   it("deletes the card and closes the panel", async () => {
     const fetchStub = respond(204);
 
-    vi.stubGlobal("fetch", fetchStub);
+    vi.stubGlobal("fetch", withRealtime(fetchStub));
     openDeleteConfirm();
     fireEvent.click(screen.getByRole("button", { name: "Delete card" }));
 
@@ -931,7 +933,7 @@ describe("deleting a card", () => {
   it("ROLLBACK: puts the card back on the board when the delete is refused", async () => {
     const { fetchStub, settle } = pending();
 
-    vi.stubGlobal("fetch", fetchStub);
+    vi.stubGlobal("fetch", withRealtime(fetchStub));
     openDeleteConfirm();
     fireEvent.click(screen.getByRole("button", { name: "Delete card" }));
 
@@ -951,7 +953,7 @@ describe("the board's read-only rendering", () => {
   it("still shows no editing controls for a column the server has not confirmed", async () => {
     const { fetchStub, settle } = pending();
 
-    vi.stubGlobal("fetch", fetchStub);
+    vi.stubGlobal("fetch", withRealtime(fetchStub));
     renderBoard();
     fireEvent.click(screen.getByRole("button", { name: "+ Add a column" }));
     fireEvent.change(screen.getByLabelText("New column name"), {

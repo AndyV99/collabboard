@@ -11,7 +11,8 @@ boards and the people in an organization — and
 columns and cards and lets you edit them: create, rename, reorder and delete
 columns, create, edit and delete cards, and
 [move a card](#moving-a-card-the-headline-interaction) by dragging it or with
-the keyboard. The WebSocket client is #9.
+the keyboard — and, since #66, [live updates](#live-updates-66): a card moved or
+edited by somebody else appears on every open board in about ten milliseconds.
 
 ## Commands
 
@@ -938,18 +939,148 @@ carries `tabindex="0"` because a scroll container with no focusable child is
 unreachable without a pointer — which is every column whose cards run past the
 fold.
 
+## Live updates (#66)
+
+A card moved or edited by somebody else on the same board appears here without a
+reload. Measured end to end with two Chromium contexts, two accounts, one board:
+**p50 9 ms, p95 12 ms, max 14 ms over 30 moves**, from the moment one browser
+issues the move to the moment the other browser's DOM shows it — against the
+project's ~200 ms target. The server's own fan-out is p99 1.64 ms; the rest is
+the mover's HTTP round trip, the relay, and React rendering.
+
+### The browser has no token, so it does not open the WebSocket
+
+The API authenticates a WebSocket handshake with a bearer token in a
+`Sec-WebSocket-Protocol` offer, a mechanism that exists *because* browsers
+cannot set handshake headers. [ADR 0007](../../docs/adr/0007-web-session-storage.md)
+says the browser never holds a bearer token. Both are load-bearing, so they were
+resolved rather than traded: **the handshake happens on the Next server, where
+the token already is, and the browser gets a same-origin event stream.**
+
+```
+browser ──SSE──▶ GET /api/realtime/boards/:id   (cookies; no credential in JS)
+                 app/api/realtime/boards/[boardId]/route.ts
+                        │
+                        └──WebSocket──▶ GET /api/v1/ws
+                           Sec-WebSocket-Protocol:
+                             collabboard.v1, bearer.collabboard.v1.<jwt>
+```
+
+[ADR 0010](../../docs/adr/0010-realtime-browser-credential.md) records the
+options, including the one this refuses — handing the page a fifteen-minute
+full-scope token, which an XSS could exfiltrate and replay from anywhere — and
+what the relay costs: two connections per viewer, and the web tier on the
+realtime path.
+
+### Three layers, and the order they are applied in
+
+```
+snapshot (prop)      what the Server Component last read     the truth
+  + live log         everyone else's events since that read  seconds old
+    + useOptimistic  this user's own unconfirmed edits       milliseconds old
+```
+
+Each layer is younger and less certain than the one below it. **That ordering is
+the whole answer to the flicker question:** an inbound `card.moved` for a card
+you are dragging lands *underneath* your own optimistic move, which is replayed
+on top, so the card does not jump out from under the pointer. When your move
+settles, `router.refresh()` brings the server's answer and last-writer-wins
+decides — the semantic ADR 0004 and ADR 0005 already chose.
+
+The one event that is not applied immediately is a **create**, and only while
+this client has an unconfirmed create of its own. A pending card carries a
+`pending:` id that `lib/board/mutations.ts` made deliberately unmatchable to a
+server id, so there is no way to tell "my card coming back" from "somebody
+else's new card", and drawing both is a visible duplicate. While anything is
+pending, creates are left to the re-read, which replaces the placeholder and adds
+the real row in one step.
+
+### Every subscribe re-reads the board, and that is the recovery design
+
+[ADR 0005](../../docs/adr/0005-realtime-event-delivery.md) is explicit that Redis
+pub/sub is at-most-once and holds nothing: anything published while a client is
+between connections is gone, and nothing will resend it. So every `subscribed`
+frame — the first one as much as the ones after a reconnect — triggers a full
+re-read.
+
+Demonstrated rather than asserted: with one browser's stream refused at the
+network layer, the other moved a card; the disconnected browser was checked to be
+**wrong**, then reconnected and was correct. Only the re-fetch could have told
+it, because the event no longer existed anywhere.
+
+The live log is also *replayed* over each new snapshot rather than discarded,
+which is why every function in `lib/realtime/apply.ts` is idempotent. An event is
+retired once a read that *started after it arrived* has landed — sound because
+ADR 0005 publishes after the commit and before the response, so an event observed
+at time *t* proves its write was durable before *t*.
+
+### The close codes mean different things
+
+| Code | Means | This client |
+| --- | --- | --- |
+| `4001` | access token expired | refresh, **then** reconnect. Not a sign-out — a 15-minute credential ending on schedule is the normal life of an open tab |
+| `4002` | dropped as a slow consumer | back off, reconnect, re-read. Events were missed *by definition*, which is the case ADR 0005 built the re-fetch for |
+| `4003` | membership revoked | stop. Every retry would be authorised, refused and closed again |
+| `1001` | instance restarting, or no pong | reconnect, honouring the server's `reconnect_after_ms` hint so a rolling deploy is not a thundering herd |
+| `1003`/`1009` | the server rejected what we sent | stop. A bug here, not a condition |
+
+Each was provoked for real, not reasoned about: `4001` by running the API with a
+40-second token TTL and watching the browser refresh and reconnect while staying
+signed in; `4002` by a deliberately stalled raw consumer against a one-frame send
+buffer; `4003` by revoking a membership and watching the 30-second re-authorisation
+sweep close the socket.
+
+Reconnects back off exponentially with full jitter, from 500 ms to 30 s, **with a
+100 ms floor**. The floor is not a rounding detail: full jitter returns
+single-digit milliseconds, and a retry that comes back in 3 ms against an
+endpoint failing instantly is a self-inflicted denial of service. It was observed
+before it was fixed — the loop exhausted a Vitest worker.
+
+### The connection state is on screen
+
+`components/boards/connection-status.tsx`, above the columns: *Live*,
+*Connecting…*, *Reconnecting…*, or *Not live* with a sentence saying why. The
+failure mode of a realtime feature is **silence**, and silence is
+indistinguishable from nobody else editing — which is
+[#53](https://github.com/AndyV99/collabboard/issues/53)'s complaint. Note the
+split: this reports *this client's connection*, which it knows first-hand. It
+does not report whether the server's Redis fan-out is healthy, because the server
+does not say. Making it say so is still #53.
+
+### Files
+
+```
+app/api/realtime/boards/[boardId]/route.ts  the SSE route: session in, stream out
+lib/realtime/relay.ts        server side: one WebSocket in, one event stream out
+lib/realtime/stream.ts       the contract between the two halves, and the ws:// URL
+lib/realtime/protocol.ts     the wire format: frames and events, parsed into a union
+lib/realtime/apply.ts        an event -> a board change, idempotently
+lib/realtime/recovery.ts     what each close code means, and how long to wait
+lib/realtime/client.ts       the browser's connection and reconnect state machine
+components/boards/use-board-live.ts       the live log, the re-read, and when to retire
+components/boards/connection-status.tsx   what the user is told
+```
+
+Every dependency that would make the client untestable — `fetch`, the clock, the
+timer, the jitter, the token refresh, the socket — is an argument. There is no
+`setTimeout` and no `Math.random` in the body of `lib/realtime/client.ts`, and
+the tests drive the schedule by hand rather than waiting for it. That is the rule
+`__tests__/board-editing.test.tsx`'s header lays down, applied to a layer that
+made it much easier to break.
+
 ## Layout
 
 ```
 app/                 routes (App Router). page.tsx is the public landing page,
                      (auth)/ and (protected)/ are the two access rules,
                      (protected)/app/ is the workspace, healthz/route.ts is the
-                     readiness signal, api/ holds the session Route Handlers and
-                     the authenticated proxy.
+                     readiness signal, api/ holds the session Route Handlers,
+                     the authenticated proxy, and the realtime event stream.
 components/          presentational components, kept pure so they are unit testable
 lib/                 the API client and session layer, the auth screens' rules
-                     and copy, the workspace's rules/roles/copy, the readiness
-                     policy, the structured logger
+                     and copy, the workspace's rules/roles/copy, the realtime
+                     protocol and reconnect policy, the readiness policy, the
+                     structured logger
 proxy.ts             pre-render session refresh + the requested-path stamp
                      (Next 16's renamed middleware)
 instrumentation.ts   server startup hook: validates + logs the resolved API_URL

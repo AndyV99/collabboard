@@ -21,11 +21,23 @@
 
 import { render, screen, within } from "@testing-library/react";
 import type { ReactNode } from "react";
-import { describe, expect, it, vi } from "vitest";
+import { beforeEach, describe, expect, it, vi } from "vitest";
+
+import { fakeRealtime } from "./support/realtime";
 
 vi.mock("next/navigation", () => ({
   useRouter: () => ({ push: vi.fn(), refresh: vi.fn() }),
 }));
+
+/**
+ * A board opens a realtime stream as soon as it mounts (#66), so even the
+ * rendering tests need something to answer it. Without one the client meets a
+ * `fetch` that rejects and starts backing off, which is correct behaviour and
+ * pure noise here.
+ */
+beforeEach(() => {
+  vi.stubGlobal("fetch", fakeRealtime().fetch);
+});
 
 import type { Card, Column } from "@/lib/api/types";
 
