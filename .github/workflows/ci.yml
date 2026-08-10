@@ -345,6 +345,65 @@ jobs:
           done
           exit $status
 
+  # Scans the repository for committed credentials.
+  #
+  # Deliberately NOT gated by `changes`, unlike api/web/infra. Those are gated
+  # because they are expensive and genuinely irrelevant to an untouched app: no
+  # Go file changed, so `go test` cannot have a new answer. That reasoning does
+  # not transfer. A secret is not a property of a subtree -- it lands in a
+  # README, a test fixture, a JSON sample, a comment in a workflow file, a
+  # docs/adr page pasting a connection string "for illustration". Any path
+  # filter that would be cheap enough to be worth writing is a list of the
+  # places we already thought of, and the ones we thought of are not where this
+  # goes wrong. The job costs well under a minute, so gating it would trade the
+  # entire point of the check for nothing.
+  #
+  # Scans full history, not just the working tree. Those answer different
+  # questions: the tree says "is a credential present now", history says "was
+  # one ever committed", and only the second one matters, because a secret that
+  # was committed and reverted is still on GitHub's servers and still has to be
+  # rotated. A tree-only scan reports clean on exactly the incident this job
+  # exists to find.
+  #
+  # The cost of that, honestly: gitleaks is linear in bytes of diff, and today
+  # that is 132 commits / ~3.1 MB / ~0.4s. There is real growth here -- every
+  # PR re-scans everything that came before it -- but at 10x the history it is
+  # still seconds against a 15-minute `api` job. If it ever does start to hurt,
+  # the fix is `--log-opts` from a known-clean tag, accepting that this stops
+  # catching a history rewrite that plants something below the baseline. Not
+  # worth buying that weakness now for a saving measured in seconds.
+  secret-scan:
+    name: secret-scan
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          # 0 = full history. The default shallow clone would give gitleaks a
+          # single commit to scan, and it would report clean, and nobody would
+          # notice that it had stopped looking.
+          fetch-depth: 0
+
+      # Not gitleaks-action, and not apt/brew/`go install`: the pre-commit hook
+      # has to run the identical build with the identical config, and the only
+      # way to guarantee that is for both to go through one script that pins the
+      # version and its checksum. An action here would drift from the hook the
+      # first time either side moved, and would do it silently -- both would
+      # still report "no leaks found", just about different rulesets.
+      #
+      # --redact keeps the matched value out of the log. A findings line still
+      # carries file, line and commit, which is enough to go and look; the value
+      # itself would turn a public, retained build log into a second place the
+      # credential is published. The hook does not redact, because that output
+      # goes to the terminal of the person who just typed it.
+      #
+      # No --exit-code juggling here, unlike the hook. The hook has to tell "a
+      # secret is staged" apart from "the scanner failed" because it prints
+      # different advice for each and gitleaks uses exit 1 for both; this job
+      # just needs to go red, and whoever opens the log sees which it was.
+      - name: gitleaks (full history)
+        run: ./scripts/gitleaks.sh git --no-banner --redact --verbose .
+
   # The one job to mark as a required status check in branch protection.
   #
   # It has `if: always()` and no path gating, so it runs and reports a
@@ -358,7 +417,7 @@ jobs:
     # Every job above must appear here. A job missing from this list still runs
     # and still reports, but cannot block a merge -- the exact silent hole #30
     # exists to make impossible to introduce.
-    needs: [changes, api, integration, web, infra]
+    needs: [changes, api, integration, web, infra, secret-scan]
     if: always()
     runs-on: ubuntu-latest
     timeout-minutes: 5

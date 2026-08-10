@@ -1,0 +1,69 @@
+# gitleaks configuration for CollabBoard.
+#
+# One config, used by both `.github/workflows/ci.yml` and the pre-commit hook in
+# `.githooks/pre-commit` -- both run through `scripts/gitleaks.sh`, which injects
+# this file. Local and CI therefore cannot disagree about what counts as a leak.
+#
+# Run it yourself:
+#   scripts/gitleaks.sh git --no-banner .          # full history
+#   scripts/gitleaks.sh dir --no-banner .          # working tree only
+#
+# See `Standards/Security Practices.md` in the vault, and #106.
+
+[extend]
+# Start from gitleaks' bundled ruleset (~180 rules: cloud provider keys, Stripe,
+# private key blocks, generic high-entropy assignments) rather than hand-rolling
+# rules. The default set is the part that gets maintained upstream as new
+# credential formats appear; anything added below is repo-specific and is a
+# subtraction, not an addition.
+useDefault = true
+
+# ---------------------------------------------------------------------------
+# Allowlist
+# ---------------------------------------------------------------------------
+#
+# Every entry here is scoped to a specific *value*, not to a path.
+#
+# The tempting version of this file excludes `**/*_test.go` and `__tests__/**`
+# wholesale, because that is where all of today's false positives are. That
+# would be a mistake, and precisely the one #106 exists to prevent: "pasted a
+# real value in for five minutes to check something" happens in a test more
+# often than anywhere else, and a path exclusion means the scanner is asleep in
+# exactly that spot. Value-scoped entries keep the fixtures quiet while leaving
+# every other string in those same files scanned.
+#
+# Each entry needs a reason for why the value cannot be a real credential.
+
+[[allowlists]]
+description = """
+HMAC signing keys used by the API's JWT tests. `0123456789abcdef` repeated, and
+its reverse, are counting patterns rather than key material -- they are chosen
+to be visibly fake and are the wrong thing structurally too, since the real
+AUTH_JWT_SECRET is supplied per environment and never has a committed value
+(apps/api/.env.example carries a placeholder, not a key). Used as the shared
+secret in apps/api/internal/auth, internal/api and internal/realtime tests so
+that a token minted in one package verifies in another.
+
+Triggers gitleaks' generic-api-key rule, which fires on any 32-char hex string
+assigned to an identifier containing "secret".
+"""
+regexTarget = "secret"
+regexes = [
+  '''^0123456789abcdef0123456789abcdef$''',
+  '''^fedcba9876543210fedcba9876543210$''',
+]
+
+[[allowlists]]
+description = """
+A structurally-valid but content-free JWT used by the web realtime tests to
+assert that the client forwards a token it is handed without parsing it. The
+three segments decode to {"alg":"HS256"}, {"sub":"somebody"} and the literal
+ASCII "signature" -- there is no key involved and nothing would verify it.
+
+Triggers gitleaks' `jwt` rule, which matches on the eyJ... shape alone and so
+cannot tell a real token from a hand-assembled one.
+"""
+regexTarget = "secret"
+regexes = [
+  '''^eyJhbGciOiJIUzI1NiJ9\.eyJzdWIiOiJzb21lYm9keSJ9\.c2lnbmF0dXJl$''',
+]
