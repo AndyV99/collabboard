@@ -55,6 +55,28 @@ mock_provider "aws" {
     }
   }
 
+  # #102's three additional roles, same reason.
+  override_data {
+    target = data.aws_iam_policy_document.web_execution
+    values = {
+      json = "{\"Version\":\"2012-10-17\",\"Statement\":[]}"
+    }
+  }
+
+  override_data {
+    target = data.aws_iam_policy_document.admin_execution
+    values = {
+      json = "{\"Version\":\"2012-10-17\",\"Statement\":[]}"
+    }
+  }
+
+  override_data {
+    target = data.aws_iam_policy_document.admin_task
+    values = {
+      json = "{\"Version\":\"2012-10-17\",\"Statement\":[]}"
+    }
+  }
+
   # Same reason, one layer up: a mocked provider generates a random string for
   # `arn`, and aws_iam_role_policy_attachment validates that it parses as an
   # ARN. The assertions comparing an attachment's policy_arn to this resource's
@@ -148,6 +170,110 @@ run "task_role_cannot_read_any_secret" {
       alltrue([for r in s.resources : startswith(r, "arn:") && strcontains(r, "collabboard/test/")])
     ])
     error_message = "the execution role's secret read must be scoped to this environment's secret namespace"
+  }
+}
+
+# #102 added three roles, and the Deny has to grow with them or it stops being a
+# property of the stack and becomes a property of two roles somebody remembered.
+#
+# The last one is the interesting one. The administrative task exists to run
+# `bootstrap-owner.sql` as the RDS master user (ADR 0013) -- and it carries the
+# Deny anyway. That is the design, not an oversight: the operator reads the
+# master password with their own IAM identity and gives it to `psql -W` at the
+# prompt, so "no ECS role in this account can read the RDS master credential"
+# stays true even of the role whose job is to use it.
+run "every_ecs_role_carries_the_deny_including_the_administrative_one" {
+  command = apply
+
+  assert {
+    condition = alltrue([
+      aws_iam_role_policy_attachment.execution_deny_master_secret.role == aws_iam_role.execution.name,
+      aws_iam_role_policy_attachment.task_deny_master_secret.role == aws_iam_role.task.name,
+      aws_iam_role_policy_attachment.web_execution_deny_master_secret.role == aws_iam_role.web_execution.name,
+      aws_iam_role_policy_attachment.admin_execution_deny_master_secret.role == aws_iam_role.admin_execution.name,
+      aws_iam_role_policy_attachment.admin_task_deny_master_secret.role == aws_iam_role.admin_task.name,
+    ])
+    error_message = "all five ECS roles must carry the master-credential Deny; a role added without it is a live path to a credential that bypasses row-level security"
+  }
+
+  assert {
+    condition = alltrue([
+      for attachment in [
+        aws_iam_role_policy_attachment.execution_deny_master_secret,
+        aws_iam_role_policy_attachment.task_deny_master_secret,
+        aws_iam_role_policy_attachment.web_execution_deny_master_secret,
+        aws_iam_role_policy_attachment.admin_execution_deny_master_secret,
+        aws_iam_role_policy_attachment.admin_task_deny_master_secret,
+      ] : attachment.policy_arn == aws_iam_policy.deny_master_secret.arn
+    ])
+    error_message = "every attachment must reference the deny policy itself"
+  }
+}
+
+# The web tier's configuration is one hostname. Reusing the API's execution role
+# would have handed the rendering tier the database password and the JWT signing
+# key, for nothing.
+run "the_web_execution_role_cannot_read_this_environments_secrets" {
+  command = apply
+
+  assert {
+    condition = alltrue([
+      for statement in data.aws_iam_policy_document.web_execution.statement :
+      !anytrue([
+        for action in statement.actions :
+        startswith(action, "secretsmanager:") || startswith(action, "ssm:") || startswith(action, "kms:")
+      ])
+    ])
+    error_message = "the web execution role must hold no secretsmanager, ssm or kms permission -- there is no secret in the web task definition and the day somebody adds one, this is what makes them decide which tier holds it"
+  }
+
+  # It also must not be able to write to the API's log group, or a log group
+  # stops being attributable to one service.
+  assert {
+    condition = alltrue([
+      for statement in data.aws_iam_policy_document.web_execution.statement :
+      alltrue([
+        for resource in statement.resources :
+        !strcontains(resource, aws_cloudwatch_log_group.api.name)
+      ])
+    ])
+    error_message = "the web execution role must not be able to write to the API's log group"
+  }
+}
+
+# ECS Exec is granted exactly once, on a role that belongs to a task an operator
+# starts by hand and that exits on its own.
+run "exec_is_granted_only_to_the_administrative_task_role" {
+  command = apply
+
+  assert {
+    condition = anytrue([
+      for statement in data.aws_iam_policy_document.admin_task.statement :
+      contains(statement.actions, "ssmmessages:OpenDataChannel")
+    ])
+    error_message = "the administrative task role needs the SSM messages channel, or `aws ecs execute-command` fails with a timeout rather than a permissions error"
+  }
+
+  # The serving roles must not have it. #101 left it off deliberately and
+  # recorded that the decision belonged in #102; this is the assertion that keeps
+  # the decision from being reversed by accident.
+  assert {
+    condition = alltrue([
+      for document in [data.aws_iam_policy_document.task, data.aws_iam_policy_document.execution, data.aws_iam_policy_document.web_execution] :
+      alltrue([
+        for statement in document.statement :
+        !anytrue([for action in statement.actions : startswith(action, "ssmmessages:")])
+      ])
+    ])
+    error_message = "no serving role may hold ssmmessages: a shell into a task holding live tenant data is a standing capability, and the administrative task definition exists so that nobody needs one"
+  }
+
+  assert {
+    condition = alltrue([
+      for statement in data.aws_iam_policy_document.admin_task.statement :
+      !anytrue([for action in statement.actions : startswith(action, "secretsmanager:")])
+    ])
+    error_message = "the administrative task role must hold no secretsmanager permission at all -- the operator types the password, which is what keeps the master credential a human-only capability"
   }
 }
 

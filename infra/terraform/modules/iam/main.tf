@@ -265,3 +265,213 @@ resource "aws_iam_role_policy_attachment" "task_deny_master_secret" {
   role       = aws_iam_role.task.name
   policy_arn = aws_iam_policy.deny_master_secret.arn
 }
+
+# ===========================================================================
+# #102 additions: the web tier and the one-shot administrative task.
+# ===========================================================================
+
+resource "aws_cloudwatch_log_group" "web" {
+  name              = "/ecs/${var.name_prefix}/web"
+  retention_in_days = var.log_retention_days
+
+  tags = { Name = "${var.name_prefix}-web" }
+}
+
+# --------------------------------------------------------------------------
+# Web execution role
+#
+# A second execution role rather than reusing the API's, and the reason is one
+# statement: the API's execution role can read every secret under
+# `collabboard/<env>/`, which is the database password and the JWT signing key.
+# The Next.js tier needs neither -- its only configuration is API_URL, which is a
+# hostname -- so reusing that role would hand the rendering tier the API's
+# credentials for no reason at all.
+#
+# It also cannot read the API's log group, and the API's role cannot write to
+# this one, so a log group is attributable to exactly one service.
+# --------------------------------------------------------------------------
+
+resource "aws_iam_role" "web_execution" {
+  name_prefix        = "${var.name_prefix}-web-exec-"
+  description        = "ECS agent role for the Next.js tasks: image pull and log stream creation"
+  assume_role_policy = data.aws_iam_policy_document.ecs_tasks_assume.json
+}
+
+data "aws_iam_policy_document" "web_execution" {
+  statement {
+    sid       = "EcrAuth"
+    effect    = "Allow"
+    actions   = ["ecr:GetAuthorizationToken"]
+    resources = ["*"]
+  }
+
+  statement {
+    sid    = "EcrPull"
+    effect = "Allow"
+    actions = [
+      "ecr:BatchCheckLayerAvailability",
+      "ecr:GetDownloadUrlForLayer",
+      "ecr:BatchGetImage",
+    ]
+    resources = [local.ecr_repository_arn_pattern]
+  }
+
+  statement {
+    sid    = "WriteWebLogs"
+    effect = "Allow"
+    actions = [
+      "logs:CreateLogStream",
+      "logs:PutLogEvents",
+    ]
+    resources = ["${aws_cloudwatch_log_group.web.arn}:*"]
+  }
+
+  # Deliberately absent: any secretsmanager or kms action. There is no secret in
+  # the web task definition, and the day somebody adds one this policy is what
+  # makes them think about which tier is holding it.
+}
+
+resource "aws_iam_role_policy" "web_execution" {
+  name_prefix = "${var.name_prefix}-web-exec-"
+  role        = aws_iam_role.web_execution.id
+  policy      = data.aws_iam_policy_document.web_execution.json
+}
+
+resource "aws_iam_role_policy_attachment" "web_execution_deny_master_secret" {
+  role       = aws_iam_role.web_execution.name
+  policy_arn = aws_iam_policy.deny_master_secret.arn
+}
+
+# There is deliberately NO web task role. `taskRoleArn` is optional, and omitting
+# it means the Next.js process has no AWS credentials at all -- not a role with
+# an empty policy, but no identity to assume. It calls one thing, the Go API,
+# over HTTPS, so an AWS identity would be a credential in the container serving
+# unauthenticated pages with nothing to spend it on.
+
+# --------------------------------------------------------------------------
+# Administrative task
+#
+# The break-glass path #56 needs and #101 could not provide: after #101 the data
+# subnets have no route off the VPC and RDS is not publicly accessible, so
+# `bootstrap-owner.sql` has nowhere to run from. This role belongs to a one-shot
+# Fargate task an operator starts by hand, holds an ECS Exec shell into, and
+# stops. See ADR 0013.
+#
+# The line worth reading twice: this role carries the SAME Deny on the RDS master
+# credential as the API's two roles. That is not an oversight in a role whose
+# entire purpose is to run `bootstrap-owner.sql` as the master user -- it is the
+# design. The operator reads the master password with their own IAM identity and
+# supplies it to `psql -W` interactively. No role in this account's ECS layer can
+# read that secret, including this one, which means "the application connects as
+# the master user" has no machine identity available to it anywhere.
+# --------------------------------------------------------------------------
+
+resource "aws_cloudwatch_log_group" "exec" {
+  name              = "/ecs/${var.name_prefix}/exec"
+  retention_in_days = var.exec_log_retention_days
+
+  tags = { Name = "${var.name_prefix}-exec" }
+}
+
+resource "aws_iam_role" "admin_execution" {
+  name_prefix        = "${var.name_prefix}-admin-exec-"
+  description        = "ECS agent role for the one-shot administrative task"
+  assume_role_policy = data.aws_iam_policy_document.ecs_tasks_assume.json
+}
+
+data "aws_iam_policy_document" "admin_execution" {
+  # No ECR statements. The administrative task runs a stock Postgres client image
+  # from ECR Public, which Fargate pulls anonymously.
+  statement {
+    sid    = "WriteAdminLogs"
+    effect = "Allow"
+    actions = [
+      "logs:CreateLogStream",
+      "logs:PutLogEvents",
+    ]
+    resources = ["${aws_cloudwatch_log_group.admin.arn}:*"]
+  }
+}
+
+resource "aws_cloudwatch_log_group" "admin" {
+  name              = "/ecs/${var.name_prefix}/admin"
+  retention_in_days = var.exec_log_retention_days
+
+  tags = { Name = "${var.name_prefix}-admin" }
+}
+
+resource "aws_iam_role_policy" "admin_execution" {
+  name_prefix = "${var.name_prefix}-admin-exec-"
+  role        = aws_iam_role.admin_execution.id
+  policy      = data.aws_iam_policy_document.admin_execution.json
+}
+
+resource "aws_iam_role_policy_attachment" "admin_execution_deny_master_secret" {
+  role       = aws_iam_role.admin_execution.name
+  policy_arn = aws_iam_policy.deny_master_secret.arn
+}
+
+resource "aws_iam_role" "admin_task" {
+  name_prefix        = "${var.name_prefix}-admin-task-"
+  description        = "Runtime identity for the one-shot administrative task. ECS Exec only; no secret access."
+  assume_role_policy = data.aws_iam_policy_document.ecs_tasks_assume.json
+}
+
+data "aws_iam_policy_document" "admin_task" {
+  # ECS Exec runs over an SSM messages channel, and these four actions are what
+  # opens it. They are granted here and nowhere else: #101 left `ssmmessages` off
+  # the API's task role on purpose, noting that a shell into a task holding live
+  # tenant data is a capability decision. This is that decision -- yes, but on a
+  # task that holds no tenant data, runs only when an operator starts it, and
+  # exits on its own.
+  #
+  # `Resource: "*"` because the SSM messages API takes no resource. It is the
+  # same shape as `ecr:GetAuthorizationToken` above: not a shortcut, the only
+  # value AWS accepts.
+  statement {
+    sid    = "EcsExecChannel"
+    effect = "Allow"
+    actions = [
+      "ssmmessages:CreateControlChannel",
+      "ssmmessages:CreateDataChannel",
+      "ssmmessages:OpenControlChannel",
+      "ssmmessages:OpenDataChannel",
+    ]
+    resources = ["*"]
+  }
+
+  # Session logging. ECS Exec writes the session transcript using the TASK role,
+  # not the execution role, so without these the cluster's logging configuration
+  # silently produces no audit trail -- the session still works, which is the
+  # worst version of this failing.
+  statement {
+    sid       = "DiscoverExecLogGroup"
+    effect    = "Allow"
+    actions   = ["logs:DescribeLogGroups"]
+    resources = ["*"]
+  }
+
+  statement {
+    sid    = "WriteExecSessionLog"
+    effect = "Allow"
+    actions = [
+      "logs:CreateLogStream",
+      "logs:PutLogEvents",
+    ]
+    resources = ["${aws_cloudwatch_log_group.exec.arn}:*"]
+  }
+
+  # Deliberately absent: every secretsmanager action. The operator supplies the
+  # database password to `psql -W` by hand. See the block comment above.
+}
+
+resource "aws_iam_role_policy" "admin_task" {
+  name_prefix = "${var.name_prefix}-admin-task-"
+  role        = aws_iam_role.admin_task.id
+  policy      = data.aws_iam_policy_document.admin_task.json
+}
+
+resource "aws_iam_role_policy_attachment" "admin_task_deny_master_secret" {
+  role       = aws_iam_role.admin_task.name
+  policy_arn = aws_iam_policy.deny_master_secret.arn
+}
