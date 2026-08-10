@@ -1,3 +1,9 @@
+# Fixed `name` rather than the `name_prefix` + create_before_destroy pattern used
+# by the security groups and the DB subnet group. Not an oversight:
+# aws_elasticache_subnet_group has no name_prefix argument, so the pattern is not
+# available here. A replacement of this group would fail with
+# CacheSubnetGroupAlreadyExists; it is only replaced if name_prefix changes,
+# which is already flagged as a rename-everything event.
 resource "aws_elasticache_subnet_group" "this" {
   name       = "${var.name_prefix}-cache"
   subnet_ids = var.subnet_ids
@@ -43,8 +49,10 @@ resource "aws_elasticache_replication_group" "this" {
   transit_encryption_enabled = true
 
   snapshot_retention_limit = var.snapshot_retention_days
-  snapshot_window          = "05:00-06:00"
-  maintenance_window       = "mon:06:30-mon:07:30"
+  # Only meaningful with a nonzero retention; ElastiCache rejects a snapshot
+  # window on a group that takes no snapshots.
+  snapshot_window    = var.snapshot_retention_days > 0 ? "05:00-06:00" : null
+  maintenance_window = "mon:06:30-mon:07:30"
 
   apply_immediately = var.apply_immediately
 

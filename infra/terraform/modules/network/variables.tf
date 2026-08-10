@@ -7,9 +7,18 @@ variable "vpc_cidr" {
   description = "CIDR block for the VPC. Must be a /16 through /20; subnets are carved from it with a 4-bit offset."
   type        = string
 
+  # Checks the prefix length directly rather than via `can(cidrsubnet(...))`.
+  # cidrsubnet succeeds on a /26 -- it happily returns a /30 -- so the function
+  # call proves nothing about whether AWS will accept the result. AWS requires
+  # VPC and subnet CIDRs between /16 and /28, and the 4-bit split here means a
+  # /20 VPC is the smallest that yields usable subnets.
   validation {
-    condition     = can(cidrsubnet(var.vpc_cidr, 4, 8))
-    error_message = "vpc_cidr must be a valid CIDR with room for a 4-bit subnet split (i.e. /20 or larger)."
+    condition = (
+      can(cidrhost(var.vpc_cidr, 0)) &&
+      tonumber(split("/", var.vpc_cidr)[1]) >= 16 &&
+      tonumber(split("/", var.vpc_cidr)[1]) <= 20
+    )
+    error_message = "vpc_cidr must be a valid CIDR between /16 and /20 -- AWS caps a VPC at /16, and the 4-bit subnet split needs /20 or larger to stay within AWS's /28 subnet minimum."
   }
 }
 

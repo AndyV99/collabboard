@@ -60,6 +60,31 @@ variable "skip_final_snapshot" {
   default     = false
 }
 
+variable "performance_insights_enabled" {
+  description = <<-EOT
+    Enable Performance Insights. Defaults off because AWS does not support it on
+    the burstable micro/small classes (db.t2/t3/t4g.micro and .small), and
+    enabling it there fails CreateDBInstance rather than being ignored. Free at
+    the 7-day retention this module uses, on classes that support it at all.
+  EOT
+  type        = bool
+  default     = false
+
+  # Turns a 15-minute apply failure into a plan-time error. Without this, the
+  # combination is accepted by Terraform and rejected by CreateDBInstance with
+  # InvalidParameterCombination, after the create has already started.
+  validation {
+    condition = (
+      !var.performance_insights_enabled ||
+      !contains(
+        ["db.t2.micro", "db.t2.small", "db.t3.micro", "db.t3.small", "db.t4g.micro", "db.t4g.small"],
+        var.instance_class,
+      )
+    )
+    error_message = "Performance Insights is not supported on burstable micro/small instance classes. Use db.t4g.medium or larger, or leave performance_insights_enabled false."
+  }
+}
+
 variable "apply_immediately" {
   description = "Apply modifications at once rather than in the next maintenance window. Can cause a restart."
   type        = bool

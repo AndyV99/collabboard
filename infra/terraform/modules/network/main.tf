@@ -81,7 +81,10 @@ resource "aws_eip" "nat" {
 
   domain = "vpc"
 
-  tags = { Name = "${var.name_prefix}-nat-${count.index}" }
+  # Tagged by AZ rather than by index, to match the NAT gateway it is attached
+  # to. An Elastic IP is a billable line of its own if it ever ends up detached,
+  # and `-nat-0` is not attributable in a cost report.
+  tags = { Name = "${var.name_prefix}-nat-${var.availability_zones[count.index]}" }
 }
 
 resource "aws_nat_gateway" "this" {
@@ -183,17 +186,38 @@ resource "aws_route_table_association" "data" {
 # need egress at all. Interface endpoints for ECR/Logs/Secrets Manager would
 # remove the remaining reasons, but at $7.30/mo each they cost more than the
 # single NAT they would replace; see ADR 0012.
+#
+# Associated with the PRIVATE route tables only, deliberately. A gateway
+# endpoint works by injecting a prefix-list route covering all of S3 in the
+# region -- including every bucket in every other AWS account. Adding it to the
+# data route table would therefore be a route off the VPC, from the one tier
+# whose entire justification is that it has none, and would quietly turn "the
+# database cannot reach the internet" into a claim that is no longer true.
+# Nothing in the data tier needs it: RDS only reaches S3 for the
+# aws_s3_export/aws_s3_import extensions, which this project does not use and
+# has not granted, and ElastiCache backups travel the service path rather than
+# the route table.
 resource "aws_vpc_endpoint" "s3" {
   vpc_id            = aws_vpc.this.id
   service_name      = "com.amazonaws.${data.aws_region.current.region}.s3"
   vpc_endpoint_type = "Gateway"
 
-  route_table_ids = concat(
-    aws_route_table.private[*].id,
-    [aws_route_table.data.id],
-  )
+  route_table_ids = aws_route_table.private[*].id
 
   tags = { Name = "${var.name_prefix}-s3" }
+}
+
+# The VPC's default security group is created by AWS, not by Terraform, and
+# ships allowing all traffic from itself and all egress. Nothing here uses it,
+# but anything launched without an explicit security group gets it, so adopting
+# it and stripping every rule closes that by default. Costs nothing, which is
+# the standard ADR 0012 applies to hardening.
+resource "aws_default_security_group" "this" {
+  vpc_id = aws_vpc.this.id
+
+  # No ingress or egress blocks: the provider revokes every rule on adoption.
+
+  tags = { Name = "${var.name_prefix}-default-do-not-use" }
 }
 
 data "aws_region" "current" {}

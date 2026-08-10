@@ -51,6 +51,11 @@ variable "db_allocated_storage" {
   default     = 20
 }
 
+variable "db_max_allocated_storage" {
+  description = "RDS storage autoscaling ceiling in GB. Exposed rather than left at a module default because autoscaling is one-way -- storage never scales back down, so this is the real upper bound on the storage line of the bill."
+  type        = number
+}
+
 variable "db_backup_retention_days" {
   description = "RDS automated backup retention in days."
   type        = number

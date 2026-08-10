@@ -4,9 +4,10 @@ Terraform for the AWS network and data layer. The ECS service and ALB are #102,
 the deploy pipeline is #103; neither is here.
 
 **Nothing in this directory has been applied to a real AWS account.** It is
-`fmt`-clean and `validate`-clean against AWS provider 6.58.0, and CI enforces
-both, but no `plan` has run against a real account because that needs
-credentials. Treat the first apply as unproven.
+`fmt`-clean and `validate`-clean against AWS provider 6.58.0, and the module
+unit tests pass against a mocked provider — CI enforces all three — but no
+`plan` has run against a real account, because that needs credentials. Treat the
+first apply as unproven.
 
 ```
 bootstrap/              state backend: S3 bucket + KMS key. Run once, local state.
@@ -70,7 +71,7 @@ idle:
 |---|---|
 | NAT gateway ×1 | $32.85 + $0.045/GB |
 | RDS `db.t4g.micro`, single-AZ | $11.68 |
-| RDS gp3 storage, 20 GB | $2.30 |
+| RDS gp3 storage, 20 GB | $2.30, up to $5.75 if autoscaling fills |
 | ElastiCache `cache.t4g.micro` ×1 | $11.68 |
 | KMS customer-managed keys ×2 | $2.00 |
 | S3, CloudWatch Logs | ~$1.00 |
@@ -85,15 +86,43 @@ A faithful production shape — NAT per AZ, Multi-AZ RDS, a cache replica — is
 about **$140/month**. `docs/adr/0012-network-shape-and-cost.md` sets out what
 each deviation gives up.
 
-## Two things #102 must know
+## Three things #102 must know
 
-Both are enforced by this configuration and both fail loudly, at startup, rather
-than degrading:
+The first two are enforced by this configuration and both fail loudly, at
+startup, rather than degrading:
 
 - **ElastiCache requires TLS.** `transit_encryption_enabled = true`, so the API
   needs `rediss://` or a non-nil `TLSConfig` for go-redis and Asynq.
 - **Postgres requires TLS.** `rds.force_ssl = 1`, so the DSN needs
   `sslmode=require` at minimum.
+
+The third is a naming convention invented here that #102 and #103 have to
+honour:
+
+- **ECR repository names are slash-separated.** The execution role can pull from
+  `repository/collabboard/*` — so `collabboard/api` works and `collabboard-api`
+  does not. A mismatch denies the pull, and the symptom is
+  `CannotPullContainerError`, which is the same symptom as a missing NAT
+  gateway.
+
+## Testing
+
+```bash
+cd infra/terraform/modules/network
+terraform init && terraform test
+```
+
+The module tests use `mock_provider`, so they need no AWS credentials and make
+no API calls. They cover the parts that are pure computation and expensive to
+get wrong — subnet CIDR derivation, and which NAT gateway each private route
+table points at across all three `nat_gateway_count` settings, two of which
+`validate` would never evaluate because staging only instantiates one of them.
+
+They also pin the data tier's isolation, including the case that is invisible in
+the resource graph: a VPC gateway endpoint injects a route without being an
+`aws_route`, so associating the S3 endpoint with the data route table would
+silently give that tier a path to every bucket in AWS. That assertion was
+verified by reintroducing the fault and watching it fail.
 
 ## The constraint this configuration exists to protect
 

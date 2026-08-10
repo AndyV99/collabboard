@@ -116,7 +116,9 @@ data "aws_iam_policy_document" "execution" {
   # Written by hand rather than attaching AmazonECSTaskExecutionRolePolicy. That
   # managed policy grants ecr:GetDownloadUrlForLayer, ecr:BatchGetImage and
   # logs:PutLogEvents on `Resource: "*"` -- every repository and every log group
-  # in the account. Here they name the two this service actually uses.
+  # in the account. Here the log group is named exactly, and ECR is narrowed to
+  # one repository namespace rather than one repository, because the
+  # repositories themselves do not exist until #103.
   statement {
     sid    = "EcrAuth"
     effect = "Allow"

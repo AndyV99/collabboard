@@ -320,6 +320,31 @@ jobs:
           done
           exit $status
 
+      # 3. Unit test. `terraform test` with a `mock_provider` evaluates the
+      # configuration end to end against a fake AWS -- no credentials, no API
+      # calls, no cost -- so it runs unchanged on a fork PR alongside everything
+      # else here.
+      #
+      # This is the only gate that covers the code paths the cost knobs create.
+      # `validate` sees the configuration as staging instantiates it, so
+      # nat_gateway_count = 0 and = 2 are branches nothing would otherwise ever
+      # evaluate, despite ADR 0012 promising both are one-line reversals.
+      #
+      # Runs for any module with a tests/ directory, so adding coverage needs no
+      # change here.
+      - name: terraform test
+        run: |
+          set -euo pipefail
+          status=0
+          for dir in modules/*/; do
+            [ -d "${dir}tests" ] || continue
+            echo "::group::terraform test ${dir}"
+            terraform -chdir="$dir" init -backend=false -input=false -no-color
+            terraform -chdir="$dir" test -no-color || status=1
+            echo '::endgroup::'
+          done
+          exit $status
+
   # The one job to mark as a required status check in branch protection.
   #
   # It has `if: always()` and no path gating, so it runs and reports a

@@ -71,6 +71,7 @@ module "database" {
 
   instance_class        = var.db_instance_class
   allocated_storage     = var.db_allocated_storage
+  max_allocated_storage = var.db_max_allocated_storage
   multi_az              = var.db_multi_az
   backup_retention_days = var.db_backup_retention_days
   deletion_protection   = var.db_deletion_protection

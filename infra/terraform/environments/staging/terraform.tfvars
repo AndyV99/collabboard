@@ -49,7 +49,16 @@ db_instance_class = "db.t4g.micro"
 # prod would be.
 db_multi_az = false
 
-db_allocated_storage     = 20
+db_allocated_storage = 20
+
+# Storage autoscaling ceiling. It is one-way -- RDS never scales storage back
+# down -- so this is the real upper bound on the storage line, not 20 GB. At
+# $0.115/GB-mo, hitting this ceiling would take storage from $2.30 to $5.75/mo
+# permanently, with no Terraform diff to show for it. Set equal to
+# db_allocated_storage to disable autoscaling entirely and accept that a full
+# disk takes the database down instead.
+db_max_allocated_storage = 50
+
 db_backup_retention_days = 7
 
 # Both of these point the same way, and both are wrong for prod on purpose:

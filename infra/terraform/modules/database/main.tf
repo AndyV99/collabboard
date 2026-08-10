@@ -1,14 +1,39 @@
+# Keyed on the instance identifier so it is stable for the life of the instance
+# and changes only when the instance is replaced -- which is exactly when a
+# fresh final-snapshot name is needed.
+resource "random_id" "final_snapshot" {
+  byte_length = 4
+
+  keepers = {
+    identifier = "${var.name_prefix}-postgres"
+  }
+}
+
 resource "aws_db_subnet_group" "this" {
-  name       = "${var.name_prefix}-db"
-  subnet_ids = var.subnet_ids
+  # name_prefix + create_before_destroy, matching the parameter group below: a
+  # fixed name collides with itself on replacement, and this group is replaced
+  # whenever name_prefix changes.
+  name_prefix = "${var.name_prefix}-db-"
+  subnet_ids  = var.subnet_ids
 
   tags = { Name = "${var.name_prefix}-db" }
+
+  lifecycle {
+    create_before_destroy = true
+  }
 }
 
 # The application requires TLS to Postgres in a deployed environment, and
 # `rds.force_ssl` is the only place that can be made true regardless of what any
-# client's connection string says. It is a static parameter, so it takes effect
-# at instance creation here rather than needing a later reboot.
+# client's connection string says.
+#
+# `apply_method = "immediate"` because `rds.force_ssl` is a *dynamic* parameter
+# on RDS PostgreSQL 15 and later. It was static on 13 and earlier, which is the
+# version of this fact most sources still repeat. Getting it wrong is quiet in
+# the wrong direction: with "pending-reboot", a later change to this value would
+# not take effect until somebody rebooted the instance, and `apply_immediately`
+# does not reboot. At creation it makes no difference either way -- the group is
+# attached by CreateDBInstance, so the instance boots with force_ssl already on.
 #
 # Consequence for #102: the API's DSN must carry `sslmode=require` at minimum
 # (`verify-full` preferred). Without it the connection is refused outright,
@@ -21,7 +46,7 @@ resource "aws_db_parameter_group" "this" {
   parameter {
     name         = "rds.force_ssl"
     value        = "1"
-    apply_method = "pending-reboot"
+    apply_method = "immediate"
   }
 
   # Statement-level latency data for the observability work, without the cost of
@@ -122,15 +147,30 @@ resource "aws_db_instance" "this" {
   copy_tags_to_snapshot    = true
   delete_automated_backups = true
 
-  deletion_protection       = var.deletion_protection
-  skip_final_snapshot       = var.skip_final_snapshot
-  final_snapshot_identifier = var.skip_final_snapshot ? null : "${var.name_prefix}-postgres-final"
+  deletion_protection = var.deletion_protection
+  skip_final_snapshot = var.skip_final_snapshot
 
-  # Free at 7 days' retention on every instance class. Turning it on later
-  # requires a modification; turning it on now costs nothing.
-  performance_insights_enabled          = true
-  performance_insights_retention_period = 7
-  performance_insights_kms_key_id       = var.kms_key_arn
+  # Suffixed with a random value rather than a fixed name. Snapshots outlive the
+  # instance, so a fixed name means the *second* destroy of an environment fails
+  # with DBSnapshotAlreadyExists -- at the last resource, leaving the rest torn
+  # down. `timestamp()` would work at destroy but produces a diff on every plan;
+  # a random_id keyed on the identifier is stable for the life of the instance
+  # and regenerates only when the instance itself is replaced.
+  final_snapshot_identifier = var.skip_final_snapshot ? null : "${var.name_prefix}-postgres-final-${random_id.final_snapshot.hex}"
+
+  # Performance Insights is deliberately a variable and deliberately off at the
+  # staging default, because it is NOT available on every instance class: AWS
+  # excludes the burstable micro and small classes -- db.t2/t3/t4g.micro and
+  # .small -- and staging runs db.t4g.micro. Hardcoding it true would fail
+  # CreateDBInstance with InvalidParameterCombination roughly 30 seconds into a
+  # 15-minute create, which is the longest-pole resource in the stack.
+  #
+  # It is free at 7 days' retention on the classes that support it, so the first
+  # class where this becomes worth enabling is db.t4g.medium -- which is roughly
+  # 4x the instance cost, and therefore a cost decision rather than a checkbox.
+  performance_insights_enabled          = var.performance_insights_enabled
+  performance_insights_retention_period = var.performance_insights_enabled ? 7 : null
+  performance_insights_kms_key_id       = var.performance_insights_enabled ? var.kms_key_arn : null
 
   # Ships the Postgres log to CloudWatch Logs, which is where the parameters
   # above become readable. Bills per GB ingested; at staging volume that is

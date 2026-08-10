@@ -38,7 +38,7 @@ variable rather than a hardcoded value:
 |---|---|---|---|
 | `nat_gateway_count` | 1 | 2 | $32.85/mo |
 | `db_multi_az` | false | true | $11.68/mo |
-| `db_instance_class` | db.t4g.micro | db.t4g.small+ | $11.68/mo |
+| `db_instance_class` | db.t4g.micro | db.t4g.medium | $35.04/mo |
 | `cache_node_count` | 1 | 2 | $11.68/mo |
 
 Approximate monthly cost of what this stands up, us-east-1, 730 hours:
@@ -46,13 +46,21 @@ Approximate monthly cost of what this stands up, us-east-1, 730 hours:
 ```
 NAT gateway (1)                    $32.85   + $0.045/GB processed
 RDS db.t4g.micro, single-AZ        $11.68
-RDS gp3 storage, 20 GB              $2.30
+RDS gp3 storage, 20 GB              $2.30   ceiling $5.75 if autoscaling fills
 ElastiCache cache.t4g.micro (1)    $11.68
 KMS customer-managed keys (2)       $2.00   state + staging data
-S3, DynamoDB, CloudWatch Logs      ~$1.00   usage-driven, negligible at idle
+S3, CloudWatch Logs                ~$1.00   usage-driven, negligible at idle
                                    -------
                                    ~$61/mo
 ```
+
+There is no DynamoDB line: ADR 0011 uses S3-native state locking, so there is no
+lock table to pay for.
+
+One cost the tables above do not itemise, because it is traffic-dependent: with
+a single NAT, the second AZ's egress crosses an AZ boundary, adding $0.01/GB in
+each direction on top of the NAT's own $0.045/GB. At staging volume this is
+cents, but it is the one hidden term.
 
 **The NAT gateway is over half of it**, and it is the one line that buys nothing
 until #102 exists — nothing runs in the private subnets yet, and the data tier
@@ -71,8 +79,18 @@ included, which keeps attachment traffic off the NAT's per-GB charge.
 **Hardening that costs nothing was not deviated on.** The data tier's isolation,
 `rds.force_ssl = 1`, TLS-required ElastiCache, encryption at rest under a
 customer-managed key, S3 public access blocked with ACLs disabled, TLS-only
-bucket policies, and least-privilege IAM are all present at staging settings,
-because none of them has a price.
+bucket policies, the VPC's default security group adopted and stripped of every
+rule, and least-privilege IAM are all present at staging settings, because none
+of them has a price.
+
+**One thing the cheap sizing does cost that is not on the table: Performance
+Insights.** AWS does not support it on the burstable micro and small classes, so
+`db.t4g.micro` cannot have it at any price. It is free at 7-day retention on the
+classes that do support it, which makes `db.t4g.medium` the first point where
+the database becomes observable at the query level — and that is a $35/mo step,
+not a checkbox. It is a variable defaulting to off, with a validation that
+rejects the unsupported combination at plan time rather than 30 seconds into a
+15-minute instance create.
 
 ## Consequences
 
@@ -84,6 +102,16 @@ cost two subnets and one route table — nothing recurring. Combined with
 `publicly_accessible = false` and an ingress rule referencing only the app
 security group, reaching Postgres from the internet requires three independent
 mistakes.
+
+That claim is easier to break than it looks, which is why it is now tested
+rather than asserted. A VPC gateway endpoint is not an `aws_route` — it injects
+a prefix-list route into every route table it is associated with — so attaching
+the S3 endpoint to the data route table would give the tier a route to every
+bucket in every AWS account while every visible route resource still looked
+correct. That is exactly what the first draft of this configuration did.
+`modules/network/tests/routing.tftest.hcl` now fails if the endpoint is ever
+associated with the data route table, and that assertion was confirmed by
+reintroducing the fault.
 
 **Two things will bite #102 if it is not expecting them, and both fail loudly
 rather than silently.** ElastiCache has `transit_encryption_enabled = true`, so

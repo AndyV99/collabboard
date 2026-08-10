@@ -19,7 +19,16 @@ variable "kms_key_arn" {
 }
 
 variable "ecr_repository_prefix" {
-  description = "ECR repository namespace the execution role may pull from, e.g. `collabboard`. The repositories themselves arrive with #103."
+  description = <<-EOT
+    ECR repository namespace the execution role may pull from. The resulting
+    ARN pattern is `repository/<prefix>/*`, which matches a SLASH-separated
+    name such as `collabboard/api` and does NOT match a flat `collabboard-api`.
+
+    That naming convention is invented here and #103 has to honour it. If #103
+    creates flat repository names instead, the pull is denied and the symptom is
+    an opaque CannotPullContainerError -- the same symptom as a missing NAT
+    gateway, with an entirely different cause.
+  EOT
   type        = string
 }
 
