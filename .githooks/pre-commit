@@ -1,0 +1,72 @@
+#!/usr/bin/env bash
+#
+# Blocks a commit that stages a credential.
+#
+# This is the half of #106 that carries most of the value. The CI job catches a
+# secret that reached a pushed branch -- by which point the credential is
+# compromised and has to be rotated, because it exists in a commit on GitHub's
+# servers and removing it later does not un-publish it. This hook is the only
+# check that runs while the mistake is still local and cheap.
+#
+# Install: scripts/setup-hooks.sh (sets core.hooksPath, which is per-clone local
+# git config and therefore cannot be committed). Read that script's header for
+# what happens to someone who never runs it.
+
+set -euo pipefail
+
+root="$(git rev-parse --show-toplevel)"
+
+# --staged scans the diff that is about to be committed, not the work tree and
+# not history: fast, and it never nags about a finding the developer did not
+# just introduce.
+#
+# No --redact here, unlike CI. Same config and therefore the same findings --
+# only the printing differs, deliberately: a CI log is a retained artifact that
+# would itself become a place the secret is stored, while this output goes to
+# the terminal of the person who just typed the secret. Seeing the matched value
+# is what makes a false positive quick to recognise.
+if "${root}/scripts/gitleaks.sh" git --staged --no-banner --verbose; then
+	exit 0
+fi
+
+status=$?
+
+# gitleaks exits 1 for findings and something else for an error it could not
+# recover from (no network on a cold cache, a checksum mismatch, a malformed
+# config). Both block the commit -- a scanner that silently passes when it
+# failed to run is worse than no scanner, because it produces confidence
+# without coverage -- but they need different advice.
+if [ "$status" -ne 1 ]; then
+	cat >&2 <<-EOF
+
+		gitleaks could not run (exit ${status}), so the staged changes were NOT scanned.
+		Commit blocked, because "the scanner broke" and "there is no secret" are not
+		the same answer.
+
+		The first run on a machine downloads gitleaks and needs network; every run
+		after that is served from the local cache. If you are offline and certain the
+		change is clean, 'git commit --no-verify' skips this -- CI still scans it.
+	EOF
+	exit "$status"
+fi
+
+cat >&2 <<-EOF
+
+	Commit blocked: the staged changes contain something shaped like a credential.
+
+	If it is a real secret:
+	  Take it out of the staged change. Do not just amend it away after committing --
+	  once a commit exists locally it is one 'git push' from being permanent, and a
+	  pushed secret must be rotated even if the commit is removed afterwards.
+
+	If it is a false positive (a fixture, an example value, a sample payload):
+	  Add an allowlist entry to .gitleaks.toml scoped to that VALUE, with a note on
+	  why it cannot be a real credential -- see the entries already there. Do not add
+	  a path exclusion; that switches the scanner off for a whole file. For a one-off,
+	  a 'gitleaks:allow' comment on the line works too.
+
+	'git commit --no-verify' bypasses this hook. CI runs the same scan with the same
+	config, so a bypass defers the failure rather than avoiding it.
+EOF
+
+exit 1
