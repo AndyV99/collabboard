@@ -93,3 +93,197 @@ variable "apply_immediately" {
   type        = bool
   default     = false
 }
+
+# ===========================================================================
+# #102: the public entry point and the services behind it.
+# ===========================================================================
+
+# ---------------------------------------------------------------------------
+# Names. These three are the only values in this file that cannot be guessed
+# from the repository -- they describe the operator's own domain.
+# ---------------------------------------------------------------------------
+
+variable "web_hostname" {
+  description = "Fully qualified name the product is served from. Must be inside the Route 53 zone named by route53_zone_id."
+  type        = string
+}
+
+variable "api_hostname" {
+  description = "Fully qualified name the Go API is served from. Resolves publicly; the listener behind it admits only this environment's NAT egress addresses."
+  type        = string
+}
+
+variable "route53_zone_id" {
+  description = "Route 53 hosted zone holding both names. Terraform writes the ACM validation records and the two alias records into it."
+  type        = string
+}
+
+variable "api_admin_ingress_cidrs" {
+  description = <<-EOT
+    Extra addresses allowed to reach the API listener, on top of this
+    environment's NAT gateway. Empty by default, which is the setting that means
+    "the API is not on the internet".
+
+    A single operator address for debugging is a legitimate entry. A `0.0.0.0/0`
+    here would publish /api/v1/auth/login, and with #33 unfixed the per-address
+    login budget is not real yet, so that is a materially different security
+    posture rather than a convenience.
+  EOT
+  type        = list(string)
+  default     = []
+
+  validation {
+    condition     = !contains(var.api_admin_ingress_cidrs, "0.0.0.0/0")
+    error_message = "api_admin_ingress_cidrs must not contain 0.0.0.0/0. Publishing the API to the internet is a decision that belongs in an ADR, not in a debugging entry that outlives the debugging."
+  }
+}
+
+# ---------------------------------------------------------------------------
+# Ports and the realtime relationship
+# ---------------------------------------------------------------------------
+
+variable "api_container_port" {
+  description = "HTTP_PORT for the API container."
+  type        = number
+  default     = 8080
+}
+
+variable "web_container_port" {
+  description = "PORT for the Next.js container."
+  type        = number
+  default     = 3000
+}
+
+variable "alb_api_port" {
+  description = "Listener port serving the API. Not 443, because an ALB's security group is its only per-port access control and 443 has to stay open for the web tier."
+  type        = number
+  default     = 8443
+}
+
+variable "alb_idle_timeout_seconds" {
+  description = <<-EOT
+    Seconds of silence before the load balancer closes a connection.
+
+    The setting that decides whether realtime works when deployed. It is
+    validated against realtime_ping_interval_seconds and
+    realtime_pong_timeout_seconds in modules/alb, so a value that would start
+    reaping live WebSockets is a plan-time error rather than a support ticket.
+  EOT
+  type        = number
+  default     = 120
+}
+
+variable "realtime_ping_interval_seconds" {
+  description = "REALTIME_PING_INTERVAL in the API task definition, and the floor the ALB idle timeout is checked against. One variable, both places, so they cannot drift."
+  type        = number
+  default     = 25
+}
+
+variable "realtime_pong_timeout_seconds" {
+  description = "REALTIME_PONG_TIMEOUT in the API task definition."
+  type        = number
+  default     = 10
+}
+
+# ---------------------------------------------------------------------------
+# Images
+# ---------------------------------------------------------------------------
+
+variable "api_image_tag" {
+  description = "Image tag the API task definition names. An image must exist at this tag in ECR before the first apply -- nothing here builds one."
+  type        = string
+}
+
+variable "web_image_tag" {
+  description = "Image tag the web task definition names."
+  type        = string
+}
+
+variable "ecr_force_delete" {
+  description = "Allow `terraform destroy` to remove the ECR repositories with images still in them."
+  type        = bool
+  default     = false
+}
+
+# ---------------------------------------------------------------------------
+# Sizing
+# ---------------------------------------------------------------------------
+
+variable "api_cpu" {
+  description = "Fargate CPU units for an API task."
+  type        = number
+}
+
+variable "api_memory" {
+  description = "Fargate memory (MiB) for an API task."
+  type        = number
+}
+
+variable "web_cpu" {
+  description = "Fargate CPU units for the web task."
+  type        = number
+}
+
+variable "web_memory" {
+  description = "Fargate memory (MiB) for the web task."
+  type        = number
+}
+
+variable "api_min_capacity" {
+  description = "Minimum API tasks. Two is a correctness floor as well as an availability one -- see modules/ecs/variables.tf."
+  type        = number
+}
+
+variable "api_max_capacity" {
+  description = "Maximum API tasks. The real upper bound on the Fargate line of the bill."
+  type        = number
+}
+
+variable "web_desired_count" {
+  description = "Web tasks. Fixed rather than autoscaled while #69 is open."
+  type        = number
+}
+
+# ---------------------------------------------------------------------------
+# Database roles consumed by the task definitions
+# ---------------------------------------------------------------------------
+
+variable "database_app_user" {
+  description = "Serving role. Not the RDS master user and not the schema owner (ADR 0001). Created by #56."
+  type        = string
+  default     = "collabboard_app"
+}
+
+variable "database_owner_user" {
+  description = "Schema owner. Present only in the migrate and provision task definitions."
+  type        = string
+  default     = "collabboard_owner"
+}
+
+variable "secret_recovery_window_days" {
+  description = "Days a deleted Secrets Manager secret sits recoverable, billing at $0.40/month each. 0 purges immediately, which is right for an environment that is meant to be destroyed and recreated."
+  type        = number
+  default     = 7
+}
+
+# ---------------------------------------------------------------------------
+# Behaviour
+# ---------------------------------------------------------------------------
+
+variable "container_insights" {
+  description = "ECS Container Insights. Off by default; it is a per-task metric bill and the Observability standard's requirement is a Prometheus endpoint (#12), not CloudWatch custom metrics."
+  type        = bool
+  default     = false
+}
+
+variable "wait_for_steady_state" {
+  description = "Block `terraform apply` until both services are stable, so an apply cannot report success over a crash-looping service."
+  type        = bool
+  default     = true
+}
+
+variable "alb_deletion_protection" {
+  description = "Block deletion of the load balancer."
+  type        = bool
+  default     = false
+}
