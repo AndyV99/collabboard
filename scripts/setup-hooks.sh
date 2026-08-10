@@ -16,18 +16,24 @@
 #
 # The honest statement of what happens to someone who never runs this: nothing.
 # No hook exists, `git commit` behaves exactly as it did before, and there is no
-# warning. That is why the pre-commit hook is not the only control:
+# warning.
 #
-#   1. This hook -- catches it before the commit exists. Needs setup. Best case.
-#   2. GitHub push protection -- server side, needs no local setup, rejects the
-#      push outright. This is the one that covers the un-set-up developer.
-#   3. The `gitleaks` job in CI -- scans full history on every PR, and is in the
-#      `ci` aggregate's `needs`, so a finding blocks the merge.
+# What still covers them, and what does not:
 #
-# Layers 2 and 3 hold with zero local configuration. Layer 1 is what turns a
-# rotate-the-credential incident into an edit before it ever leaves the machine,
-# which is why it is worth the manual step -- but it is defence in depth, not
-# the load-bearing gate.
+#   1. This hook -- catches it before the commit exists. Needs setup. It is the
+#      only layer that prevents an incident rather than reporting one.
+#   2. GitHub push protection -- would reject the push server side with no local
+#      setup at all, and is exactly what would cover someone who skipped step 1.
+#      NOT ENABLED: it needs paid Secret Protection on a private repo. See #109
+#      and the README's "Why push protection is not on".
+#   3. The `secret-scan` job in CI -- scans full history on every PR and is in
+#      the `ci` aggregate's `needs`, so a finding blocks the merge.
+#
+# With 2 unavailable, skipping this script means a committed credential reaches
+# GitHub before anything objects. Layer 3 then stops the merge, but the value is
+# published by that point and has to be rotated. So this is not defence in depth
+# at the moment -- for anything that gets pushed, it is the only prevention there
+# is, and the 30 seconds are worth it.
 
 set -euo pipefail
 
