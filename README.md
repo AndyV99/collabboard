@@ -32,7 +32,10 @@ apps/api/            Go service
   internal/realtime/ WebSocket hub + Redis pub/sub fan-out
   internal/store/    Postgres data layer (tenant-context helpers live here)
   migrations/        goose SQL, embedded into the binary
-infra/terraform/     VPC, ECS Fargate, RDS, ElastiCache, S3, ALB
+infra/terraform/     AWS infrastructure
+  bootstrap/         remote state backend — run once, before anything else
+  modules/           network, security groups, RDS, ElastiCache, S3, IAM
+  environments/      one root module per environment; only `staging` exists
 docs/adr/            architecture decision records
 ```
 
@@ -133,8 +136,50 @@ The web app is not yet initialised:
 cd apps/web && npx create-next-app@latest . --typescript
 ```
 
+## Infrastructure
+
+Terraform for the AWS network and data layer lives in `infra/terraform/`. It has
+**not been applied to a real account** — it is `fmt`- and `validate`-clean and
+CI enforces both, but no `plan` has run against real credentials.
+
+State lives in one S3 bucket per account, created by a separate `bootstrap/`
+stack because it cannot store its own state in the bucket it creates. That stack
+runs once, by hand:
+
+```bash
+cd infra/terraform/bootstrap
+terraform init && terraform apply
+terraform output -raw backend_config     # paste into environments/staging/backend.hcl
+```
+
+Then any environment plans against it. `terraform.tfvars` is auto-loaded, so
+there is no `-var-file` flag to get wrong:
+
+```bash
+cd infra/terraform/environments/staging
+terraform init -backend-config=backend.hcl
+terraform plan
+```
+
+That environment costs roughly **$61/month** idle, over half of it a single NAT
+gateway which buys nothing until the ECS service exists — `nat_gateway_count = 0`
+drops it to about $28. Read `infra/terraform/environments/staging/terraform.tfvars`
+before applying; it is where the money is decided.
+`infra/terraform/README.md` has the breakdown,
+`infra/terraform/OPERATOR-INPUTS.md` has the manual steps and what survives a
+`destroy`, and ADRs 0011 and 0012 have the reasoning.
+
+The database is deliberately awkward to misuse. Its master password is generated
+and held by RDS — never by Terraform, so it is not in state, not in a plan and
+not in this repository — and both ECS roles carry an explicit IAM `Deny` on the
+secret holding it. That is ADR 0001's tenant isolation expressed in IAM: the
+application cannot connect as a role that bypasses row-level security, because
+it cannot read that role's password. Provisioning the real `collabboard_owner`
+and `collabboard_app` credentials is issue #56.
+
 ## Commands
 
 - API: `go build ./...` · `go test ./...` · `go test -tags=integration ./...` · `golangci-lint run` · `sqlc generate`
 - Web: `npm run dev` · `npm test` · `npm run lint`
 - E2E: `npx playwright test` (needs both services, or the compose stack)
+- Infra: `terraform fmt -recursive` · `terraform validate` (in `bootstrap/` or an environment)
