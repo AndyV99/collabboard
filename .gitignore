@@ -13,11 +13,26 @@ dist/
 
 # Terraform
 .terraform/
+
+# State is never committed. It holds resource attributes in plaintext, including
+# ones redacted in plan output, so a committed state file is a committed
+# credential. This also covers the bootstrap stack's deliberately-local state.
 *.tfstate
 *.tfstate.*
+
+# Blanket ignore stays as the default for any tfvars written ad hoc. The
+# environment files are the exception and are committed on purpose: no variable
+# in infra/terraform accepts a secret value -- the RDS master password is
+# generated and stored by AWS, and the application role credentials are
+# provisioned by #56 -- so these files hold only region, CIDRs and sizing.
 *.tfvars
+!infra/terraform/environments/*/terraform.tfvars
 !*.tfvars.example
-.terraform.lock.hcl
+
+# .terraform.lock.hcl is deliberately NOT ignored. It records the exact provider
+# version and checksums `init` resolved, so a plan cannot change under you
+# because a provider released overnight -- the same reason go.sum and
+# package-lock.json are committed.
 
 # Env & secrets
 .env
