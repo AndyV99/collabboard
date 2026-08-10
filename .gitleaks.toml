@@ -19,6 +19,141 @@
 useDefault = true
 
 # ---------------------------------------------------------------------------
+# Repo-specific rules
+# ---------------------------------------------------------------------------
+
+# The default ruleset does not catch a datastore URL with the password inline.
+# `generic-api-key`, which covers most of the gap elsewhere, keys off an
+# assignment to an identifier containing secret/token/key/password -- and
+# `postgres://user:<password>@host/db` has no such identifier in it. Verified
+# against v8.30.1: five of six credential shapes tried in #106 fired, and this
+# was the sixth. See #110.
+#
+# Every example URL written in this file uses a `<placeholder>` password on
+# purpose, so that the file is clean under its own rule. gitleaks happens to
+# skip any file named `.gitleaks.toml` while scanning -- by basename, not by
+# path, and not documented as a guarantee -- so relying on that would mean this
+# config only passes CI by an accident that a future release could withdraw.
+#
+# This is the shape this repository is most likely to leak. Postgres credentials
+# travel as a DSN everywhere: internal/config builds one from POSTGRES_PASSWORD,
+# #56 provisions a real collabboard_app password, #102 hands it to a task
+# definition. The plausible incident is not someone committing a .env -- that is
+# gitignored -- it is a DSN pasted into a runbook, an ADR, a compose override, a
+# tfvars file, or a debugging note, complete with the password.
+[[rules]]
+id = "collabboard-datastore-url-inline-credential"
+description = "Datastore connection URL with an inline password (postgres/postgresql/redis/rediss)"
+
+# Scoped to the four schemes this stack actually uses. mysql/mongodb/amqp are
+# deliberately absent: nothing here speaks them, so a rule covering them would
+# be untested surface. Adding one later is a word in the alternation.
+#
+# Deliberately NOT anchored to an assignment. A rule shaped like
+# `KEY = "postgres://..."` matches the tidy case and misses every one listed
+# above -- a log line, a bare URL in prose, a YAML scalar, a shell export. The
+# scheme is the anchor instead, so the URL is caught wherever it sits.
+#
+# Group 3 (the password) is the secret. Group 2 is `*` not `+` on purpose:
+# `redis://:<password>@host` with no username is how redis AUTH is normally
+# written, and requiring a username would miss it entirely.
+#
+# The character classes stop at whitespace, quotes, backticks and the URL
+# delimiters `/?#`, so the match ends at the authority section and does not run
+# on into surrounding prose.
+regex = '''(?i)\b(postgres(?:ql)?|rediss?)://([^\s:/?#@"'\x60]*):([^\s/?#@"'\x60]+)@([^\s/?#@"'\x60]+)'''
+secretGroup = 3
+
+# Prefilter, so the full-history scan does not run this regex over every
+# fragment. Substring match, case-insensitive -- and not reducible, since
+# "postgresql://" does not contain "postgres://" and "rediss://" does not
+# contain "redis://".
+keywords = [
+  "postgres://",
+  "postgresql://",
+  "redis://",
+  "rediss://",
+]
+
+# NO entropy floor and NO minimum length, deliberately.
+#
+# Both are the obvious way to cut false positives here and both are wrong for
+# this rule. `hunter2SuperSecret` is a plausible real password and is not
+# high-entropy; neither is anything a human picked. A threshold tuned to fire
+# only on 40-char random strings would catch the generated credentials -- which
+# `generic-api-key` largely catches already -- and miss every human-chosen one,
+# which is the population that actually leaks. And length cannot separate the
+# cases anyway: the dev placeholder `postgres` and the real-enough `password`
+# are both eight characters.
+#
+# So the rule fires on ANY non-empty inline password, and all of the
+# discrimination happens in the allowlists below, where each exemption is a
+# specific value with a written reason rather than a threshold nobody can
+# audit.
+
+# Passwords that are not values at all, but placeholders that will be
+# substituted at runtime. Every pattern is fully anchored: it exempts a password
+# that IS a placeholder, never one that merely contains a `$` or a `%`. An
+# unanchored version would suppress a URL-encoded real password -- `p%40ssw0rd`
+# contains something that reads as a format verb -- which is exactly the silent
+# hole this rule exists to close.
+#
+# Rule-scoped rather than global, because this is a statement about this
+# regex's capture group, not a claim that these strings are safe anywhere.
+[[rules.allowlists]]
+description = """
+The password group is a template placeholder rather than a literal: a shell or
+compose variable (${VAR}, $VAR, $(cmd)), a Go format verb (%s), a documentation
+stand-in (<password>), or a Go/Helm template action ({{.Password}}). None of
+these can be a credential -- the credential is whatever gets substituted in,
+which by construction is not in the file.
+"""
+regexTarget = "secret"
+regexes = [
+  '''^\$\{[^}]*\}$''',
+  '''^\$[A-Za-z_][A-Za-z0-9_]*$''',
+  '''^\$\([^)]*\)$''',
+  '''^%[#+\-0-9.]*[a-zA-Z]$''',
+  '''^<[^>]*>$''',
+  '''^\{\{[^}]*\}\}$''',
+]
+
+# DECIDED, per #110: a loopback or localhost host does NOT suppress this rule.
+#
+# It is a tempting exemption and it nearly won. `postgres://u:p@127.0.0.1/db`
+# grants access to a service on the author's own machine and nothing else, so on
+# a first reading the credential is not a credential. It also scales: every
+# future test fixture dialling a local database would be quiet with no new
+# allowlist entry, where today each one costs a line in this file.
+#
+# Rejected, for a reason specific to this stack rather than a general principle.
+# The database is `publicly_accessible = false` in a private subnet (ADR 0012),
+# so there is no route by which a laptop reaches the real staging database
+# directly. Whatever gets built for that access later -- a port-forward over SSH
+# or SSM, a tunnel, a proxy -- shares one property: the client end is loopback,
+# and the DSN it produces reads
+# `postgres://collabboard_app:<the real password>@localhost:5432/collabboard`.
+# The host is loopback and the password is production. That is not a contrived
+# bypass, it is the shape of the only access pattern the network design leaves
+# open, and a loopback exemption would make the scanner blind to precisely the
+# moment someone is holding a real credential. The general version of the
+# objection is the same one that rules out path exclusions: the host is not the
+# secret, the password is, and exempting on the part that is not the secret is
+# how a scanner goes quiet without anyone deciding that it should.
+#
+# The secondary objection -- that /etc/hosts makes "loopback" a claim the
+# scanner cannot verify -- is real but weaker, since it needs someone to be
+# actively hiding something. The port-forward case needs nobody to do anything
+# wrong at all, which is what settles it.
+#
+# So loopback is used only as a CONJUNCT: the two fixture entries in the
+# allowlist section below pin scheme, user, password AND host together, which is
+# strictly tighter than either half. The cost is honest and accepted -- a new
+# local-database fixture will trip this rule and need its own entry. That is the
+# intended workflow, not a defect: it makes each exemption a decision somebody
+# wrote down, which is the whole premise of a value-scoped allowlist.
+
+# ---------------------------------------------------------------------------
 # Allowlist
 # ---------------------------------------------------------------------------
 #
@@ -66,4 +201,26 @@ cannot tell a real token from a hand-assembled one.
 regexTarget = "secret"
 regexes = [
   '''^eyJhbGciOiJIUzI1NiJ9\.eyJzdWIiOiJzb21lYm9keSJ9\.c2lnbmF0dXJl$''',
+]
+
+[[allowlists]]
+description = """
+The two deliberately-unreachable DSNs the API's failure-path tests dial, in
+apps/api/internal/migrate/migrate_test.go and internal/provision/provision_test.go.
+Both point at TCP port 1 on loopback, which nothing listens on -- the point of
+each test is that the call fails to connect, so a DSN that DID reach a database
+would break them. `nobody`/`nothing` are not credentials for anything: there is
+no such role in any migration, and no host they could authenticate to.
+
+Matched on the whole authority section rather than on the password alone, so
+these exempt those two exact strings and not the words `nobody`/`nothing`
+appearing as a password against some other host.
+
+Triggers collabboard-datastore-url-inline-credential, which fires on any
+non-empty inline password by design.
+"""
+regexTarget = "match"
+regexes = [
+  '''^postgres://nobody:nobody@127\.0\.0\.1:1$''',
+  '''^postgres://nobody:nothing@127\.0\.0\.1:1$''',
 ]

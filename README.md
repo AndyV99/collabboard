@@ -240,6 +240,20 @@ scripts/gitleaks.sh git --no-banner .    # full history, what CI does
 scripts/gitleaks.sh dir --no-banner .    # working tree only
 ```
 
+**Connection URLs.** On top of gitleaks' bundled rules, `.gitleaks.toml` adds one
+of our own: a `postgres://`, `postgresql://`, `redis://` or `rediss://` URL with a
+password inline is a finding. The default ruleset does not catch that shape — it
+looks for a password assigned to a *named* identifier, and a URL has no name in
+it — and a DSN is how database credentials travel through this stack, so it is
+the leak this repo is most able to produce.
+
+The rule fires on **any** non-empty inline password, with no entropy or length
+threshold, because the passwords that actually leak are the ones a human chose.
+That means a fixture pointing at a local database will trip it, deliberately:
+loopback does not exempt a URL, since the host is not the part that is secret.
+Build the DSN from parts (`internal/config` already does) or use a `${VAR}`
+placeholder and the rule stays quiet; otherwise add an allowlist entry, below.
+
 **False positives.** This repo is full of realistic-looking fixtures, and a few
 of them trip the default rules. The allowlist in `.gitleaks.toml` is scoped to
 specific *values*, never to paths — a test file is exactly where someone pastes a
