@@ -4,6 +4,7 @@ import { useRouter } from "next/navigation";
 import { useCallback, useTransition } from "react";
 
 import { api } from "@/lib/api/browser";
+import type { ApiError } from "@/lib/api/errors";
 import type { Endpoint } from "@/lib/api/http";
 import type { BoardChange } from "@/lib/board/mutations";
 import { describeWriteFailure } from "@/lib/workspace/outcomes";
@@ -64,7 +65,36 @@ export type BoardMutationInput<T> = {
    * here — the text someone typed is the one thing a failed write must not
    * cost them.
    */
-  onFailure?: () => void;
+  onFailure?: (error: ApiError) => void;
+  /**
+   * A message for this failure, overriding {@link describeWriteFailure}.
+   *
+   * Returning undefined falls through to the shared wording, so an override
+   * only has to cover the case it knows more about than the general one does.
+   * #65 uses it for a 409 on a move, where the generic "this changed while you
+   * were working on it" is true but does not say which part of the board
+   * changed, or that the card is back where it started.
+   */
+  describe?: (error: ApiError) => string | undefined;
+  /**
+   * Held between applying the change and sending it.
+   *
+   * The optimistic edit is on screen the whole time this is pending, so a gate
+   * costs feel nothing; what it buys is ordering. #65 chains a card's moves on
+   * one of these so that two drags of the same card reach the server in the
+   * order the user made them — see `card-moves.ts`.
+   *
+   * **Resolving `false` abandons the request**, silently: no message, and the
+   * optimistic change drops on its own when the transition ends. That is how a
+   * queue disowns the work stacked up behind something that failed, which would
+   * otherwise be sent against a board state the server never reached.
+   */
+  gate?: () => Promise<boolean | void>;
+  /**
+   * Ran once the server has answered, before the refresh and whatever the
+   * answer was. Releasing a {@link gate} belongs here.
+   */
+  onSettled?: () => void;
 };
 
 export type BoardMutation = {
@@ -95,36 +125,68 @@ export function useBoardMutation(
   const [pending, startTransition] = useTransition();
 
   const run = useCallback(
-    <T,>({ change, endpoint, subject, onSuccess, onFailure }: BoardMutationInput<T>) => {
+    <T,>({
+      change,
+      endpoint,
+      subject,
+      onSuccess,
+      onFailure,
+      describe,
+      gate,
+      onSettled,
+    }: BoardMutationInput<T>) => {
       startTransition(async () => {
-        applyChange(change);
+        try {
+          // Inside the `try` so that the `finally` covers it. It is the one
+          // statement that could throw before the gate is released, and the
+          // cost of that would be a card nobody can move again for the life of
+          // the page: the release never runs, so every later move of it waits
+          // on a promise that will not settle.
+          applyChange(change);
 
-        const result = await api(endpoint);
+          // Before the request, after the paint. Whatever this waits for, the
+          // optimistic change is already on screen — which is what makes
+          // serialising a card's moves free at the interaction layer.
+          if ((await gate?.()) === false) {
+            return;
+          }
 
-        if (!result.ok) {
-          // Both of these are `useState` setters, which React defers to the end
-          // of the transition. That is the behaviour wanted rather than a
-          // limitation worked around: the message appears at the same instant
-          // the optimistic change disappears, so the board is never showing a
-          // rejected edit and an explanation of it at the same time.
-          report(describeWriteFailure(result.error, subject));
-          onFailure?.();
+          const result = await api(endpoint);
 
-          return;
+          if (!result.ok) {
+            // Both of these are `useState` setters, which React defers to the
+            // end of the transition. That is the behaviour wanted rather than a
+            // limitation worked around: the message appears at the same instant
+            // the optimistic change disappears, so the board is never showing a
+            // rejected edit and an explanation of it at the same time.
+            report(
+              describe?.(result.error) ?? describeWriteFailure(result.error, subject),
+            );
+            onFailure?.(result.error);
+
+            return;
+          }
+
+          report(null);
+          onSuccess?.(result.data);
+
+          // Inside the transition on purpose. `router.refresh()` re-renders the
+          // Server Component, and keeping the transition pending until that
+          // lands is what holds the optimistic value on screen across the gap.
+          //
+          // It is also the whole of rule 3 in apps/web/README.md: a reorder is
+          // decided by re-reading what the server returns, never by keeping the
+          // array this client spliced. ADR 0004's ranks are not on the wire, so
+          // there is nothing else the client could legitimately be ordering by.
+          router.refresh();
+        } finally {
+          // In a `finally` because a gate is a *queue*: whoever is waiting on
+          // this one is stuck for the life of the page if an unexpected throw
+          // skips the release. `api` returns its failures as values rather than
+          // throwing, so this should never be the reason it runs — which is
+          // exactly why it would not be noticed if it were missing.
+          onSettled?.();
         }
-
-        report(null);
-        onSuccess?.(result.data);
-
-        // Inside the transition on purpose. `router.refresh()` re-renders the
-        // Server Component, and keeping the transition pending until that lands
-        // is what holds the optimistic value on screen across the gap.
-        //
-        // It is also the whole of rule 3 in apps/web/README.md: a reorder is
-        // decided by re-reading what the server returns, never by keeping the
-        // array this client spliced. ADR 0004's ranks are not on the wire, so
-        // there is nothing else the client could legitimately be ordering by.
-        router.refresh();
       });
     },
     [applyChange, report, router],

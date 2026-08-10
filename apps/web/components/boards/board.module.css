@@ -204,11 +204,18 @@
   overflow-wrap: anywhere;
 }
 
+/*
+ * Since #65 this doubles as the empty column's drop zone, which is why it has a
+ * height it does not need for two lines of text: a column with no cards is the
+ * one a card most often gets dragged into, and it would otherwise be a target
+ * that has to be hit exactly.
+ */
 .columnEmpty {
   font-size: 0.8125rem;
   line-height: 1.45;
   color: var(--muted);
   padding: 0.5rem 0.125rem;
+  min-height: 4rem;
 }
 
 /* --- editing (#64) ---------------------------------------------------- */
@@ -392,6 +399,104 @@
 .detailValue {
   margin: 0;
   overflow-wrap: anywhere;
+}
+
+/* --- moving a card (#65) ---------------------------------------------- */
+
+/*
+ * A card row: the grip that moves it, then the link that opens it.
+ *
+ * Two controls rather than one, because a link cannot also be the thing Enter
+ * lifts — Enter on a link means "follow it". The whole row is still draggable
+ * by pointer; the grip is what makes the same move reachable without one.
+ */
+.cardRow {
+  display: flex;
+  align-items: stretch;
+  gap: 0.375rem;
+  /* The touch sensor waits 200ms before it takes over, so the browser must not
+   * claim the gesture as a pan first — otherwise a touch drag scrolls the
+   * column instead of picking the card up. */
+  touch-action: manipulation;
+}
+
+.cardRow > .card {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
+/*
+ * The card left behind while its copy follows the pointer. Dimmed rather than
+ * removed, so the column does not resize under the drag and every other card
+ * keeps the position the gap was measured against.
+ */
+.cardRowDragging {
+  opacity: 0.35;
+}
+
+/* The floating copy, lifted off the board. */
+.cardDragging {
+  width: 15rem;
+  box-shadow: 0 10px 24px rgb(0 0 0 / 25%);
+  border-color: var(--accent);
+  cursor: grabbing;
+}
+
+.grip {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 1.5rem;
+  padding: 0;
+  border: 1px solid transparent;
+  border-radius: 6px;
+  background: none;
+  color: var(--muted);
+  font-size: 0.875rem;
+  line-height: 1;
+  cursor: grab;
+}
+
+.grip:hover {
+  border-color: var(--border);
+  color: inherit;
+}
+
+/* Held by the keyboard: the arrow keys are now moving this card. */
+.gripLifted {
+  border-color: var(--accent);
+  background: var(--accent);
+  color: var(--background);
+  cursor: grabbing;
+}
+
+/*
+ * The column under the pointer. An outline rather than a moving insertion line,
+ * because the card itself is already drawn in the place it would land — the
+ * board is the preview, so this only has to say which column is listening.
+ */
+.zoneOver {
+  border-radius: 8px;
+  outline: 2px dashed var(--accent);
+  outline-offset: 2px;
+}
+
+/*
+ * Read, not seen. Used for the grip's name, the move instructions, and the live
+ * region that announces where a card has gone — `display: none` would take all
+ * three out of the accessibility tree, which is the only place they exist.
+ */
+.visuallyHidden {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  margin: -1px;
+  padding: 0;
+  border: 0;
+  overflow: hidden;
+  white-space: nowrap;
+  clip-path: inset(50%);
 }
 
 /* --- loading ---------------------------------------------------------- */

@@ -1,16 +1,31 @@
 /**
  * The board as rendered: columns across, cards down, one card open.
  *
- * `BoardView` and `CardDetail` are pure Server Components taking resolved props
- * — the page fetches, these render — so every state below is a render rather
- * than something that has to be provoked against a real API. That split is also
- * what will let #64 and #65 add `"use client"` to these files without moving
- * the data flow.
+ * `BoardView` and `CardDetail` take resolved props — the page fetches, these
+ * render — so every state below is a render rather than something that has to
+ * be provoked against a real API. That split is what let #64 and #65 add
+ * `"use client"` to these files without moving the data flow.
+ *
+ * # Why this file now mocks the router
+ *
+ * It did not have to before #65, and that was worth something: #64's controls
+ * all mount on demand, so a board nobody was editing called `useRouter` nowhere
+ * and this file could render it with no app-router context at all.
+ *
+ * A card is draggable without anyone opening anything, so the runner that sends
+ * a move is mounted for every board, and `useRouter` with it. The mock is the
+ * honest consequence of the feature rather than a test bent to fit — but the
+ * property it replaces is a real loss, and it is the reason this comment exists
+ * instead of a bare `vi.mock`.
  */
 
 import { render, screen, within } from "@testing-library/react";
 import type { ReactNode } from "react";
 import { describe, expect, it, vi } from "vitest";
+
+vi.mock("next/navigation", () => ({
+  useRouter: () => ({ push: vi.fn(), refresh: vi.fn() }),
+}));
 
 import type { Card, Column } from "@/lib/api/types";
 

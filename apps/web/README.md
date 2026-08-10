@@ -9,8 +9,9 @@ sign in, sign out, route protection),
 boards and the people in an organization — and
 [the board view](#the-board-view-columns-and-cards), which renders a board's
 columns and cards and lets you edit them: create, rename, reorder and delete
-columns, and create, edit and delete cards. Dragging a card between columns is
-#65, and the WebSocket client is #9.
+columns, create, edit and delete cards, and
+[move a card](#moving-a-card-the-headline-interaction) by dragging it or with
+the keyboard. The WebSocket client is #9.
 
 ## Commands
 
@@ -641,9 +642,10 @@ app/api/proxy/*         authenticated pass-through for Client Components
 ## The board view: columns and cards
 
 The core screen. `/app/projects/<id>/boards/<id>` renders a board as columns of
-cards and lets you change it. Dragging a card from one column to another is #65
-and live updates are #9, and the note under the board says so in words rather
-than offering a disabled control that cannot do it.
+cards and lets you change it, including
+[moving a card](#moving-a-card-the-headline-interaction) between and within
+columns. Live updates are #9, and the note under the board says so in words
+rather than offering a disabled control that cannot do it.
 
 ### The order is the API's, and the client never computes one
 
@@ -662,7 +664,7 @@ and `title` is not an order at all.
 If a change here ever reaches for `.sort()`, the bug is upstream — either the
 API's `ORDER BY` is wrong or the request was not the one the screen needed.
 
-The reason this matters beyond correctness is #65. Drag-and-drop posts
+The reason this matters beyond correctness is the card move. Drag-and-drop posts
 `{"column_id": …, "after_card_id": …}` — an *anchor*, a claim about one row —
 and an anchor is only meaningful against the list the server actually has. A
 client carrying its own ordering model would be computing anchors against a list
@@ -704,7 +706,7 @@ a board that loaded fine. An id that names nothing on this board renders a "card
 not found" panel with the board still behind it, without asking the API whose
 card it was.
 
-### Where the Server/Client line falls — #65 and #66 inherit this
+### Where the Server/Client line falls — #66 inherits this
 
 **The page is the only thing that touches the API or the session.** It fetches,
 checks the two 404 cases, groups the responses, and hands plain serialisable
@@ -719,6 +721,8 @@ components/boards/board-view.tsx      "use client": the optimistic store, the
                                       columns, and the detail panel
 components/boards/board-mutation.ts   apply → send → refresh, for one edit
 components/boards/board-controls.tsx  the composers and the column tools
+components/boards/card-drag.tsx       the pointer gesture, and one card's grip
+components/boards/card-moves.ts       moves, queued per card, and the 409
 components/boards/card-detail.tsx     one card, read or editable
 components/boards/board-skeleton.tsx  the loading.tsx fallback
 ```
@@ -740,14 +744,90 @@ The three rules that came with the boundary, all still in force:
    this design exists to avoid, and it starts with one innocent `useEffect`.
    Writes go out through `/api/proxy` and are followed by `router.refresh()`,
    so the *read* still happens once, on the server.
-3. **Reorder by asking the server, not by sorting an array.** A column move
-   posts `POST /columns/:id/move` with a neighbour's id and then re-reads. The
-   splice in `lib/board/mutations.ts` is a display held for the duration of the
-   request; it never becomes the source of truth, or the client would have
-   invented the rank ADR 0004 refused to publish.
+3. **Reorder by asking the server, not by sorting an array.** A column or card
+   move posts to `/move` with a neighbour's id and then re-reads. The splice in
+   `lib/board/mutations.ts` is a display held for the duration of the request;
+   it never becomes the source of truth, or the client would have invented the
+   rank ADR 0004 refused to publish.
 
 Selection is a URL rather than state, so there is nothing to lift into a
 provider either.
+
+### Moving a card: the headline interaction
+
+Drag a card within a column or into another one, or move it with the keyboard.
+Both end in one `POST /cards/:id/move` carrying `{"column_id": …,
+"after_card_id": …}` — an **anchor**, never an index and never a rank, because
+[ADR 0004](../../docs/adr/0004-card-ordering.md) keeps the rank off the wire and
+an index is a claim about a list this client may already be wrong about.
+
+**The gesture decides nothing.** A drag reports two facts — what the pointer is
+over, and which side of it — and the keyboard reports an arrow key. Both are
+turned into the same `CardMove` by pure functions in `lib/board/mutations.ts`
+(`cardDropTarget`, `cardNudge`), which is why the ordering logic is unit tested
+as arithmetic and why the two input methods cannot drift apart.
+
+**The keyboard reaches every placement a drag does.** Enter on a card's grip
+lifts it; the arrow keys move it up and down its column and into the columns
+beside it; Enter drops it and Escape leaves it alone. Each keypress moves a
+*proposal*, drawn through the same reducer as an optimistic edit, so crossing
+half the board still costs one request — the same as one drag. Every change of
+position is announced through a live region, because a reorder fires no
+accessibility event of its own and a silent one is invisible even when it works.
+
+**Two rapid moves of one card are serialised.** Left alone they race: the server
+resolves two moves of the same row as last-writer-wins, and "last" means last to
+*arrive*. So each card has a queue in `components/boards/card-moves.ts` — a
+move's request waits for that card's previous request to be answered, while its
+optimistic change is already on screen, so the queue costs nothing to look at.
+Different cards never wait for each other.
+
+**A stale anchor is a 409, and the card goes back.** If someone else moved the
+card you dropped this one next to, the anchor names nothing in that column and
+the API refuses the move. The optimistic move comes off the board, the board
+re-reads, and a message says the card is back where it started. It deliberately
+**does not retry**: retrying means choosing a new anchor from the refreshed
+board, and "the third slot" is an index — the exact claim ADR 0004 refused,
+because the server cannot tell a deliberate placement from a stale one.
+
+#### The library, and what it cost
+
+`@dnd-kit/core` + `/sortable` + `/utilities`, measured rather than estimated:
+**+48.8 kB raw, +16.0 kB gzipped** of client JavaScript (the whole app goes
+224.4 kB → 240.4 kB gzipped), loaded only on the board route.
+
+It is there for the parts a hand-rolled implementation does not get. HTML5
+drag-and-drop is free and would have covered a mouse, but mobile browsers fire
+none of its events, so touch support would simply not exist; `TouchSensor` is
+one line. It also handles auto-scrolling the container under the pointer, which
+this screen needs in both axes — a horizontal scroller of columns that are each
+their own vertical scroller. And it is the half that **cannot be unit tested**:
+jsdom has no layout, so no pointer gesture, library or otherwise, can be driven
+in `vitest`.
+
+Rejected: `react-beautiful-dnd` (deprecated by Atlassian); `@hello-pangea/dnd`,
+its maintained fork, which is 31 kB gzipped and reports drops as source and
+destination *indices*, the one currency this API refuses; and `@dnd-kit/react`
+0.5.0, the actively developed successor, which is pre-1.0.
+
+Two risks, named rather than discovered later: `@dnd-kit/core` 6.3.1 was
+published in December 2024 with nothing since, and it calls `react-dom`'s
+`unstable_batchedUpdates`, which React 19.2.8 still exports — checked, not
+assumed.
+
+dnd-kit's `KeyboardSensor` is **not** used. It moves a card by pixels and re-runs
+collision detection, which on independently scrolling columns is unpredictable
+and, again, undrivable in jsdom. The keyboard path walks the list instead.
+
+#### What a move costs
+
+Against the production build and a real API: `POST /cards/:id/move` is a median
+13 ms. The `router.refresh()` that follows it — the whole-board re-read #64
+accepted — is a median 15–21 ms, and it is **coalesced**: six moves fired as
+fast as the keyboard allows produced four re-reads, not six, and the board still
+converged to the server's answer without a reload. So the burstiness a drag adds
+over a rename turns out not to multiply the re-read, and rule 3 stands without a
+workaround.
 
 ### Editing: optimistic, and rolled back by construction
 
