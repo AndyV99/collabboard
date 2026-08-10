@@ -108,21 +108,40 @@ honour:
 ## Testing
 
 ```bash
-cd infra/terraform/modules/network
-terraform init && terraform test
+cd infra/terraform/modules/network && terraform init && terraform test   # 8 cases
+cd infra/terraform/modules/iam     && terraform init && terraform test   # 4 cases
 ```
 
-The module tests use `mock_provider`, so they need no AWS credentials and make
-no API calls. They cover the parts that are pure computation and expensive to
-get wrong — subnet CIDR derivation, and which NAT gateway each private route
-table points at across all three `nat_gateway_count` settings, two of which
-`validate` would never evaluate because staging only instantiates one of them.
+CI runs `terraform test` for any module with a `tests/` directory, so adding
+coverage needs no workflow change. The tests use `mock_provider`: no AWS
+credentials, no API calls, no cost, so they run on a fork PR like everything
+else.
 
-They also pin the data tier's isolation, including the case that is invisible in
-the resource graph: a VPC gateway endpoint injects a route without being an
-`aws_route`, so associating the S3 endpoint with the data route table would
-silently give that tier a path to every bucket in AWS. That assertion was
-verified by reintroducing the fault and watching it fail.
+**`modules/network`** covers what is pure computation and expensive to get
+wrong — subnet CIDR derivation, and which NAT gateway each private route table
+points at across all three `nat_gateway_count` settings, two of which `validate`
+would never evaluate because staging instantiates only one. It also pins the
+data tier's isolation, including the case that is invisible in the resource
+graph: a VPC gateway endpoint injects a route without being an `aws_route`, so
+associating the S3 endpoint with the data route table would silently give that
+tier a path to every bucket in AWS.
+
+**`modules/iam`** covers the invariant ADR 0001 rests on: the master credential
+is Denied, the Deny names the right ARN and covers every `secretsmanager`
+action, both roles carry it, and the task role holds no secret permission at
+all. An empty or malformed `denied_secret_arns` is a plan-time error rather than
+a silently absent control.
+
+Both suites were mutation-tested rather than trusted — the S3-endpoint fault,
+`Deny`→`Allow`, a dropped role attachment, and a secret grant added to the task
+role were each reintroduced and each failed the intended assertion.
+
+One limit worth knowing: a mocked provider computes
+`aws_iam_policy_document.json`, so the IAM tests assert on the *configured*
+statements rather than the rendered JSON. That catches a Deny that is missing,
+misdirected, unattached or inverted; it cannot catch AWS evaluating a
+well-formed policy differently than expected. `OPERATOR-INPUTS.md` step 8 closes
+that gap with one `iam simulate-principal-policy` call against a real account.
 
 ## The constraint this configuration exists to protect
 
@@ -134,4 +153,5 @@ So the master password is generated and held by **RDS**, never by Terraform — 
 is not in state, not in a plan, and not in this repository — and both ECS roles
 carry an explicit IAM `Deny` on its secret. Wiring the application to the master
 credential is not a shortcut available by accident; it requires deleting a Deny
-statement. Provisioning the real roles is #56.
+statement, and `modules/iam/tests` fails if anyone does. Provisioning the real
+roles is #56.

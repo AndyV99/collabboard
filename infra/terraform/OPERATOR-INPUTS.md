@@ -150,6 +150,12 @@ isolation guarantee is in effect rather than merely in the code, and 9 proves it
 was bought without breaking the thing the role exists to do. Both are single
 commands and neither changes anything.
 
+`modules/iam/tests` already asserts that the Deny exists, names the master
+secret's ARN, covers every `secretsmanager` action and is attached to both
+roles — but it does that against a mocked provider, so it checks the policy as
+*written*. Step 8 is the only thing that checks how AWS *evaluates* it. Keep
+both; they answer different questions.
+
 ---
 
 ## 5. Teardown — what `destroy` leaves behind

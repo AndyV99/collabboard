@@ -83,9 +83,14 @@ data "aws_iam_policy_document" "ecs_tasks_assume" {
 # application connects as the RDS master user" is not a configuration mistake
 # that is available to be made: the task cannot read that secret even if a task
 # definition in #102 names it.
+#
+# Unconditional, deliberately. These three resources were previously gated on
+# `length(var.denied_secret_arns) > 0`, so an empty list produced no Deny and no
+# error -- the control vanished silently in exactly the case where it had been
+# misconfigured. `denied_secret_arns` now validates non-empty instead, which
+# makes the gate both unnecessary and misleading: a `count` here would tell the
+# next reader that an instantiation without the Deny is a supported shape.
 data "aws_iam_policy_document" "deny_master_secret" {
-  count = length(var.denied_secret_arns) > 0 ? 1 : 0
-
   statement {
     sid       = "DenyRdsMasterCredential"
     effect    = "Deny"
@@ -95,11 +100,9 @@ data "aws_iam_policy_document" "deny_master_secret" {
 }
 
 resource "aws_iam_policy" "deny_master_secret" {
-  count = length(var.denied_secret_arns) > 0 ? 1 : 0
-
   name_prefix = "${var.name_prefix}-deny-master-secret-"
   description = "Denies the RDS master credential to ECS roles. See ADR 0001 and ADR 0006."
-  policy      = data.aws_iam_policy_document.deny_master_secret[0].json
+  policy      = data.aws_iam_policy_document.deny_master_secret.json
 }
 
 # --------------------------------------------------------------------------
@@ -185,10 +188,8 @@ resource "aws_iam_role_policy" "execution" {
 }
 
 resource "aws_iam_role_policy_attachment" "execution_deny_master_secret" {
-  count = length(var.denied_secret_arns) > 0 ? 1 : 0
-
   role       = aws_iam_role.execution.name
-  policy_arn = aws_iam_policy.deny_master_secret[0].arn
+  policy_arn = aws_iam_policy.deny_master_secret.arn
 }
 
 # --------------------------------------------------------------------------
@@ -261,8 +262,6 @@ resource "aws_iam_role_policy" "task" {
 }
 
 resource "aws_iam_role_policy_attachment" "task_deny_master_secret" {
-  count = length(var.denied_secret_arns) > 0 ? 1 : 0
-
   role       = aws_iam_role.task.name
-  policy_arn = aws_iam_policy.deny_master_secret[0].arn
+  policy_arn = aws_iam_policy.deny_master_secret.arn
 }
