@@ -32,6 +32,11 @@ func Options(cfg config.RedisConfig) *redis.Options {
 
 // TLSConfig renders the TLS settings for cfg, or nil when TLS is off.
 //
+// A fresh value per call, deliberately. Memoising it into a package variable
+// would be the obvious optimisation and would hand every consumer the same
+// mutable struct, so Asynq adjusting its copy would silently change the one the
+// go-redis client is already using.
+//
 // Nil is meaningful rather than empty: go-redis and Asynq both treat a nil
 // TLSConfig as "speak the plaintext protocol", so this returning nil is what
 // keeps the local compose stack working, and it returning non-nil is the whole
@@ -75,11 +80,19 @@ func TLSConfig(cfg config.RedisConfig) *tls.Config {
 // process thinks it is encrypted — the question that has to be answerable
 // first when a task fails its health check against a TLS-only replication
 // group. Address and TLS mode only; the password is never logged.
+//
+// It reports what was actually built rather than what was requested. Logging
+// cfg.TLSEnabled would restate the input: if Options ever stopped honouring the
+// flag, the line would still read tls_enabled=true while the socket was
+// plaintext, which is precisely the failure this package exists to make
+// impossible to have quietly.
 func New(logger *slog.Logger, cfg config.RedisConfig) *redis.Client {
+	opts := Options(cfg)
+
 	logger.Info("redis client configured",
-		slog.String("addr", cfg.Addr()),
-		slog.Bool("tls_enabled", cfg.TLSEnabled),
+		slog.String("addr", opts.Addr),
+		slog.Bool("tls_enabled", opts.TLSConfig != nil),
 	)
 
-	return redis.NewClient(Options(cfg))
+	return redis.NewClient(opts)
 }

@@ -69,12 +69,15 @@ func newTLSServer(t *testing.T) (port int, observed <-chan handshake) {
 
 	cert := tls.Certificate{Certificate: [][]byte{der}, PrivateKey: key}
 
-	// Listening on localhost rather than 127.0.0.1 so that the address the
-	// client dials and the name in the certificate agree however localhost
-	// resolves on this machine.
+	// Bound to the loopback address explicitly. The client dials this address
+	// while being configured with a hostname, so the binding must not depend on
+	// how localhost happens to resolve on this machine.
+	//
+	// context.Background rather than t.Context: the latter is cancelled before
+	// t.Cleanup runs, which is where the listener is closed.
 	var lc net.ListenConfig
 
-	ln, err := lc.Listen(t.Context(), "tcp", "localhost:0")
+	ln, err := lc.Listen(context.Background(), "tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatalf("listening: %v", err)
 	}
@@ -107,6 +110,12 @@ func newTLSServer(t *testing.T) (port int, observed <-chan handshake) {
 				_ = tlsConn.SetDeadline(time.Now().Add(5 * time.Second))
 				herr := tlsConn.HandshakeContext(context.Background())
 
+				// Non-blocking so a connection the test never reads — the
+				// client's pool may open more than one — cannot leave this
+				// goroutine parked on a send after the test returns. The
+				// buffer is sized well above the number of dials either test
+				// provokes, so a drop here means something unexpected
+				// happened rather than the test racing itself.
 				select {
 				case results <- handshake{sni: sni, err: herr}:
 				default:
@@ -140,6 +149,14 @@ const serverHost = "localhost"
 
 // clientFor builds a client from this package's Options, with retries off so a
 // single dial produces a single observable handshake.
+//
+// The dial address is overridden to the loopback *address* while the
+// configuration keeps the loopback *name*. That divergence is what makes the
+// SNI assertion mean anything: crypto/tls fills in an empty ServerName from the
+// address being dialled (see tls.Dial), so if the configured host and the
+// dialled host are the same string, a client that never sets ServerName is
+// indistinguishable from one that derives it correctly. Splitting them is also
+// the real deployment shape — a name resolved elsewhere, or a proxy in front.
 func clientFor(t *testing.T, port int, tlsEnabled bool) *redis.Client {
 	t.Helper()
 
@@ -148,6 +165,7 @@ func clientFor(t *testing.T, port int, tlsEnabled bool) *redis.Client {
 		Port:       port,
 		TLSEnabled: tlsEnabled,
 	})
+	opts.Addr = net.JoinHostPort("127.0.0.1", strconv.Itoa(port))
 	opts.MaxRetries = -1
 	opts.DialTimeout = 5 * time.Second
 
@@ -175,18 +193,26 @@ func TestEnabledClientNegotiatesTLSAndVerifies(t *testing.T) {
 
 	// The specific failure proves verification ran, rather than the connection
 	// falling over for some unrelated reason.
-	var unknownAuthority x509.UnknownAuthorityError
-	if !errors.As(err, &unknownAuthority) {
-		var hostErr x509.HostnameError
-		if !errors.As(err, &hostErr) {
-			t.Fatalf("Ping failed with %v (%T), want an x509 verification error", err, err)
-		}
+	//
+	// CertificateVerificationError is the wrapper crypto/tls puts around every
+	// verification failure, so this does not pin the platform verifier's error
+	// type — x509.UnknownAuthorityError is a Linux shape, and darwin, Windows
+	// and a root-less container each produce something different for the same
+	// rejection.
+	var verifyErr *tls.CertificateVerificationError
+	if !errors.As(err, &verifyErr) {
+		t.Fatalf("Ping failed with %v (%T), want a certificate verification error", err, err)
 	}
 
 	select {
 	case got := <-observed:
 		// A ClientHello reached the server, so TLS was genuinely spoken rather
 		// than the client failing before it opened a handshake.
+		//
+		// This is also the assertion that fails if ServerName stops being
+		// derived from the configured host: the dial address is an IP literal,
+		// and crypto/tls sends no SNI at all for one, so the fallback produces
+		// an empty string here rather than the name.
 		if got.sni != serverHost {
 			t.Errorf("server saw SNI %q, want %q — ServerName is not derived from the configured host",
 				got.sni, serverHost)

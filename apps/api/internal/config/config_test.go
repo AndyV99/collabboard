@@ -140,15 +140,24 @@ func TestDSNEscapesPassword(t *testing.T) {
 // falling back to false would hand them a plaintext client that reports itself
 // as configured.
 func TestRedisTLSRejectsUnparseableValue(t *testing.T) {
-	t.Setenv("REDIS_TLS_ENABLED", "yes")
+	// " true" is the same class of mistake arriving by a different route: a
+	// YAML block scalar or a copied task-definition value that keeps its
+	// leading space. ParseBool rejects it, and it must stay rejected rather
+	// than being trimmed into working, because trimming here and not elsewhere
+	// is its own inconsistency.
+	for _, raw := range []string{"yes", "on", "enabled", " true"} {
+		t.Run("REDIS_TLS_ENABLED="+raw, func(t *testing.T) {
+			t.Setenv("REDIS_TLS_ENABLED", raw)
 
-	_, err := Load()
-	if err == nil {
-		t.Fatal("Load() accepted REDIS_TLS_ENABLED=yes; it must refuse a value it cannot parse")
-	}
+			_, err := Load()
+			if err == nil {
+				t.Fatalf("Load() accepted REDIS_TLS_ENABLED=%q; it must refuse a value it cannot parse", raw)
+			}
 
-	if !strings.Contains(err.Error(), "REDIS_TLS_ENABLED") {
-		t.Errorf("error %q does not name the offending variable", err)
+			if !strings.Contains(err.Error(), "REDIS_TLS_ENABLED") {
+				t.Errorf("error %q does not name the offending variable", err)
+			}
+		})
 	}
 }
 

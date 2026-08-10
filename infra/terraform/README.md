@@ -92,7 +92,16 @@ The first two are enforced by this configuration and both fail loudly, at
 startup, rather than degrading:
 
 - **ElastiCache requires TLS.** `transit_encryption_enabled = true`, so the API
-  needs `rediss://` or a non-nil `TLSConfig` for go-redis and Asynq.
+  needs a non-nil `TLSConfig` for go-redis and Asynq. As of #112 that is
+  reachable from configuration: **set `REDIS_TLS_ENABLED=true` in the API's
+  serve task definition.** It defaults to `false`, which is what the local
+  compose stack needs, so forgetting it leaves a deployed task speaking
+  plaintext to a listener that will not accept it — `/healthz` answers 503 and
+  the apply fails on `wait_for_steady_state`. Tracked as #122.
+
+  `REDIS_HOST` must be the primary endpoint's **DNS name**, not an address: the
+  client verifies the certificate against that name, and Go sends no SNI for an
+  IP literal.
 - **Postgres requires TLS.** `rds.force_ssl = 1`, so the DSN needs
   `sslmode=require` at minimum.
 

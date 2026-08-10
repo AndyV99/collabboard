@@ -2,6 +2,8 @@ package redisclient_test
 
 import (
 	"crypto/tls"
+	"io"
+	"log/slog"
 	"testing"
 
 	"github.com/AndyV99/collabboard/apps/api/internal/config"
@@ -95,6 +97,10 @@ func TestTLSNeverSkipsVerification(t *testing.T) {
 // Asynq takes an asynq.RedisClientOpt with its own TLSConfig field rather than
 // a *redis.Options, so the exported builder is what the job queue will call.
 // If these two disagree, half the service is encrypted.
+//
+// This asserts *delegation*, not field parity: Options calls TLSConfig today,
+// so the only way to fail is to stop doing that. Adding a field to TLSConfig
+// will not make this test say anything new, and it is not meant to.
 func TestTLSConfigAndOptionsAgree(t *testing.T) {
 	t.Parallel()
 
@@ -144,6 +150,62 @@ func TestTLSMinimumVersion(t *testing.T) {
 
 	if tlsCfg.MinVersion < tls.VersionTLS12 {
 		t.Errorf("MinVersion = %d, want at least TLS 1.2 (%d)", tlsCfg.MinVersion, tls.VersionTLS12)
+	}
+}
+
+// Moving construction out of cmd/api made these three regressable in a way they
+// were not when they sat inline next to redis.NewClient. Nothing else would
+// catch a dropped Password: the compose stack and the Testcontainers harness
+// both run Redis without auth, so the integration suite is blind to it and only
+// a deployed environment would notice.
+func TestOptionsCarriesConnectionSettings(t *testing.T) {
+	t.Parallel()
+
+	cfg := baseConfig()
+	// Not a credential: this hostname does not resolve and this password
+	// authenticates against nothing. It exists only to be compared to itself.
+	cfg.Password = "not-a-real-password"
+	cfg.DB = 3
+
+	opts := redisclient.Options(cfg)
+
+	if got, want := opts.Addr, cfg.Addr(); got != want {
+		t.Errorf("Addr = %q, want %q", got, want)
+	}
+
+	if got, want := opts.Password, cfg.Password; got != want {
+		t.Errorf("Password = %q, want %q", got, want)
+	}
+
+	if got, want := opts.DB, cfg.DB; got != want {
+		t.Errorf("DB = %d, want %d", got, want)
+	}
+}
+
+// New is the only function cmd/api calls, so it is the one whose behaviour
+// actually ships. Options being correct does not prove New uses it.
+func TestNewAppliesTheSameOptions(t *testing.T) {
+	t.Parallel()
+
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+
+	for _, enabled := range []bool{false, true} {
+		cfg := baseConfig()
+		cfg.TLSEnabled = enabled
+
+		client := redisclient.New(logger, cfg)
+
+		t.Cleanup(func() { _ = client.Close() })
+
+		opts := client.Options()
+
+		if got := opts.TLSConfig != nil; got != enabled {
+			t.Errorf("New(TLSEnabled=%t) built TLSConfig non-nil = %t", enabled, got)
+		}
+
+		if got, want := opts.Addr, cfg.Addr(); got != want {
+			t.Errorf("New(TLSEnabled=%t) Addr = %q, want %q", enabled, got, want)
+		}
 	}
 }
 

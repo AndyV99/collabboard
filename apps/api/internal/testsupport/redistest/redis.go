@@ -94,6 +94,13 @@ func (s *Server) Client(tb testing.TB, db int) *redis.Client {
 		tb.Fatal("redistest: harness was never started; TestMain did not run or failed")
 	}
 
+	// Deliberately not internal/redisclient, which is the one place the service
+	// itself may build a Redis client. This harness dials a Testcontainers
+	// instance that runs without TLS and is addressed by a generated URL, so it
+	// has no config.RedisConfig to hand and nothing to gain from the TLS
+	// decision. Routing it through redisclient would make the test harness the
+	// second definition of how this service connects, which is what that
+	// package exists to prevent.
 	opts, err := redis.ParseURL(s.URL)
 	if err != nil {
 		tb.Fatalf("redistest: parsing url: %v", err)
