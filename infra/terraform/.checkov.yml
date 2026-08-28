@@ -1,0 +1,218 @@
+# Static analysis policy for this repository's Terraform.
+#
+# `fmt` and `validate` prove the configuration parses and that every argument
+# exists in the provider schema. They are the equivalent of `gofmt` and `go
+# build`, and they prove nothing about whether the infrastructure is safe. This
+# file is the other half: it reads the configuration for meaning, needs no AWS
+# credentials, and therefore works unchanged on a fork PR -- which matters here
+# because `terraform plan` has never been runnable in CI.
+#
+# ---------------------------------------------------------------------------
+# THE THRESHOLD, AND WHY IT IS "EVERYTHING NOT LISTED BELOW"
+# ---------------------------------------------------------------------------
+# The `web` job splits `npm audit` into a reporting run and a gating one at a
+# severity threshold. That shape does not transfer, because Checkov has no
+# severity in the open-source distribution -- every finding is equally loud.
+# Filtering by anything would therefore be filtering by nothing.
+#
+# So the gate is: **every check that is not explicitly skipped here must pass**,
+# and `main` scans clean. That is only sustainable because each skip below is
+# argued rather than accumulated. A tool that fails on every advisory in a hobby
+# account teaches people to re-run it until it is green; a tool with 43 silent
+# exclusions teaches them that it never says anything. This file is the attempt
+# to sit between those.
+#
+# ---------------------------------------------------------------------------
+# ADDING A SKIP
+# ---------------------------------------------------------------------------
+# Prefer an inline `#checkov:skip=CKV_ID:reason` on the resource when the reason
+# is *about that resource*, because it sits next to the thing it excuses and
+# shows up in the diff that introduces it.
+#
+# Use this file when the check does not apply to this project at all, or applies
+# to many resources for one shared reason. Every entry needs a reason and, where
+# the decision is recorded, the ADR that made it. An entry with no reason should
+# be deleted rather than trusted.
+#
+# What is deliberately NOT skipped, so a regression fails the build: public
+# access blocks, encryption at rest, `publicly_accessible` on RDS, open
+# security groups other than the two argued below, and IMDSv2.
+
+framework:
+  - terraform
+
+# Modules are scanned through the environment that calls them, so a variable's
+# real value is evaluated rather than guessed. Without this, a check on a
+# resource whose argument comes from a variable is skipped as indeterminate --
+# which is most of them here.
+download-external-modules: false
+evaluate-variables: true
+
+skip-check:
+  # -------------------------------------------------------------------------
+  # Cost-shape deviations, all recorded in docs/adr/0012-network-shape-and-cost.md
+  #
+  # These are the checks a scanner is right to raise and this environment is
+  # deliberately on the wrong side of. Each is a one-variable reversal, which is
+  # the property ADR 0012 exists to preserve.
+  # -------------------------------------------------------------------------
+
+  # RDS Multi-AZ. `db_multi_az = false` in staging; doubles the instance cost
+  # and is an online modification, so it is reversible without data loss.
+  - CKV_AWS_157
+
+  # ElastiCache automatic failover. `cache_node_count = 1`, so there is no
+  # replica to fail over to. Same ADR, same one-variable reversal.
+  - CKV2_AWS_50
+
+  # RDS deletion protection, and the same for the load balancer. Both are
+  # `false` *on purpose* in an environment whose stated property is that it can
+  # be destroyed to stop costing money -- `true` makes `terraform destroy` fail,
+  # which is right in prod and wrong here. See OPERATOR-INPUTS.md section 5.
+  - CKV_AWS_293
+  - CKV_AWS_150
+
+  # CloudWatch Logs retention of at least one year. Staging keeps considerably
+  # less, because retention is a per-GB bill on logs nobody will read a year
+  # from now. A prod environment should not carry this skip.
+  - CKV_AWS_338
+
+  # RDS enhanced monitoring, at a per-instance monthly charge for OS metrics
+  # this project does not act on. The Observability standard asks for RED/USE
+  # metrics from the application (#12), which is a different thing.
+  - CKV_AWS_118
+
+  # -------------------------------------------------------------------------
+  # Checks that contradict a decision this repository has already made
+  # -------------------------------------------------------------------------
+
+  # "RDS instances should have performance insights enabled." AWS does not
+  # support Performance Insights on db.t2/t3/t4g.micro or .small at all, and
+  # modules/database rejects the combination at *plan* time with a variable
+  # validation rather than 30 seconds into a 15-minute create. Enabling this
+  # would mean moving to db.t4g.medium at roughly 4x the cost.
+  - CKV_AWS_353
+
+  # "Secrets Manager secrets should have automatic rotation enabled." Rotation
+  # here is a deploy, not a lambda: per ADR 0006 the password in Secrets Manager
+  # and the password in Postgres are the same string by construction, and the
+  # thing that makes them the same is `api provision`. A rotation lambda that
+  # changed the secret without running it would invalidate the credential for
+  # every running task. The ordered procedure is in OPERATOR-INPUTS.md; an
+  # automatic rotation lambda is explicitly deferred until it can run it.
+  - CKV2_AWS_57
+
+  # "RDS database should have IAM authentication enabled." A real alternative,
+  # and not this project's model: ADR 0001 and ADR 0006 rest on three distinct
+  # Postgres roles with different privileges, one of which (`collabboard_owner`)
+  # is used by a one-shot task and never by the service. IAM auth would replace
+  # the credential mechanism, not the role model, and the role model is what the
+  # tenant isolation argument rests on.
+  - CKV_AWS_161
+
+  # "ECR repositories should be encrypted using KMS." modules/ecs uses AES256
+  # deliberately and says why: container images are build artefacts, not tenant
+  # data, and a KMS-encrypted repository adds a grant and a per-layer key
+  # operation to every pull for no confidentiality this project needs.
+  - CKV_AWS_136
+
+  # "Container insights enabled on ECS cluster." Off deliberately -- it is a
+  # per-task metric bill, and the Observability standard's requirement is a
+  # Prometheus endpoint (#12), not CloudWatch custom metrics. `container_insights`
+  # is a variable, so turning it on is a one-line change when #12 lands.
+  - CKV_AWS_65
+
+  # "ECS cluster logging enabled and client-to-container communication uses
+  # CMK." The first half is done -- every ECS Exec session is transcribed to
+  # CloudWatch, which is the record that matters for a break-glass path. The
+  # second half is declined in a comment in modules/ecs: the channel is
+  # TLS-encrypted regardless, and encrypting the transcript with the environment
+  # CMK would require the admin task role to hold kms:GenerateDataKey on a key
+  # whose every other grant is conditioned on a specific service.
+  - CKV_AWS_224
+
+  # "CloudWatch Log Group encrypted by KMS." Same argument as above, applied to
+  # the application log groups: they carry structured application logs which are
+  # deliberately free of credentials and of personal data beyond a tenant id,
+  # and CMK encryption would mean a kms grant on every log-writing role.
+  - CKV_AWS_158
+
+  # "KMS key Policy is defined." The bootstrap state key deliberately has no
+  # explicit policy, and modules/main.tf says so: AWS's default key policy grants
+  # the account root full control and thereby delegates authorization to IAM,
+  # which is correct while the only principal is the human operator. That comment
+  # also records when to narrow it -- when #103's deploy role exists -- and #103
+  # did not need state access, so it still stands.
+  - CKV2_AWS_64
+
+  # -------------------------------------------------------------------------
+  # Checks that do not apply to this project
+  # -------------------------------------------------------------------------
+
+  # "Security Groups are attached to another resource." A false positive by
+  # construction: every security group here is attached by ID, passed as a
+  # module variable into an ECS `network_configuration`, an RDS
+  # `vpc_security_group_ids` or an ALB `security_groups`. Checkov's graph does
+  # not follow an ID across a module boundary, so it reports all six as
+  # orphaned. `terraform test` in modules/network and modules/security-groups
+  # asserts the real relationships.
+  - CKV2_AWS_5
+
+  # "S3 bucket has cross-region replication enabled." Neither bucket wants it.
+  # The attachments bucket holds a staging environment's uploads; the state
+  # bucket is versioned and its loss is recoverable by re-importing. Replication
+  # would roughly double the storage bill to protect against a region loss this
+  # project does not claim to survive.
+  - CKV_AWS_144
+
+  # "S3 buckets should have event notifications enabled." There is nothing to
+  # notify. No lambda, no queue, no consumer.
+  - CKV2_AWS_62
+
+  # "Public facing ALB are protected by WAF." A managed WAF web ACL is roughly
+  # $8/month plus per-request charges, against a total environment cost of about
+  # $107. More to the point, ADR 0014 already answers the exposure question
+  # structurally: only the web tier is on the internet, and the API listener
+  # admits this environment's own NAT addresses and nothing else. WAF would be
+  # the right next control if the API were ever published; it is not the first
+  # one missing today.
+  - CKV2_AWS_28
+
+  # -------------------------------------------------------------------------
+  # Genuine gaps, filed rather than folded in
+  #
+  # These are the ones this file must not be allowed to bury. Each has an issue
+  # with a concrete acceptance criterion, and each skip should be DELETED when
+  # its issue closes rather than left behind.
+  # -------------------------------------------------------------------------
+
+  # VPC flow logs (#136) and ALB access logs (#137). Both are real audit gaps:
+  # there is currently no record of what connected to what. Both need a
+  # destination bucket or log group and a retention decision, which is more than
+  # a CI-gate change should be making.
+  - CKV2_AWS_11
+  - CKV_AWS_91
+
+  # S3 server access logging (#137). Same issue: needs a second bucket, which
+  # itself then trips this check unless excluded.
+  - CKV_AWS_18
+
+  # SNS topic encryption (#138). Not a one-line fix: CloudWatch Alarms publishing
+  # to a topic encrypted with a customer-managed key needs an explicit key-policy
+  # grant for cloudwatch.amazonaws.com, and the AWS-managed alias/aws/sns key
+  # does not work for cross-service publishing. Done carelessly this silently
+  # breaks every alarm, which is worse than an unencrypted alarm notification
+  # that names a resource and carries no secret.
+  - CKV_AWS_26
+
+  # Read-only root filesystem on ECS containers (#139). The API image is
+  # distroless and writes nothing, and its Dockerfile already says it is
+  # compatible with a read-only root filesystem. The web tier is not: Next writes
+  # to .next/cache and would need a tmpfs mount. Worth doing, needs testing.
+  - CKV_AWS_336
+
+  # ElastiCache auth token (#140). Transit encryption is on; there is no Redis
+  # AUTH password, so the cache is encrypted but unauthenticated -- the same
+  # shape as the Postgres `require` vs `verify-full` gap #115 closed. Reaching it
+  # requires membership of the app security group, which is the control today.
+  - CKV_AWS_31

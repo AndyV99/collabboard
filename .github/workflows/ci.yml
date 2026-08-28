@@ -69,6 +69,14 @@ jobs:
               - '.github/workflows/ci.yml'
             infra:
               - 'infra/**'
+              # Named explicitly, and not because `infra/**` obviously misses
+              # it. Glob libraries differ on whether `**` crosses a
+              # dot-prefixed path segment, and the consequence of guessing
+              # wrong is that a change to the policy exclusions alone does not
+              # run the policy check -- a suppression added without the gate
+              # ever re-running against it. That is the #30 shape, so it is
+              # answered by not depending on the answer.
+              - 'infra/terraform/.checkov.yml'
               - '.github/workflows/ci.yml'
 
   # Stage order follows CI-CD Standards.md: lint first (fails fast), then unit
@@ -320,7 +328,44 @@ jobs:
           done
           exit $status
 
-      # 3. Unit test. `terraform test` with a `mock_provider` evaluates the
+      # 3. Policy. `fmt` and `validate` are gofmt and `go build`: they prove the
+      # configuration parses and that every argument exists in the provider
+      # schema, and nothing about whether the infrastructure is safe. Removing
+      # `aws_s3_bucket_public_access_block`, or flipping `publicly_accessible`
+      # on RDS, passes both and passes review if the reviewer is reading the
+      # diff's stated purpose.
+      #
+      # Checkov rather than tfsec/Trivy-config for one concrete reason: this
+      # repository's resources overwhelmingly live in modules whose arguments
+      # come from variables set by the calling environment, and Checkov
+      # evaluates those (`evaluate-variables` in the config) where a
+      # module-blind scanner reports them as indeterminate and skips them. It
+      # also has an inline `#checkov:skip=ID:reason` syntax, which is what lets
+      # a deliberate exclusion sit beside the resource it excuses rather than in
+      # a list far away.
+      #
+      # No credentials, no API calls, no `plan` -- so this runs unchanged on a
+      # fork PR, which matters because `plan` never has.
+      #
+      # The threshold, and every exclusion with its reason, live in
+      # infra/terraform/.checkov.yml. There is deliberately no severity filter:
+      # open-source Checkov has no severities, so filtering by one would be
+      # filtering by nothing.
+      - name: checkov
+        uses: bridgecrewio/checkov-action@99bb2caf247dfd9f03cf984373bc6043d4e32ebf # v12.1347.0
+        with:
+          directory: infra/terraform
+          config_file: infra/terraform/.checkov.yml
+          # The action defaults to uploading SARIF, which needs
+          # security-events: write and GitHub Advanced Security. Neither is
+          # available on this repository, and asking for them turns a clean scan
+          # into a failed upload step.
+          output_format: cli
+          quiet: true
+          compact: true
+          soft_fail: false
+
+      # 4. Unit test. `terraform test` with a `mock_provider` evaluates the
       # configuration end to end against a fake AWS -- no credentials, no API
       # calls, no cost -- so it runs unchanged on a fork PR alongside everything
       # else here.
