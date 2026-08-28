@@ -63,9 +63,15 @@ jobs:
           filters: |
             api:
               - 'apps/api/**'
+              # The root .dockerignore decides what reaches either image build,
+              # and it was in no filter at all -- so a change to it ran no app
+              # job. Excluding a file `next build` or `go:embed` needs would
+              # have shipped a broken image with every check green.
+              - '.dockerignore'
               - '.github/workflows/ci.yml'
             web:
               - 'apps/web/**'
+              - '.dockerignore'
               - '.github/workflows/ci.yml'
             infra:
               - 'infra/**'
@@ -345,6 +351,100 @@ jobs:
           done
           exit $status
 
+  # Build both container images and scan them. Stages 3 and 4 of
+  # CI-CD Standards.md for an artifact that already exists -- deliberately NOT
+  # stages 6-9: nothing is pushed, no registry is contacted, no credential is
+  # referenced, so this runs unchanged on a fork PR. The registry work is
+  # cd.yml's.
+  #
+  # A sibling job rather than steps inside `api`/`web`, so it reports its own
+  # conclusion on the PR. The cost is a second checkout; the benefit is that
+  # "the image is broken" and "the tests fail" are distinguishable at a glance.
+  #
+  # Two things were unprotected before this. Nothing built either Dockerfile, so
+  # a dependency needing a toolchain the base lacks, or a path the
+  # .dockerignore now excludes, would surface at deploy time with every check
+  # green -- `npm run build` on a runner is not the same build. And
+  # Security Practices.md requires a Trivy scan on every built image, which
+  # could not be satisfied while CI built no image.
+  image:
+    name: image (${{ matrix.app }})
+    needs: changes
+    if: needs.changes.outputs.api == 'true' || needs.changes.outputs.web == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    strategy:
+      # Both images are scanned even when only one changed. They share a
+      # .dockerignore and a base-image bump cadence, and a scan skipped because
+      # "that app did not change" is a scan that never runs on the app nobody is
+      # touching -- which is exactly where an unpatched base image sits.
+      fail-fast: false
+      matrix:
+        app: [api, web]
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
+
+      - name: Build ${{ matrix.app }}
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        with:
+          context: .
+          file: apps/${{ matrix.app }}/Dockerfile
+          # Never pushed. This job holds no credential and contacts no registry.
+          push: false
+          # Into the runner's docker daemon, so Trivy can scan it by tag.
+          load: true
+          tags: collabboard-${{ matrix.app }}:ci
+          # amd64 explicitly, even though the Dockerfiles default to the
+          # architecture the task definitions declare. The runner is amd64, and
+          # building arm64 here would mean qemu emulation -- minutes per PR --
+          # to scan packages that are the same in either build. What ships is
+          # built natively by cd.yml on a matching runner; this is a scan, not a
+          # release artifact.
+          build-args: TARGET_ARCH=amd64
+          cache-from: type=gha,scope=${{ matrix.app }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.app }}
+
+      # Reporting, then gating -- the same split the `web` job already uses for
+      # `npm audit`, and for the same reason. The first step shows everything,
+      # including vulnerabilities with no fix available, so they are visible in
+      # the log. The second fails the build only on what somebody could actually
+      # act on.
+      - name: Trivy (report everything, including unfixable)
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          image-ref: collabboard-${{ matrix.app }}:ci
+          format: table
+          severity: LOW,MEDIUM,HIGH,CRITICAL
+          ignore-unfixed: false
+          exit-code: '0'
+
+      # The gate. HIGH and CRITICAL only, and `ignore-unfixed: true`, which is
+      # the answer to the question #39 asked to decide explicitly.
+      #
+      # A HIGH in the base image with no fixed version published is not
+      # actionable: there is no bump to take, and failing on it leaves the check
+      # permanently red until someone else ships a patch. A permanently red gate
+      # is one people learn to route around, which costs more than the finding.
+      # It stays visible in the reporting step above.
+      #
+      # A HIGH that IS fixable fails the build, and the fix is a base image bump
+      # -- which is Dependabot's job (#22) on the pinned tags in both
+      # Dockerfiles. .trivyignore is for the narrow case of a fixable finding
+      # deliberately deferred; every entry there needs a date and an issue.
+      - name: Trivy (gate on fixable HIGH and CRITICAL)
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          image-ref: collabboard-${{ matrix.app }}:ci
+          format: table
+          severity: HIGH,CRITICAL
+          ignore-unfixed: true
+          exit-code: '1'
+          trivyignores: .trivyignore
+
   # Scans the repository for committed credentials.
   #
   # Deliberately NOT gated by `changes`, unlike api/web/infra. Those are gated
@@ -417,7 +517,7 @@ jobs:
     # Every job above must appear here. A job missing from this list still runs
     # and still reports, but cannot block a merge -- the exact silent hole #30
     # exists to make impossible to introduce.
-    needs: [changes, api, integration, web, infra, secret-scan]
+    needs: [changes, api, integration, web, image, infra, secret-scan]
     if: always()
     runs-on: ubuntu-latest
     timeout-minutes: 5

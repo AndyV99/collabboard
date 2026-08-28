@@ -34,7 +34,7 @@
 # Pinned to patch releases rather than floating tags, for the reason
 # apps/web/Dockerfile gives: a base image refresh should arrive as a commit
 # someone reviewed, not as yesterday's green build going red.
-ARG GO_VERSION=1.26.5
+ARG GO_VERSION=1.26.6
 ARG ALPINE_VERSION=3.24
 
 # The runtime base gets a digest as well as a tag, which the Node pins did not
