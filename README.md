@@ -205,31 +205,68 @@ Skip it and nothing warns you; `git commit` just behaves as it always did. That
 is a limitation of git, not a choice — a repository cannot install its own
 hooks, or cloning one would be arbitrary code execution.
 
-### Why push protection is not on
+### Push protection, and how it was verified
 
-GitHub's own secret scanning, and the push protection built on it, are free on
-public repositories and part of the paid **GitHub Secret Protection** add-on on
-private ones. This repository is private on a personal plan, and the add-on is
-not purchased, so the API refuses:
+Secret scanning and push protection are both **on**. They are free on public
+repositories and part of the paid GitHub Secret Protection add-on on private
+ones; this repository was private, and #109 was the decision to make it public
+rather than buy the add-on — a portfolio project whose point is being read loses
+little by being readable, and it also makes CI minutes and arm64 runners free.
+
+The full history was scanned before the visibility changed, across every ref:
+158 non-merge commits clean, and the 38 merge commits verified with `git
+diff-tree --cc` to introduce no content of their own, so the scan covered
+everything ever added.
+
+**Verify by reading, not by the write's status code.** Setting
+`secret_scanning_push_protection` on a repository with no secret scanning
+returns **200 and changes nothing**. An API call that succeeds and silently does
+not do the thing is an easy way to believe a control is on when it is not:
+
+```bash
+gh api repos/AndyV99/collabboard --jq '.security_and_analysis'
+```
+
+Both fields read `enabled`.
+
+#### It was tested, and the first test was wrong
+
+Push protection was demonstrated by pushing a fabricated credential to a
+throwaway branch, with `--no-verify` to bypass the local hook — which is exactly
+the case this layer exists to cover.
+
+The first attempt used a fake `ghp_` token and **was not blocked**. That is not
+a gap in push protection: GitHub's own token formats carry a CRC32 checksum in
+their last characters, so a randomly generated `ghp_` string is not a
+well-formed token and is correctly ignored. Worth recording, because "I pushed a
+fake secret and nothing happened" is the wrong conclusion to draw from it, and
+it is the conclusion the evidence appears to support.
+
+A correctly-shaped AWS access key ID and secret pair — a format with no checksum
+— was rejected outright:
 
 ```
-$ gh api -X PATCH repos/AndyV99/collabboard \
-    -f 'security_and_analysis[secret_scanning][status]=enabled'
-422  Secret scanning is not available for this repository.
+remote: - GITHUB PUSH PROTECTION
+remote:     - Push cannot contain secrets
+remote:       —— Amazon AWS Secret Access Key ——
+ ! [remote rejected] (push declined due to repository rule violations)
 ```
 
-Worth knowing: setting `secret_scanning_push_protection` on its own returns
-**200 and changes nothing** — it stays `disabled`, because it has no secret
-scanning to build on. An API call that succeeds and silently does not do the
-thing is an easy way to believe a control is on when it is not, so verify with
-`gh api repos/OWNER/REPO --jq '.security_and_analysis'` rather than trusting the
-exit code.
+The branch never reached the remote, so there was nothing to clean up. **If you
+test this yourself, pick a format without a checksum**, or you will prove
+nothing and believe you proved something.
 
-Turning it on means either buying Secret Protection or making the repository
-public, both of which are decisions rather than settings. Until then the honest
-statement is that **a credential committed without the hook installed will reach
-GitHub**, CI will catch it on the PR, and it will have to be rotated. Tracked in
-issue #109.
+#### What each layer now covers
+
+| | Hook installed | Hook not installed |
+|---|---|---|
+| Local commit | blocked, no incident | not blocked |
+| Push to GitHub | — | **blocked, no incident** |
+| PR CI | blocked | blocked |
+
+The row that used to read "the credential reaches GitHub and must be rotated" is
+gone. The hook is still worth installing: it fails in a second, at the terminal
+of the person who just typed the thing, rather than after a round trip.
 
 All three run the same gitleaks build against the same `.gitleaks.toml`, because
 both entry points go through `scripts/gitleaks.sh`, which pins the version and
