@@ -35,6 +35,12 @@ env:
   # could change the formatting rules `fmt -check` enforces without a commit
   # that says so. 1.10+ is required by the S3-native state locking in ADR 0011.
   TERRAFORM_VERSION: '1.15.8'
+  # The Terraform policy scanner. Pinned for the same reason as everything
+  # above it, and with one extra: the exclusion list in
+  # infra/terraform/.checkov.yml is written against this version's check IDs,
+  # so an unpinned upgrade could silently start skipping a check that no longer
+  # exists while a new one goes unreviewed.
+  CHECKOV_VERSION: '3.3.15'
 
 jobs:
   # Cheap (~5s) job that decides which app jobs need to run. Its outputs gate
@@ -351,19 +357,29 @@ jobs:
       # infra/terraform/.checkov.yml. There is deliberately no severity filter:
       # open-source Checkov has no severities, so filtering by one would be
       # filtering by nothing.
+      # Installed and pinned here rather than run through
+      # bridgecrewio/checkov-action, and that is not a style preference. That
+      # action's pinned tag resolves to a container running **Checkov 2.0.930**,
+      # which predates the AWS provider v4 split of `aws_s3_bucket` into
+      # separate encryption and versioning resources -- so it reports the state
+      # bucket and the attachments bucket as unencrypted and unversioned when
+      # both are configured, and evaluates 188 checks where 3.3.x evaluates 360.
+      # A gate that runs a four-year-old ruleset and reports green on the
+      # checks it no longer understands is worse than no gate, because it is
+      # believed.
+      #
+      # Same reasoning as scripts/gitleaks.sh: the tool version is part of what
+      # the check means, so it is pinned where it can be read, and it is the
+      # version the exclusions in .checkov.yml were written against.
       - name: checkov
-        uses: bridgecrewio/checkov-action@99bb2caf247dfd9f03cf984373bc6043d4e32ebf # v12.1347.0
-        with:
-          directory: infra/terraform
-          config_file: infra/terraform/.checkov.yml
-          # The action defaults to uploading SARIF, which needs
-          # security-events: write and GitHub Advanced Security. Neither is
-          # available on this repository, and asking for them turns a clean scan
-          # into a failed upload step.
-          output_format: cli
-          quiet: true
-          compact: true
-          soft_fail: false
+        run: |
+          python3 -m pip install --quiet --disable-pip-version-check \
+            "checkov==${CHECKOV_VERSION}"
+          checkov --version
+          checkov \
+            --directory . \
+            --config-file .checkov.yml \
+            --compact
 
       # 4. Unit test. `terraform test` with a `mock_provider` evaluates the
       # configuration end to end against a fake AWS -- no credentials, no API
