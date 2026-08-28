@@ -79,6 +79,10 @@ variables {
   cache_host    = "collabboard-test-redis.abcdef.ng.0001.use1.cache.amazonaws.com"
   cache_port    = 6379
 
+  # The public subnets, because that is where the load balancer's interfaces
+  # live. Two, one per AZ, matching modules/network's shape.
+  trusted_proxy_cidrs = ["10.0.0.0/20", "10.0.16.0/20"]
+
   app_database_secret_arn   = "arn:aws:secretsmanager:us-east-1:000000000000:secret:collabboard/test/db/app-AbCdEf"
   owner_database_secret_arn = "arn:aws:secretsmanager:us-east-1:000000000000:secret:collabboard/test/db/owner-AbCdEf"
   jwt_secret_arn            = "arn:aws:secretsmanager:us-east-1:000000000000:secret:collabboard/test/auth/jwt-AbCdEf"
@@ -593,4 +597,75 @@ run "rejects_a_relative_certificate_path" {
   }
 
   expect_failures = [var.database_ssl_root_cert]
+}
+
+# ---------------------------------------------------------------------------
+# Who is allowed to say who the client is
+# ---------------------------------------------------------------------------
+
+# apps/api calls SetTrustedProxies with this list. Empty means trust nobody,
+# which is safe with nothing in front of the service and wrong behind a load
+# balancer -- every request then appears to come from the ALB, so the
+# per-address login budget becomes one bucket shared by every user and a single
+# attacker locks everybody out. Nothing about that looks broken, which is why it
+# is asserted here rather than left to a reading of the task definition.
+run "the_serving_container_is_told_which_peer_may_assert_the_client_address" {
+  command = apply
+
+  assert {
+    condition = anytrue([
+      for entry in jsondecode(aws_ecs_task_definition.api.container_definitions)[0].environment :
+      entry.name == "HTTP_TRUSTED_PROXIES" && entry.value == join(",", var.trusted_proxy_cidrs)
+    ])
+    error_message = "the serving container must carry HTTP_TRUSTED_PROXIES; without it every request appears to come from the load balancer and the per-address login budget is one global bucket"
+  }
+
+  # Non-empty is the whole point, and an empty join produces an empty string
+  # that the assertion above would still match if var.trusted_proxy_cidrs were
+  # empty. The variable's own validation rejects that, but this says so at the
+  # point the value is consumed.
+  assert {
+    condition = anytrue([
+      for entry in jsondecode(aws_ecs_task_definition.api.container_definitions)[0].environment :
+      entry.name == "HTTP_TRUSTED_PROXIES" && entry.value != ""
+    ])
+    error_message = "HTTP_TRUSTED_PROXIES must not be empty in a task definition that runs behind the ALB"
+  }
+
+  # Serve mode only. `api migrate` and `api provision` start no HTTP listener,
+  # so there is no ClientIP for the setting to affect and configuring one would
+  # imply otherwise.
+  assert {
+    condition = alltrue([
+      for definition in [
+        jsondecode(aws_ecs_task_definition.api_migrate.container_definitions)[0],
+        jsondecode(aws_ecs_task_definition.api_provision.container_definitions)[0],
+      ] :
+      !anytrue([
+        for entry in definition.environment : entry.name == "HTTP_TRUSTED_PROXIES"
+      ])
+    ])
+    error_message = "the one-shot tasks must not carry HTTP_TRUSTED_PROXIES: neither starts an HTTP listener"
+  }
+}
+
+# Both directions of the wrong answer, refused at plan time.
+run "rejects_an_empty_trusted_proxy_list" {
+  command = plan
+
+  variables {
+    trusted_proxy_cidrs = []
+  }
+
+  expect_failures = [var.trusted_proxy_cidrs]
+}
+
+run "rejects_trusting_every_peer" {
+  command = plan
+
+  variables {
+    trusted_proxy_cidrs = ["10.0.0.0/20", "0.0.0.0/0"]
+  }
+
+  expect_failures = [var.trusted_proxy_cidrs]
 }

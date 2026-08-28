@@ -19,8 +19,24 @@ output "private_subnet_ids" {
 }
 
 output "private_subnet_cidrs" {
-  description = "CIDR blocks of the private subnets. Exported for #33: these are the addresses the API sees as its peer once an ALB is in front of it, and therefore what a trusted-proxy list would have to contain."
+  description = "CIDR blocks of the private subnets -- where the ECS tasks run. NOT the trusted-proxy list: #101 exported this for #33 on the assumption that the load balancer's address would be a private one, and it is not. See public_subnet_cidrs."
   value       = aws_subnet.private[*].cidr_block
+}
+
+output "public_subnet_cidrs" {
+  description = <<-EOT
+    CIDR blocks of the public subnets, which is where the load balancer's
+    network interfaces live -- modules/alb attaches the ALB to
+    public_subnet_ids, so an ECS task in a private subnet sees a peer address
+    from *this* range, not from its own.
+
+    This is what HTTP_TRUSTED_PROXIES has to contain (#33). Getting it wrong by
+    naming the private ranges instead leaves the load balancer untrusted, which
+    is not a loud failure: ClientIP() returns the ALB's address for every
+    request, the per-address login budget collapses into one bucket shared by
+    every user, and a single attacker locks everybody out.
+  EOT
+  value       = aws_subnet.public[*].cidr_block
 }
 
 output "data_subnet_ids" {

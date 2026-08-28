@@ -370,6 +370,32 @@ variable "database_max_conns" {
   }
 }
 
+variable "trusted_proxy_cidrs" {
+  description = <<-EOT
+    HTTP_TRUSTED_PROXIES: the CIDR blocks whose X-Forwarded-For the API
+    believes. Must be the *public* subnets -- modules/alb attaches the load
+    balancer there, so that is the peer address a task actually observes.
+
+    Empty means trust nobody, which is safe and, with a load balancer in front,
+    wrong in a way nothing reports: every request then appears to come from the
+    ALB, the per-address login budget becomes a single bucket shared by every
+    user, and one attacker locks everybody out. Empty is therefore rejected
+    below rather than allowed as a default -- this module only ever runs behind
+    the ALB.
+  EOT
+  type        = list(string)
+
+  validation {
+    condition     = length(var.trusted_proxy_cidrs) > 0
+    error_message = "trusted_proxy_cidrs must not be empty: this module always runs behind the load balancer, and an empty list makes the per-address login limit one global bucket rather than a per-client one."
+  }
+
+  validation {
+    condition     = !contains(var.trusted_proxy_cidrs, "0.0.0.0/0")
+    error_message = "trusted_proxy_cidrs must not contain 0.0.0.0/0: that lets any peer assert the client address, which is gin's insecure default and what this setting replaces. apps/api rejects it at startup too."
+  }
+}
+
 variable "cache_host" {
   description = "ElastiCache primary endpoint, as a DNS name. Never an address: the API verifies the TLS certificate against this value, Go sends no SNI for an IP literal, and the ElastiCache certificate carries no IP SAN -- so an address fails verification with an error that reads like a broken trust store rather than like a wrong hostname."
   type        = string

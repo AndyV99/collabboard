@@ -125,9 +125,12 @@ variable "api_admin_ingress_cidrs" {
     "the API is not on the internet".
 
     A single operator address for debugging is a legitimate entry. A `0.0.0.0/0`
-    here would publish /api/v1/auth/login, and with #33 unfixed the per-address
-    login budget is not real yet, so that is a materially different security
-    posture rather than a convenience.
+    here would publish /api/v1/auth/login to the internet, which is a materially
+    different security posture rather than a convenience. #33 has since made the
+    per-address login budget real -- the API trusts the load balancer's subnets
+    and nothing else -- so an opened listener is rate limited per client rather
+    than per load balancer. That lowers the cost of this setting; it does not
+    make it free.
   EOT
   type        = list(string)
   default     = []

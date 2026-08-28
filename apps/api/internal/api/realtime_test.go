@@ -181,6 +181,7 @@ func TestTheDemoPublishEndpointIsGone(t *testing.T) {
 	// route table's answer and not a missing dependency's.
 	router := NewRouter(discardLogger(),
 		BodyLimits{},
+		nil,
 		HealthDeps{Postgres: stubPinger{}, Redis: stubPinger{}},
 		AuthDeps{Service: &membershipService{issuer: issuer}, Verifier: issuer, Store: newCRUDStore()},
 		RealtimeDeps{
@@ -220,6 +221,7 @@ func TestTheRealtimeRoutesAreOnlyMountedWhenSupplied(t *testing.T) {
 
 	without := NewRouter(discardLogger(),
 		BodyLimits{},
+		nil,
 		HealthDeps{Postgres: stubPinger{}, Redis: stubPinger{}},
 		AuthDeps{Service: &membershipService{issuer: issuer}, Verifier: issuer},
 		RealtimeDeps{})
@@ -237,6 +239,7 @@ func TestTheRealtimeRoutesAreOnlyMountedWhenSupplied(t *testing.T) {
 
 	with := NewRouter(discardLogger(),
 		BodyLimits{},
+		nil,
 		HealthDeps{Postgres: stubPinger{}, Redis: stubPinger{}},
 		AuthDeps{Service: &membershipService{issuer: issuer}, Verifier: issuer},
 		RealtimeDeps{

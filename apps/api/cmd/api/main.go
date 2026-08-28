@@ -182,7 +182,7 @@ func runServe(logger *slog.Logger, cfg config.Config) error {
 	router := api.NewRouter(logger, api.BodyLimits{
 		Default:         int64(cfg.HTTP.MaxRequestBytes),
 		Unauthenticated: int64(cfg.HTTP.MaxUnauthenticatedRequestBytes),
-	}, api.HealthDeps{
+	}, cfg.HTTP.TrustedProxies, api.HealthDeps{
 		Postgres: pgxPinger{pool: pool},
 		Redis:    redisPinger{client: redisClient},
 

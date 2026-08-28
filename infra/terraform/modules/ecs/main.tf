@@ -54,6 +54,14 @@ locals {
     # path tried to.
     POSTGRES_USER = var.database_app_user
 
+    # Who may tell this task who the client is. The public subnets, because
+    # that is where modules/alb puts the load balancer's interfaces -- a task in
+    # a private subnet sees a peer address from the *public* range.
+    #
+    # Serve mode only. `api migrate` and `api provision` start no HTTP listener,
+    # so there is no ClientIP for a trusted-proxy list to affect.
+    HTTP_TRUSTED_PROXIES = join(",", var.trusted_proxy_cidrs)
+
     REDIS_HOST = var.cache_host
     REDIS_PORT = tostring(var.cache_port)
 

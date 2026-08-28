@@ -19,9 +19,14 @@ import (
 // limits is configuration rather than a dependency, which is why it comes first
 // and not as another Deps struct. Its zero value is a working pair of limits,
 // not an absent one — see [BodyLimits].
+// trustedProxies is the CIDR list whose X-Forwarded-For this service believes.
+// Nil means trust nobody, which is correct when nothing sits in front of the
+// service and wrong the moment a load balancer does — see the call to
+// SetTrustedProxies below for why the wrong one is the quiet one.
 func NewRouter(
 	logger *slog.Logger,
 	limits BodyLimits,
+	trustedProxies []string,
 	deps HealthDeps,
 	authDeps AuthDeps,
 	realtimeDeps RealtimeDeps,
@@ -30,20 +35,43 @@ func NewRouter(
 
 	router := gin.New()
 
-	// Gin trusts X-Forwarded-For from every peer by default, which makes
-	// ClientIP() attacker-controlled and the per-address login budget
-	// trivially bypassable — one header per attempt and every attempt looks
-	// like a new client. Trusting nobody makes ClientIP() the peer address,
-	// which is correct today (nothing sits in front of this) and will be wrong
-	// the moment an ALB does. Filed as an issue rather than guessed at here,
-	// because the right answer is the load balancer's subnet and that does not
-	// exist yet.
+	// Who is allowed to tell this service who the client is.
 	//
-	// The error is impossible for a nil argument, but ignoring it silently
-	// would hide a future typo.
-	if err := router.SetTrustedProxies(nil); err != nil {
+	// Gin trusts X-Forwarded-For from every peer by default, which makes
+	// ClientIP() attacker-controlled and the per-address login budget trivially
+	// bypassable — one header per attempt and every attempt looks like a new
+	// client. Trusting nobody makes ClientIP() the peer address.
+	//
+	// Both settings are wrong in a different direction and only one of them is
+	// loud. With an ALB in front and nobody trusted, every request appears to
+	// come from the load balancer, so the per-address budget becomes one bucket
+	// shared by every user and a single attacker locks out everybody. That is
+	// worse than not having the limit, and nothing about it looks broken.
+	//
+	// So the list is configuration, defaulting to empty — the current, safe
+	// behaviour for a service with nothing in front of it — and the deployed
+	// task definition sets it to the load balancer's own subnets. Anything
+	// unparseable, and 0.0.0.0/0 specifically, is refused by config.Load before
+	// the engine is built, because the failure here is a log line beside a
+	// server that is already serving.
+	if err := router.SetTrustedProxies(trustedProxies); err != nil {
+		// Unreachable in practice: config.Load has already parsed every entry
+		// with net.ParseCIDR. Kept because "unreachable" is a claim about
+		// today's callers, and a router that silently trusts the wrong set is
+		// not a failure anyone would notice.
 		logger.Error("configuring trusted proxies", slog.Any("error", err))
 	}
+
+	// X-Forwarded-For only. Gin's default also consults X-Real-IP, and that is
+	// a hole once anything upstream is trusted: an ALB *appends* to
+	// X-Forwarded-For, so a forged entry ends up to the left of the real client
+	// address and Gin's right-to-left walk ignores it — but the ALB passes
+	// X-Real-IP through untouched, and Gin falls back to it whenever
+	// X-Forwarded-For is absent or malformed. A client that sends a malformed
+	// X-Forwarded-For and a chosen X-Real-IP would pick its own identity.
+	//
+	// One header, the one the load balancer actually writes.
+	router.RemoteIPHeaders = []string{"X-Forwarded-For"}
 
 	// gin.Logger writes unstructured text to stdout, which would violate the
 	// structured-logging standard; requestLogger replaces it.

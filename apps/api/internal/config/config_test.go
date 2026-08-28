@@ -281,3 +281,71 @@ func TestLoadReadsSSLRootCert(t *testing.T) {
 		t.Errorf("SSLRootCert = %q, want %q", cfg.Postgres.SSLRootCert, path)
 	}
 }
+
+// HTTP_TRUSTED_PROXIES decides who is allowed to assert the client's address,
+// so a value that does not parse has to stop the service rather than be
+// dropped. gin's SetTrustedProxies would report the same error, but by then the
+// engine is being built and the failure is a log line beside a running server —
+// one that is trusting nobody and therefore running the single-bucket rate
+// limiter this setting exists to prevent.
+func TestTrustedProxiesRejectsAnUnparseableEntry(t *testing.T) {
+	t.Setenv("HTTP_TRUSTED_PROXIES", "10.0.0.0/20,not-a-cidr")
+
+	if _, err := Load(); err == nil {
+		t.Fatal("expected an error for an unparseable trusted-proxy entry, got nil")
+	}
+}
+
+// 0.0.0.0/0 is refused by name. It parses perfectly, and it restores exactly
+// gin's insecure default — every peer allowed to name the client — which is
+// what this setting was added to replace. An operator writing it has almost
+// certainly reached for "allow the load balancer" and overshot.
+func TestTrustedProxiesRejectsTrustingEveryone(t *testing.T) {
+	for _, everything := range []string{"0.0.0.0/0", "::/0"} {
+		t.Run(everything, func(t *testing.T) {
+			t.Setenv("HTTP_TRUSTED_PROXIES", everything)
+
+			if _, err := Load(); err == nil {
+				t.Fatalf("expected %s to be refused, got nil", everything)
+			}
+		})
+	}
+}
+
+// Unset must produce nil rather than an empty-string entry. strings.Split("",
+// ",") returns one empty element, so the naive parse yields []string{""} —
+// which gin then rejects, turning "no proxies configured" into a startup
+// failure for every local run.
+func TestTrustedProxiesDefaultsToTrustingNobody(t *testing.T) {
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+
+	if len(cfg.HTTP.TrustedProxies) != 0 {
+		t.Errorf("TrustedProxies = %v, want empty — the default must trust nobody", cfg.HTTP.TrustedProxies)
+	}
+}
+
+// A bare address is what an operator writes when they mean one machine.
+// Accepting it and normalising is kinder than an error that teaches nothing,
+// and gin needs the mask.
+func TestTrustedProxiesAcceptsCIDRsAndBareAddresses(t *testing.T) {
+	t.Setenv("HTTP_TRUSTED_PROXIES", " 10.0.0.0/20 , 10.0.16.4 ,, ::1 ")
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+
+	want := []string{"10.0.0.0/20", "10.0.16.4/32", "::1/128"}
+	if len(cfg.HTTP.TrustedProxies) != len(want) {
+		t.Fatalf("TrustedProxies = %v, want %v", cfg.HTTP.TrustedProxies, want)
+	}
+
+	for i, w := range want {
+		if cfg.HTTP.TrustedProxies[i] != w {
+			t.Errorf("TrustedProxies[%d] = %q, want %q", i, cfg.HTTP.TrustedProxies[i], w)
+		}
+	}
+}

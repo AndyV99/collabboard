@@ -362,6 +362,7 @@ func newInstance(t *testing.T, opts instanceOptions) *instance {
 	// card write that committed, which is the whole point of the issue.
 	router := api.NewRouter(discardLogger(),
 		api.BodyLimits{},
+		nil,
 		api.HealthDeps{},
 		api.AuthDeps{Service: stubAuthService{}, Verifier: opts.issuer, Store: opts.store},
 		api.RealtimeDeps{Connect: hub.ConnectHandler(), Publisher: hub.EventPublisher()})

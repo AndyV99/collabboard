@@ -54,7 +54,7 @@ func TestOnlyTheKnownPublicRoutesAnswerWithoutAToken(t *testing.T) {
 
 	gin.SetMode(gin.TestMode)
 
-	router := NewRouter(discardLogger(), BodyLimits{},
+	router := NewRouter(discardLogger(), BodyLimits{}, nil,
 		HealthDeps{Postgres: stubPinger{}, Redis: stubPinger{}},
 		AuthDeps{
 			Service:  &countingAuthService{},
