@@ -291,13 +291,59 @@ variable "database_name" {
 }
 
 variable "database_sslmode" {
-  description = "libpq sslmode for the API's DSN. The instance's parameter group sets `rds.force_ssl = 1`, so anything below `require` is refused by the server at connect time. `verify-full` would need a CA bundle in the image and a way to point at it, which apps/api does not have today."
+  description = "libpq sslmode for the API's DSN. The instance's parameter group sets `rds.force_ssl = 1`, so anything below `require` is refused by the server at connect time. `verify-full` is the default because #115 put the RDS trust anchors in the image and `database_ssl_root_cert` points libpq at them: `require` encrypts without checking who answered, which stops passive eavesdropping and not an active attacker who can answer for the endpoint's address inside the VPC."
   type        = string
-  default     = "require"
+  default     = "verify-full"
 
   validation {
     condition     = contains(["require", "verify-ca", "verify-full"], var.database_sslmode)
     error_message = "database_sslmode must be require, verify-ca or verify-full. RDS is configured with rds.force_ssl = 1, so `disable`, `allow` and `prefer` produce a connection the server rejects."
+  }
+}
+
+variable "admin_database_sslmode" {
+  description = <<-EOT
+    PGSSLMODE for the one-shot administrative task.
+
+    Separate from database_sslmode, and weaker on purpose. That task runs a
+    stock postgres image this repository does not build, so the RDS trust
+    anchors cannot be placed inside it and  would make the
+    break-glass path unusable at the moment it is needed. See the comment in
+    main.tf for what the difference costs.
+
+     is rejected for the same reason it is on database_sslmode: the
+    instance's parameter group refuses the connection and the error does not
+    say why.
+  EOT
+  type        = string
+  default     = "require"
+
+  validation {
+    condition     = contains(["require", "verify-ca", "verify-full"], var.admin_database_sslmode)
+    error_message = "admin_database_sslmode must be require, verify-ca or verify-full. verify-ca and verify-full only work if the operator has supplied a CA bundle to the image by some means this module does not provide."
+  }
+}
+
+variable "database_ssl_root_cert" {
+  description = <<-EOT
+    POSTGRES_SSLROOTCERT: the in-image path to the CA bundle libpq verifies the
+    server certificate against.
+
+    Must match the destination of the certificate COPY in apps/api/Dockerfile.
+    The two are coupled and nothing checks the coupling at plan time -- the
+    image is opaque to Terraform -- so a mismatch is a task that starts, fails
+    to connect, and reports "root certificate file does not exist".
+
+    Empty disables verification even at verify-full, and is therefore rejected
+    below rather than allowed as a way to "turn it off": the way to turn it off
+    is database_sslmode = "require", which says so.
+  EOT
+  type        = string
+  default     = "/etc/ssl/certs/rds-global-bundle.pem"
+
+  validation {
+    condition     = startswith(var.database_ssl_root_cert, "/")
+    error_message = "database_ssl_root_cert must be an absolute path inside the container image. libpq resolves a relative path against the process working directory, which is unset for this image."
   }
 }
 

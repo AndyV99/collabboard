@@ -55,3 +55,15 @@ docs
 .idea
 **/.DS_Store
 **/*.pem
+
+# One exception, and it is narrow on purpose. The blanket `**/*.pem` above is a
+# safety rule about private keys, and it stays: a key that reaches a build
+# context reaches a layer, and a layer is forever. This file is the opposite
+# kind of PEM — 108 Amazon RDS *public* root certificates, published by AWS at a
+# URL with no authentication, which apps/api's image needs in order to make
+# POSTGRES_SSLMODE=verify-full mean anything (see apps/api/certs/README.md).
+#
+# Named by exact directory rather than by a pattern like `!**/certs/*.pem`, so
+# that a future `certs/` somewhere else does not inherit the exemption silently.
+# Order matters here: the last matching pattern wins, so this must stay below.
+!apps/api/certs/*.pem

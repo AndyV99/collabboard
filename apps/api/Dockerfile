@@ -95,6 +95,14 @@ RUN --mount=type=cache,target=/go/pkg/mod \
 # build failure. The root `.dockerignore` already strips `apps/api/bin`.
 COPY apps/api/ ./
 
+# The RDS trust anchors, carried across from the build context so the runtime
+# stage can take them from a stage rather than from the context directly. See
+# apps/api/certs/README.md for why this is vendored rather than curl'd here:
+# `sslmode=verify-full` is a statement about which authorities are trusted, and
+# that belongs in a reviewed commit rather than in whatever the network returns
+# during a build.
+COPY apps/api/certs/rds-global-bundle.pem /out/rds-global-bundle.pem
+
 ARG TARGET_ARCH
 
 # CGO_ENABLED=0 is what makes the runtime stage's choice possible: no libc, no
@@ -154,6 +162,29 @@ USER nonroot:nonroot
 # Owned by root and mode 0555: the running user needs to execute it and has no
 # reason to be able to rewrite it.
 COPY --from=builder --chown=root:root --chmod=0555 /out/api /usr/local/bin/api
+
+# The Amazon RDS global certificate bundle, which is what makes
+# POSTGRES_SSLMODE=verify-full reachable rather than merely documented. libpq
+# resolves the CA from `sslrootcert`, defaulting to ~/.postgresql/root.crt —
+# a path that does not exist in this image and never will, since there is no
+# home directory and no way to write one. Without a file here, verify-full
+# fails at connect time with "root certificate file does not exist", which
+# reads like a broken image rather than a missing setting.
+#
+# Placed beside the base image's own `ca-certificates` rather than replacing
+# them: those are for outbound TLS to AWS APIs and anything else the service
+# calls, this one is consulted only when a DSN names it. Neither affects the
+# other.
+#
+# 0444, not 0555: it is data, not a program, and nothing should execute it. Root
+# owns it so the `nonroot` process can read it and cannot substitute it — a
+# writable trust anchor is not a trust anchor.
+#
+# The path is referenced by POSTGRES_SSLROOTCERT in
+# infra/terraform/modules/ecs/main.tf. Changing it here without changing it
+# there produces a task that will not start.
+COPY --from=builder --chown=root:root --chmod=0444 \
+     /out/rds-global-bundle.pem /etc/ssl/certs/rds-global-bundle.pem
 
 # Matches `api_container_port` in modules/ecs/variables.tf. Documentation only —
 # the value that binds comes from HTTP_PORT, defaulted in internal/config.

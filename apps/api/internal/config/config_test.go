@@ -189,3 +189,95 @@ func TestRedisTLSParsing(t *testing.T) {
 		})
 	}
 }
+
+// sslmode=verify-full is only as good as the CA file libpq resolves, and libpq
+// resolves it from sslrootcert — defaulting to ~/.postgresql/root.crt, which
+// does not exist in a distroless image. Before POSTGRES_SSLROOTCERT existed,
+// verify-full was documented in .env.example and unreachable in practice: the
+// connection failed with "root certificate file ... does not exist", which
+// reads like a broken image rather than like a missing setting.
+//
+// Both DSNs, because `api migrate` connects with MigrationDSN and would
+// otherwise be the one connection in the system still unverified — and it is
+// the one holding the schema owner's credential.
+func TestSSLRootCertReachesBothDSNs(t *testing.T) {
+	const path = "/etc/ssl/certs/rds-global-bundle.pem"
+
+	p := PostgresConfig{
+		Host:              "collabboard-staging-postgres.abcdef.us-east-1.rds.amazonaws.com",
+		Port:              5432,
+		User:              "collabboard_app",
+		Password:          "serving",
+		Database:          "collabboard",
+		SSLMode:           "verify-full",
+		SSLRootCert:       path,
+		MigrationUser:     "collabboard_owner",
+		MigrationPassword: "owner",
+	}
+
+	for name, dsn := range map[string]string{"DSN": p.DSN(), "MigrationDSN": p.MigrationDSN()} {
+		parsed, err := url.Parse(dsn)
+		if err != nil {
+			t.Fatalf("%s %q is not a valid URL: %v", name, dsn, err)
+		}
+
+		// Read the parsed query rather than substring-matching the string: a
+		// path is percent-encoded on the wire, so strings.Contains(dsn, path)
+		// would pass or fail for reasons unrelated to the value libpq sees.
+		if got := parsed.Query().Get("sslrootcert"); got != path {
+			t.Errorf("%s: sslrootcert = %q, want %q", name, got, path)
+		}
+
+		if got := parsed.Query().Get("sslmode"); got != "verify-full" {
+			t.Errorf("%s: sslmode = %q, want verify-full", name, got)
+		}
+	}
+}
+
+// The other half, and the one that protects the local loop. An empty
+// SSLRootCert must omit the parameter rather than emit it empty: libpq reads
+// `sslrootcert=` as "no CA file", which under verify-full fails the connection
+// outright instead of falling back to a default. Emitting it empty would also
+// change the DSN every local developer has been running against, for a setting
+// none of them set.
+func TestSSLRootCertIsOmittedWhenUnset(t *testing.T) {
+	p := PostgresConfig{
+		Host:              "localhost",
+		Port:              5432,
+		User:              "collabboard_app",
+		Password:          "dev",
+		Database:          "collabboard",
+		SSLMode:           "disable",
+		MigrationUser:     "collabboard_owner",
+		MigrationPassword: "dev",
+	}
+
+	for name, dsn := range map[string]string{"DSN": p.DSN(), "MigrationDSN": p.MigrationDSN()} {
+		parsed, err := url.Parse(dsn)
+		if err != nil {
+			t.Fatalf("%s %q is not a valid URL: %v", name, dsn, err)
+		}
+
+		if _, present := parsed.Query()["sslrootcert"]; present {
+			t.Errorf("%s: sslrootcert must be absent when unset, but %q carries it", name, dsn)
+		}
+	}
+}
+
+// Load has to read it, not merely carry it. A field wired into the struct and
+// not into Load is the exact shape of this issue's original defect: a setting
+// that exists in the type, is documented, and cannot be set.
+func TestLoadReadsSSLRootCert(t *testing.T) {
+	const path = "/etc/ssl/certs/rds-global-bundle.pem"
+
+	t.Setenv("POSTGRES_SSLROOTCERT", path)
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+
+	if cfg.Postgres.SSLRootCert != path {
+		t.Errorf("SSLRootCert = %q, want %q", cfg.Postgres.SSLRootCert, path)
+	}
+}

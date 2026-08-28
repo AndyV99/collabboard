@@ -185,6 +185,24 @@ type PostgresConfig struct {
 	Database string
 	SSLMode  string
 
+	// SSLRootCert is the path to a PEM bundle of certificate authorities the
+	// server's certificate is verified against. Empty by default, which leaves
+	// the parameter out of the DSN entirely and hands the decision back to
+	// libpq's own default (~/.postgresql/root.crt) — the behaviour the local
+	// compose stack has always had, where SSLMode is "disable" and nothing is
+	// verified anyway.
+	//
+	// It only does anything at "verify-ca" and "verify-full". Setting it under
+	// "require" is harmless and inert: libpq parses the parameter and never
+	// consults the file, because "require" encrypts without verifying.
+	//
+	// In a deployed environment this points at the RDS bundle vendored in
+	// apps/api/certs and copied into the image by apps/api/Dockerfile. It is a
+	// path rather than the PEM itself because that is the only shape libpq
+	// accepts, and because a 165 KB certificate bundle in a task definition's
+	// environment would be absurd.
+	SSLRootCert string
+
 	MigrationUser     string
 	MigrationPassword string
 
@@ -216,6 +234,16 @@ func (p PostgresConfig) dsn(user, password string) string {
 
 	q := u.Query()
 	q.Set("sslmode", p.SSLMode)
+
+	// Only when set. An empty sslrootcert is not the same as an absent one:
+	// libpq treats the empty string as "no CA file", which under verify-full
+	// fails the connection outright rather than falling back to a default. So
+	// the parameter is omitted rather than emitted empty, and the local loop
+	// produces exactly the DSN it did before this field existed.
+	if p.SSLRootCert != "" {
+		q.Set("sslrootcert", p.SSLRootCert)
+	}
+
 	u.RawQuery = q.Encode()
 
 	return u.String()
@@ -281,6 +309,7 @@ func Load() (Config, error) {
 			Password:          envString("POSTGRES_PASSWORD", "dev"),
 			Database:          envString("POSTGRES_DB", "collabboard"),
 			SSLMode:           envString("POSTGRES_SSLMODE", "disable"),
+			SSLRootCert:       envString("POSTGRES_SSLROOTCERT", ""),
 			MigrationUser:     envString("POSTGRES_MIGRATION_USER", "collabboard_owner"),
 			MigrationPassword: envString("POSTGRES_MIGRATION_PASSWORD", "dev"),
 			MaxConns:          int32(envInt("POSTGRES_MAX_CONNS", 10, &errs)), //nolint:gosec // bounded small int from config
