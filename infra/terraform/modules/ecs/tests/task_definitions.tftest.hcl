@@ -436,3 +436,71 @@ run "every_task_definition_declares_the_architecture_the_images_are_built_for" {
     error_message = "the operating system family must stay LINUX"
   }
 }
+
+# ---------------------------------------------------------------------------
+# The setting that stops the service starting at all
+# ---------------------------------------------------------------------------
+
+# modules/cache creates the replication group with transit_encryption_enabled,
+# so the listener refuses a plaintext connection. The Go client only offers a
+# TLS one when REDIS_TLS_ENABLED says so, and it defaults to off because the
+# local compose stack needs it off. The gap between those two facts is a
+# deployed API whose /healthz answers 503, a target group with no healthy
+# target, and an apply that fails on wait_for_steady_state about ten minutes
+# in -- naming the service, not the variable.
+run "the_serving_container_speaks_tls_to_elasticache" {
+  command = apply
+
+  # The value, not merely the key. `REDIS_TLS_ENABLED = "false"` would satisfy
+  # a presence check and fail in exactly the way described above.
+  assert {
+    condition = anytrue([
+      for entry in jsondecode(aws_ecs_task_definition.api.container_definitions)[0].environment :
+      entry.name == "REDIS_TLS_ENABLED" && entry.value == "true"
+    ])
+    error_message = "the serving container must set REDIS_TLS_ENABLED=true: modules/cache sets transit_encryption_enabled and the setting defaults to false, so omitting it produces a plaintext connection the listener rejects"
+  }
+
+  # REDIS_HOST has to be the endpoint's DNS name for the certificate to verify.
+  # var.cache_host is validated against the IPv4 shape; this asserts the
+  # validated value is the one that actually reaches the container, which the
+  # variable's own validation cannot say.
+  assert {
+    condition = anytrue([
+      for entry in jsondecode(aws_ecs_task_definition.api.container_definitions)[0].environment :
+      entry.name == "REDIS_HOST" && entry.value == var.cache_host && !can(cidrnetmask("${entry.value}/32"))
+    ])
+    error_message = "REDIS_HOST must be the primary endpoint's DNS name -- the client derives the TLS ServerName from it, and Go sends no SNI for an IP literal"
+  }
+
+  # The migrate and provision tasks are deliberately NOT covered here, and this
+  # is the assertion that says so rather than leaving it as an absence. Neither
+  # mode opens a Redis connection: api_common_environment carries no REDIS_*
+  # setting at all, so there is nothing for a TLS flag to apply to, and adding
+  # one would imply a dependency that does not exist.
+  assert {
+    condition = alltrue([
+      for definition in [
+        jsondecode(aws_ecs_task_definition.api_migrate.container_definitions)[0],
+        jsondecode(aws_ecs_task_definition.api_provision.container_definitions)[0],
+      ] :
+      !anytrue([
+        for entry in lookup(definition, "environment", []) : startswith(entry.name, "REDIS_")
+      ])
+    ])
+    error_message = "the one-shot tasks must carry no REDIS_ setting: neither `api migrate` nor `api provision` opens a cache connection, and configuring one would suggest otherwise"
+  }
+}
+
+# The other half of the TLS story, caught at plan time rather than at the tenth
+# minute of an apply. An address here produces a task that starts, connects,
+# and fails certificate verification against a name it never sent.
+run "rejects_a_cache_host_that_is_an_address" {
+  command = plan
+
+  variables {
+    cache_host = "10.0.32.17"
+  }
+
+  expect_failures = [var.cache_host]
+}

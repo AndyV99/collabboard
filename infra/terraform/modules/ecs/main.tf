@@ -46,6 +46,20 @@ locals {
     REDIS_HOST = var.cache_host
     REDIS_PORT = tostring(var.cache_port)
 
+    # A literal rather than a variable, deliberately. modules/cache sets
+    # `transit_encryption_enabled = true` as a constant, not behind a variable,
+    # so a `true` here is the same constant written a second time and the two
+    # cannot drift. A variable would have to default to something, and a
+    # variable defaulting to `false` reintroduces exactly the failure this
+    # setting exists to prevent: a plaintext connection to a listener that
+    # refuses it, /healthz answering 503, and the apply timing out on
+    # `wait_for_steady_state` roughly ten minutes later with an error that
+    # names the service rather than the setting.
+    #
+    # If `transit_encryption_enabled` ever becomes configurable, this becomes a
+    # variable threaded from the same source in the same commit.
+    REDIS_TLS_ENABLED = "true"
+
     # These two are set from the same variables that validate the ALB's idle
     # timeout, in modules/alb/variables.tf. Changing the ping interval here
     # without changing the idle timeout is a plan-time error rather than a
