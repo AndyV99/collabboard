@@ -234,14 +234,25 @@ resource "aws_ecs_cluster_capacity_providers" "this" {
 locals {
   api_image = "${aws_ecr_repository.api.repository_url}:${var.api_image_tag}"
 
-  # X86_64 stated rather than defaulted. ARM64 Fargate is about 20% cheaper and
-  # the rest of this environment already runs Graviton (db.t4g, cache.t4g), so it
-  # is the obvious saving -- but it only works if #103 builds arm64 images, and
-  # an amd64 image on an ARM64 task definition fails at start with an exec format
-  # error. Making the choice visible is what lets #103 change it deliberately.
+  # ARM64, and it must agree with what the pipeline actually builds. An amd64
+  # image on an ARM64 task definition -- or the reverse -- fails at task start
+  # with an exec format error: the task never reaches healthy, the apply times
+  # out on wait_for_steady_state, and nothing in the error names an
+  # architecture. So this is asserted in tests/ and the two Dockerfiles default
+  # to the matching value, which makes a one-sided edit a test failure rather
+  # than a deploy.
+  #
+  # Worth ~20% of the Fargate line (about $5.40/month at the committed staging
+  # sizing, running continuously), and it makes the environment consistently
+  # Graviton: RDS and ElastiCache were already t4g.
+  #
+  # The two tiers share one value deliberately. They could differ -- and an
+  # earlier draft of this let them -- but a second platform local is a second
+  # thing to keep in step with a second Dockerfile, and there is no reason for
+  # them to diverge.
   runtime_platform = {
     operating_system_family = "LINUX"
-    cpu_architecture        = "X86_64"
+    cpu_architecture        = "ARM64"
   }
 }
 

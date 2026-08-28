@@ -34,11 +34,33 @@ ARG NODE_VERSION=22.23.2
 ARG ALPINE_VERSION=3.24
 
 # ---------------------------------------------------------------------------
+# Target architecture — MUST match `runtime_platform` in modules/ecs/main.tf
+# ---------------------------------------------------------------------------
+# arm64, matching that module's `cpu_architecture = "ARM64"`. A mismatch is not
+# a build failure; it is a task that dies at start with an exec format error,
+# which reads like a broken image rather than a wrong platform.
+#
+# Note the difference from apps/api/Dockerfile, which pins its *builder* to
+# $BUILDPLATFORM and cross-compiles. This one cannot, and the reason is
+# concrete rather than cautious: `next build`'s standalone output traces
+# node_modules and pulls in sharp's native binding — `@img/sharp-linux-x64` or
+# `@img/sharp-linuxmusl-x64` on an x64 builder. npm selects that variant from
+# the platform it is *installed on*, so a cross-build would ship an x64 .node
+# file inside an arm64 image and Next's image optimisation would fail at
+# runtime, long after the build reported success.
+#
+# So every stage below is pinned to the target platform. On an arm64 runner
+# that is native and costs nothing; on an amd64 machine it is qemu emulation
+# and the build takes minutes rather than seconds. `.github/workflows/cd.yml`
+# therefore builds this image on an arm64 runner.
+ARG TARGET_ARCH=arm64
+
+# ---------------------------------------------------------------------------
 # Stage 1: dependencies
 # ---------------------------------------------------------------------------
 # Its own stage so the (slow) install is keyed on the lockfile alone. Editing a
 # component re-runs the build stage but reuses this one.
-FROM node:${NODE_VERSION}-alpine${ALPINE_VERSION} AS deps
+FROM --platform=linux/${TARGET_ARCH} node:${NODE_VERSION}-alpine${ALPINE_VERSION} AS deps
 
 WORKDIR /app
 
@@ -52,13 +74,17 @@ COPY apps/web/package.json apps/web/package-lock.json ./
 # and the app's `.ts`/`.tsx`. None of this reaches the runtime stage.
 #
 # The cache mount survives between builds without landing in a layer.
+# Runs on the target platform (see TARGET_ARCH above), which is what makes npm
+# resolve the right `@img/sharp-*` optional dependency. Installing this stage on
+# a different architecture than the runtime stage is the one cross-build mistake
+# that produces a working build and a broken container.
 RUN --mount=type=cache,target=/root/.npm \
     npm ci
 
 # ---------------------------------------------------------------------------
 # Stage 2: build
 # ---------------------------------------------------------------------------
-FROM node:${NODE_VERSION}-alpine${ALPINE_VERSION} AS builder
+FROM --platform=linux/${TARGET_ARCH} node:${NODE_VERSION}-alpine${ALPINE_VERSION} AS builder
 
 WORKDIR /app
 
@@ -90,7 +116,7 @@ RUN mkdir -p public
 # ---------------------------------------------------------------------------
 # Stage 3: runtime
 # ---------------------------------------------------------------------------
-FROM node:${NODE_VERSION}-alpine${ALPINE_VERSION} AS runner
+FROM --platform=linux/${TARGET_ARCH} node:${NODE_VERSION}-alpine${ALPINE_VERSION} AS runner
 
 WORKDIR /app
 
