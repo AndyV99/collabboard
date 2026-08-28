@@ -9,6 +9,12 @@ import (
 	"github.com/gin-gonic/gin"
 )
 
+// forwardedForHeader is the only header this service will take a client address
+// from. gin's default also consults X-Real-IP and falls back to it when this
+// one is absent or unparseable -- see the comment at RemoteIPHeaders below for
+// why that fallback is a bypass once anything upstream is trusted.
+const forwardedForHeader = "X-Forwarded-For"
+
 // NewRouter builds the Gin engine with the service's middleware and routes.
 //
 // Auth and realtime are optional so that a build without them — the health-only
@@ -71,7 +77,7 @@ func NewRouter(
 	// X-Forwarded-For and a chosen X-Real-IP would pick its own identity.
 	//
 	// One header, the one the load balancer actually writes.
-	router.RemoteIPHeaders = []string{"X-Forwarded-For"}
+	router.RemoteIPHeaders = []string{forwardedForHeader}
 
 	// gin.Logger writes unstructured text to stdout, which would violate the
 	// structured-logging standard; requestLogger replaces it.

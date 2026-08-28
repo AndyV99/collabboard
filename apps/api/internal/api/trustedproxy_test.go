@@ -48,8 +48,8 @@ func clientIPSeenBy(t *testing.T, trusted []string, peer string, headers map[str
 // free to bypass.
 func TestForgedForwardedHeaderIsIgnoredWithNoTrustedProxies(t *testing.T) {
 	got := clientIPSeenBy(t, nil, "203.0.113.9:54321", map[string]string{
-		"X-Forwarded-For": "198.51.100.7",
-		"X-Real-IP":       "198.51.100.8",
+		forwardedForHeader: "198.51.100.7",
+		"X-Real-IP":        "198.51.100.8",
 	})
 
 	if got != "203.0.113.9" {
@@ -67,7 +67,7 @@ func TestForgedForwardedHeaderIsIgnoredWithNoTrustedProxies(t *testing.T) {
 // untrusted address, which is why the forgery does not win.
 func TestForwardedHeaderIsBelievedFromATrustedProxy(t *testing.T) {
 	got := clientIPSeenBy(t, []string{"10.0.0.0/20"}, "10.0.1.55:41000", map[string]string{
-		"X-Forwarded-For": "198.51.100.7, 203.0.113.9",
+		forwardedForHeader: "198.51.100.7, 203.0.113.9",
 	})
 
 	if got != "203.0.113.9" {
@@ -80,7 +80,7 @@ func TestForwardedHeaderIsBelievedFromATrustedProxy(t *testing.T) {
 // forwarding headers in general".
 func TestForgedForwardedHeaderIsIgnoredFromAnUntrustedPeer(t *testing.T) {
 	got := clientIPSeenBy(t, []string{"10.0.0.0/20"}, "203.0.113.50:41000", map[string]string{
-		"X-Forwarded-For": "198.51.100.7",
+		forwardedForHeader: "198.51.100.7",
 	})
 
 	if got != "203.0.113.50" {
@@ -101,8 +101,8 @@ func TestForgedForwardedHeaderIsIgnoredFromAnUntrustedPeer(t *testing.T) {
 // invalid, which is precisely what triggers the fallback.
 func TestXRealIPIsNotConsultedEvenFromATrustedProxy(t *testing.T) {
 	got := clientIPSeenBy(t, []string{"10.0.0.0/20"}, "10.0.1.55:41000", map[string]string{
-		"X-Forwarded-For": "not-an-address",
-		"X-Real-IP":       "198.51.100.7",
+		forwardedForHeader: "not-an-address",
+		"X-Real-IP":        "198.51.100.7",
 	})
 
 	if got == "198.51.100.7" {
