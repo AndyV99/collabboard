@@ -289,3 +289,48 @@ module "ecs" {
   container_insights    = var.container_insights
   wait_for_steady_state = var.wait_for_steady_state
 }
+
+# ---------------------------------------------------------------------------
+# The identity GitHub Actions deploys with -- #103
+# ---------------------------------------------------------------------------
+
+module "cicd" {
+  source = "../../modules/cicd"
+
+  name_prefix = local.name_prefix
+
+  # Staging deploys on a push to main, so the ref is the constraint. Prod, when
+  # it exists, uses the `environment:` form instead -- GitHub will not mint a
+  # token carrying that subject until the environment's manual approval has
+  # been given, which is what makes the promotion gate enforced by the identity
+  # provider rather than by an `if:` somebody can edit.
+  #
+  # The module rejects a `repo:owner/name:*` entry outright: that shape matches
+  # a pull_request run, so on a public repository it would let anyone who opens
+  # a PR assume this role.
+  allowed_subjects = ["repo:${var.github_repository}:ref:refs/heads/main"]
+
+  cluster_name = module.ecs.cluster_name
+  service_names = [
+    module.ecs.api_service_name,
+    module.ecs.web_service_name,
+  ]
+
+  # Exactly the roles this environment's own task definitions already name, and
+  # nothing else. PassRole on `*` with RegisterTaskDefinition would be
+  # unrestricted privilege escalation in this account.
+  passable_role_arns = [
+    module.iam.execution_role_arn,
+    module.iam.task_role_arn,
+    module.iam.web_execution_role_arn,
+  ]
+
+  ecr_repository_prefix = var.project
+  log_group_prefix      = "/ecs/${local.name_prefix}"
+
+  # ADR 0001, once more. The deploy role holds no secretsmanager Allow at all,
+  # so this denies nothing today -- and cannot be overridden by an Allow
+  # attached later, which is the whole reason it is here rather than omitted as
+  # redundant.
+  denied_secret_arns = [module.database.master_user_secret_arn]
+}

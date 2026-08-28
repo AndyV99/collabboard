@@ -6,10 +6,10 @@ what holds a secret and who writes it, which steps Terraform cannot do, and what
 keeps billing after `destroy`. It was written alongside the Terraform in #101
 rather than reconstructed from it afterwards.
 
-Scope: the base infrastructure in #101, plus the load balancer, ECS services and
-one-shot task definitions in #102. The deploy pipeline (#103) and the database
-role provisioning (#56) each add their own rows, and this file should grow with
-them rather than being rewritten.
+Scope: the base infrastructure in #101, the load balancer, ECS services and
+one-shot task definitions in #102, and the deploy pipeline in #103. The database
+role provisioning (#56) adds its own rows, and this file should grow with it
+rather than being rewritten.
 
 No real secret value appears here, and none should be added — where a value is
 needed, the command that produces it is given instead.
@@ -204,6 +204,64 @@ Never in this repository, never in a tfvars. A named CLI profile or SSO session.
 
 ---
 
+### 2.6 #103: the deploy identity
+
+There is no new *secret* here, and that is the headline. GitHub Actions assumes
+an IAM role through OIDC, so nothing long-lived exists to be stored, rotated or
+leaked — no `AWS_ACCESS_KEY_ID` in a repository secret, no key to forget to
+revoke when a laptop is lost.
+
+What there is instead is a set of GitHub **variables** (not secrets), every one
+of them an identifier rather than a credential. They are variables deliberately:
+GitHub masks a secret's value in logs, and masking a role ARN turns a failed
+`AssumeRole` into an error message with the interesting part replaced by
+asterisks.
+
+| GitHub variable | Value comes from | Why the pipeline needs it |
+|---|---|---|
+| `AWS_DEPLOY_ROLE_ARN` | `terraform output -raw deploy_role_arn` | The role every deploy job assumes |
+| `ECS_CLUSTER_NAME` | `terraform output -raw ecs_cluster_name` | Scopes `update-service` and `run-task` |
+| `API_SERVICE_NAME` | `terraform output -raw api_service_name` | Which service to roll |
+| `WEB_SERVICE_NAME` | `terraform output -raw web_service_name` | Which service to roll |
+| `API_REPOSITORY_URL` | `terraform output -raw api_repository_url` | Where to push, and what image the task definition gets |
+| `WEB_REPOSITORY_URL` | `terraform output -raw web_repository_url` | Same, web tier |
+| `MIGRATE_TASK_DEFINITION` | `terraform output -raw migrate_task_definition_arn` | The one-shot `api migrate up` task |
+| `RUN_TASK_NETWORK_CONFIGURATION` | `terraform output -raw run_task_network_configuration` | Subnets and security group for that task |
+| `WEB_URL` | `terraform output -raw web_url` | What the smoke check curls |
+| `PROD_AWS_DEPLOY_ROLE_ARN` | *(unset)* | Leave unset. The promote job is the approval gate, wired and waiting; unset means "no prod yet" and the job says so and passes. |
+
+Every one is written by a human after the environment applies, and every one is
+readable from `terraform output`. Nothing here is guessable and nothing here is
+sensitive.
+
+**Two GitHub Environments must exist**, `staging` and `production`. Create them
+under Settings → Environments. `production` needs a **required reviewer** — that
+rule is not decoration: GitHub will not mint an OIDC token whose `sub` carries
+`environment:production` until the approval is given, so the prod deploy role
+cannot be assumed by an unapproved run. The gate is enforced by the identity
+provider, not by an `if:` in a workflow file that anyone able to open a PR could
+edit.
+
+**The variables must be set on the repository, not on the environment**, unless
+you intend a per-environment value. `vars.X` resolves environment-scoped
+variables over repository-scoped ones, so a leftover environment variable
+silently wins over the repository one — a value that is right in `terraform
+output` and wrong in the deploy, with nothing reporting a conflict.
+
+#### The bootstrap ordering that bites
+
+The OIDC provider is created by the **bootstrap** stack, because
+`aws_iam_openid_connect_provider` is an account-wide singleton keyed by its URL:
+two environments creating one would collide, and whichever owned it would remove
+it on destroy. The environment stack looks it up with a data source.
+
+So the order is: bootstrap apply → environment apply → set GitHub variables →
+push to `main`. Applying the environment against an account with no OIDC
+provider fails at plan with `no matching OIDC provider found`, which is accurate
+and easy to misread as an IAM permission problem.
+
+---
+
 ## 3. What Terraform cannot do
 
 Four things, three of them chicken-and-egg.
@@ -214,7 +272,8 @@ Four things, three of them chicken-and-egg.
 4. **A container image for each service.** Nothing in this repository builds one. `apps/web` has a Dockerfile; **`apps/api` has none at all**, and neither is built or pushed by CI yet — that is #103. Both services name `<repo>:bootstrap` by default, and with `wait_for_steady_state = true` an apply against an empty registry fails after roughly ten minutes.
 5. **Writing the three secret values.** Terraform creates the containers and nothing else. Two are #56's; `auth/jwt` is the operator's.
 6. **Running `bootstrap-owner.sql`, `api migrate up` and `api provision`.** #102 provides the task definitions that make all three possible — see ADR 0013 and section 4 below — but starting them is an operator or pipeline action, not an apply.
-7. **Confirming the SNS subscription.** Terraform can create an email subscription but cannot click the confirmation link, so a subscription resource would sit permanently pending and look configured while notifying nobody. The topic is created; subscribing is step 15.
+7. **Creating the two GitHub Environments and setting the repository variables (#103).** Terraform can print every value; it cannot log into GitHub. The `production` environment's required-reviewer rule in particular is what makes the prod gate real, and no AWS resource expresses it.
+8. **Confirming the SNS subscription.** Terraform can create an email subscription but cannot click the confirmation link, so a subscription resource would sit permanently pending and look configured while notifying nobody. The topic is created; subscribing is step 15.
 
 #101's version of this list said #56 was blocked on #102 rather than on #101. **#102 unblocks it**: the `<prefix>-admin` task definition is a psql session inside the VPC, which is the network path that did not previously exist.
 

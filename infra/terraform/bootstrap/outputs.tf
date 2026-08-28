@@ -31,3 +31,16 @@ output "backend_config" {
     kms_key_id = "${aws_kms_key.state.arn}"
   EOT
 }
+
+output "github_oidc_provider_arn" {
+  description = <<-EOT
+    ARN of the GitHub Actions OIDC provider (#103).
+
+    Environments do not consume this output -- they cannot, because this stack
+    keeps its state locally and no remote state data source can reach it. They
+    look the provider up by URL with `data "aws_iam_openid_connect_provider"`
+    instead. It is printed here so an operator can confirm the thing exists
+    before wondering why a deploy role will not apply.
+  EOT
+  value       = aws_iam_openid_connect_provider.github.arn
+}

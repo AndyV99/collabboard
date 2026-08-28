@@ -183,3 +183,10 @@ container_insights = false
 # Both point the same way as db_deletion_protection: this environment must be
 # destroyable, because leaving it running is the cost.
 alb_deletion_protection = false
+
+# ---------------------------------------------------------------------------
+# #103: the deploy identity
+# ---------------------------------------------------------------------------
+
+# Half of the only condition protecting the deploy role. See variables.tf.
+github_repository = "AndyV99/collabboard"

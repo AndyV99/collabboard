@@ -287,3 +287,23 @@ variable "alb_deletion_protection" {
   type        = bool
   default     = false
 }
+
+# ---------------------------------------------------------------------------
+# #103: the deploy identity
+# ---------------------------------------------------------------------------
+
+variable "github_repository" {
+  description = <<-EOT
+    `owner/name` of the repository allowed to assume this environment's deploy
+    role. This is not cosmetic: it is half of the only condition standing
+    between the role and every GitHub Actions workflow in the world, so a typo
+    here produces a role nothing can assume (loud) and a wrong-but-real
+    repository name produces one somebody else can (silent).
+  EOT
+  type        = string
+
+  validation {
+    condition     = can(regex("^[A-Za-z0-9._-]+/[A-Za-z0-9._-]+$", var.github_repository))
+    error_message = "github_repository must be exactly `owner/name` -- no scheme, no trailing slash, no ref. It is interpolated into an OIDC `sub` condition, where a malformed value silently matches nothing or too much."
+  }
+}
