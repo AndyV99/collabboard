@@ -27,6 +27,23 @@ type Pinger interface {
 type HealthDeps struct {
 	Postgres Pinger
 	Redis    Pinger
+
+	// DiscloseErrors puts the underlying driver error text into the response
+	// body. It is what makes /healthz genuinely useful in the local loop --
+	// "connection refused on 5432" is the answer, and hiding it would just move
+	// the work to reading logs.
+	//
+	// The zero value is false, and that polarity is the point: the unsafe
+	// setting is the one you have to ask for. A driver error names the host,
+	// the port, and which dependency failed, which on a deployed URL is free
+	// reconnaissance for anyone who can reach the route -- it turns a scan into
+	// a targeted attempt. Forgetting to set this field yields the safe
+	// behaviour rather than the interesting one.
+	//
+	// Suppressed detail is not lost: it is logged at WARN with the component
+	// name before the response is built, so whoever is debugging still has it
+	// and nobody else does.
+	DiscloseErrors bool
 }
 
 type componentStatus struct {
@@ -68,10 +85,26 @@ func healthHandler(logger *slog.Logger, deps HealthDeps) gin.HandlerFunc {
 			status = http.StatusServiceUnavailable
 			body.Status = statusDegrade
 
+			// Logged before any redaction below, and always with the full text.
+			// This is the line that makes suppression acceptable rather than a
+			// loss: the operator keeps the detail, the internet does not.
 			logger.WarnContext(c.Request.Context(), "health check dependency unavailable",
 				slog.String("component", name),
 				slog.String("error", component.Error),
 			)
+		}
+
+		// Redaction happens after logging and after the status has been decided,
+		// so what is served differs from what is recorded in exactly one
+		// respect: the driver's error string. Which component is unhealthy, and
+		// the overall status, survive -- an operator reading a load balancer's
+		// health check output needs those, and neither discloses topology the
+		// caller did not already have.
+		if !deps.DiscloseErrors {
+			for name, component := range components {
+				component.Error = ""
+				components[name] = component
+			}
 		}
 
 		c.JSON(status, body)

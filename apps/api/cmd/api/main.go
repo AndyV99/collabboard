@@ -185,6 +185,13 @@ func runServe(logger *slog.Logger, cfg config.Config) error {
 	}, api.HealthDeps{
 		Postgres: pgxPinger{pool: pool},
 		Redis:    redisPinger{client: redisClient},
+
+		// The one place this is turned on. APP_ENV is the existing switch and
+		// no second concept is introduced: it already decides whether the
+		// signing secret may be generated and whether the realtime origin
+		// allow-list may default to localhost, which is the same question --
+		// "is this the local loop or somewhere real".
+		DiscloseErrors: cfg.IsDevelopment(),
 	}, authDeps, api.RealtimeDeps{
 		Connect: hub.ConnectHandler(),
 		// The write path's broadcaster. Every card and column write publishes
