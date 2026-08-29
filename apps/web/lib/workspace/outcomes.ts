@@ -87,6 +87,26 @@ export function describeLoadFailure(error: ApiError, subject: string): LoadFailu
       };
 
     case "not_found":
+    // A malformed id in the URL, which `crud.go`'s `pathUUID` answers 400 for
+    // before any lookup happens. It shares `not_found`'s copy deliberately.
+    //
+    // From the reader's side the two are the same situation: this address does
+    // not name anything. The distinction between "well-formed and absent" and
+    // "not even an id" is real to the API and invisible to a person who
+    // arrived here from a link that lost its last characters in a chat client,
+    // or an id pasted with a stray space — which is the common way somebody
+    // reaches a broken address. Inventing a third state for it would mean
+    // writing copy about a difference the screen cannot show.
+    //
+    // What it must not do is what the `default` branch did: claim a server
+    // fault and offer a retry. Nothing went wrong on the server, and retrying
+    // produces the identical 400 forever — a loop with no exit.
+    //
+    // The API's own message is NOT relayed here, unlike in describeWriteFailure.
+    // `board_id must be a uuid` is about a path segment the user never typed as
+    // a field, and showing it would leak an internal parameter name onto a page
+    // about a missing board.
+    case "bad_request":
       return {
         title: "Not found",
         message: `These ${subject} do not exist, or they belong to a workspace you are not a member of.`,
@@ -109,10 +129,15 @@ export function describeLoadFailure(error: ApiError, subject: string): LoadFailu
       };
 
     default:
-      // server_error, malformed, unexpected_status, and the two that should not
-      // reach a GET (bad_request, conflict). All of them mean the same thing to
-      // someone looking at an empty page: this is not your fault and there is
-      // nothing to fix here.
+      // server_error, malformed, unexpected_status, and `conflict` — which
+      // genuinely should not reach a GET. `bad_request` used to be listed here
+      // as equally unreachable and was not: a malformed id in the URL produces
+      // one on every workspace screen, and this branch told those users the
+      // server was broken and handed them a retry button. It has its own case
+      // above now.
+      //
+      // What remains here all means the same thing to someone looking at an
+      // empty page: this is not your fault and there is nothing to fix here.
       return {
         title: `Could not load ${subject}`,
         message:
