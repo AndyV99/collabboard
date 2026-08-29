@@ -36,11 +36,21 @@ import { logEvent } from "@/lib/log";
 type Context = { params: Promise<{ path: string[] }> };
 
 /**
- * The relayed body, wrapped so that a legitimate JSON `null` and a 204 stay
- * distinguishable. Without the wrapper `parse` returning null would mean
- * "malformed", which is the one thing a pass-through must not invent.
+ * The relayed answer, wrapped so that nothing about it has to be invented here.
+ *
+ * Two things need carrying and neither survives an `ApiResult` on its own:
+ *
+ * - **`empty`**, so a legitimate JSON `null` and a 204 stay distinguishable.
+ *   Without it, `parse` returning null would mean "malformed", which is the one
+ *   thing a pass-through must not invent.
+ * - **`status`**, so the API's own 2xx reaches the browser. `Response.json`
+ *   defaults to 200, and every create route on the Go side answers **201** —
+ *   `POST /projects`, `/projects/:id/boards`, `/boards/:id/columns`,
+ *   `/columns/:id/cards` and `/members` — so without this the module comment
+ *   above ("relayed with the API's own status") was true of failures and false
+ *   of everything else.
  */
-type Relayed = { value: unknown; empty: boolean };
+type Relayed = { value: unknown; empty: boolean; status: number };
 
 function passthrough(method: HttpMethod, path: string, body: unknown): Endpoint<Relayed> {
   return {
@@ -51,7 +61,7 @@ function passthrough(method: HttpMethod, path: string, body: unknown): Endpoint<
     // proxied routes is DELETE. Setting it unconditionally costs nothing and
     // avoids encoding "which methods answer 204" in two places.
     expectNoContent: true,
-    parse: (value) => ({ value: value ?? null, empty: value === undefined }),
+    parse: (value, status) => ({ value: value ?? null, empty: value === undefined, status }),
   };
 }
 
@@ -130,11 +140,19 @@ async function handle(request: NextRequest, context: Context): Promise<Response>
     return Response.json(proxyErrorBody(result.error), { status, headers });
   }
 
+  // `result.data.status` rather than a literal, in both branches. The empty one
+  // is reached for a 204 and a 205, and hard-coding 204 there would rewrite a
+  // 205 into something with different semantics — the same class of quiet
+  // rewrite this issue is about, one status along.
   if (result.data.empty) {
-    return new Response(null, { status: 204, headers: { "cache-control": "no-store" } });
+    return new Response(null, {
+      status: result.data.status,
+      headers: { "cache-control": "no-store" },
+    });
   }
 
   return Response.json(result.data.value, {
+    status: result.data.status,
     headers: { "cache-control": "no-store" },
   });
 }

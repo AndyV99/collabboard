@@ -61,6 +61,15 @@ export type HttpMethod = "GET" | "POST" | "PATCH" | "DELETE";
  * returns null when it is not the promised shape, which becomes a `malformed`
  * error rather than a value the UI would go on to render as `undefined`.
  *
+ * It is also handed the **response status**, which every parser in
+ * `lib/api/types.ts` ignores because a card is a card whether it arrived as a
+ * 200 or a 201. The one parser that does not ignore it is the pass-through in
+ * `app/api/proxy/[...path]/route.ts`, which has to relay the API's own status
+ * rather than inventing one — and this is the narrowest place to carry it, since
+ * widening `ApiResult`'s success arm would make every other caller acknowledge a
+ * number none of them wants. A parser that takes one argument still satisfies
+ * this type, so no existing definition had to change.
+ *
  * `expectNoContent` marks the endpoints that answer 204 (`DELETE /cards/:id`,
  * `POST /auth/logout`). Their `parse` is called with `undefined` rather than
  * skipped, which is what lets the proxy's pass-through parser tell an empty
@@ -70,7 +79,7 @@ export type Endpoint<T> = {
   method: HttpMethod;
   path: string;
   body?: unknown;
-  parse: (value: unknown) => T | null;
+  parse: (value: unknown, status: number) => T | null;
   expectNoContent?: boolean;
 };
 
@@ -169,7 +178,7 @@ async function readResponse<T>(
     // handing `parse` an `undefined` would silently become `malformed` with a
     // less useful reason. Both go through the same door on purpose.
     return endpoint.expectNoContent === true
-      ? ok(endpoint.parse(undefined) as T)
+      ? ok(endpoint.parse(undefined, response.status) as T)
       : err(malformedError(response.status));
   }
 
@@ -192,7 +201,7 @@ async function readResponse<T>(
     );
   }
 
-  const parsed = endpoint.parse(payload);
+  const parsed = endpoint.parse(payload, response.status);
 
   return parsed === null ? err(malformedError(response.status)) : ok(parsed);
 }
