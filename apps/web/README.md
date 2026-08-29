@@ -9,7 +9,8 @@ sign in, sign out, route protection),
 boards and the people in an organization — and
 [the board view](#the-board-view-columns-and-cards), which renders a board's
 columns and cards and lets you edit them: create, rename, reorder and delete
-columns, create, edit and delete cards, and
+columns, create, edit and delete cards,
+[assign one and give it a due date](#who-has-this-and-when-is-it-due), and
 [move a card](#moving-a-card-the-headline-interaction) by dragging it or with
 the keyboard — and, since #66, [live updates](#live-updates-66): a card moved or
 edited by somebody else appears on every open board in about ten milliseconds.
@@ -672,19 +673,27 @@ client carrying its own ordering model would be computing anchors against a list
 nobody else agrees with, and a stale anchor is a 409 rather than a wrong-looking
 success.
 
-### Three requests for the whole board, never one per card
+### Five requests for the whole board, never one per card
 
 `GET /boards/:id`, `GET /boards/:id/columns`, `GET /boards/:id/cards`, plus
-`GET /projects/:id` for the breadcrumb. All four in one `Promise.all`, because
-none depends on another's answer — the tempting "read the board, then read its
-contents only if it exists" is a waterfall that doubles time to first paint on
-every successful load to save two requests on the rare failing one.
+`GET /projects/:id` for the breadcrumb and `GET /members` for the assignee
+picker. All five in one `Promise.all`, because none depends on another's answer
+— the tempting "read the board, then read its contents only if it exists" is a
+waterfall that doubles time to first paint on every successful load to save two
+requests on the rare failing one.
 
 `GET /boards/:id/cards` returns the entire board, so the request count does not
 move with the number of cards. Measured against the production build and a real
 API: a 240-card board renders in a median 15 ms (TTFB 10 ms) and makes the same
-five API requests as a five-card one. 284 kB of HTML, 25 kB over the wire
-compressed.
+API requests as a five-card one. 284 kB of HTML, 25 kB over the wire compressed.
+(Measured before #157 added `GET /members`. It joins the same `Promise.all`, so
+it costs time only if it is the slowest of the five.)
+
+`GET /members` is the one read here whose failure is **not** fatal to the
+screen. Columns and cards are the board; members are an annotation on it, and a
+workspace whose directory is briefly unreachable should still be able to read,
+move, write and reorder its cards. So its failure is passed down as `null`, and
+the assignee picker is the only thing that goes away.
 
 Only `GET /boards/:id` distinguishes a board that does not exist from one that
 does. The two list endpoints answer `200 []` for an unknown board id, because
@@ -714,17 +723,21 @@ checks the two 404 cases, groups the responses, and hands plain serialisable
 props to one client boundary:
 
 ```
-page.tsx                     Server Component: four requests, the 404 checks,
+page.tsx                     Server Component: five requests, the 404 checks,
                              and the grouping. The only async thing here.
 lib/board/snapshot.ts        pure: columns × cards → the board's shape
 lib/board/mutations.ts       pure: snapshot + one edit → the next snapshot
+lib/board/due.ts             pure: a due date's label, lateness, and control
+lib/board/assignee.ts        pure: a user id → a name, and a name → initials
 components/boards/board-view.tsx      "use client": the optimistic store, the
                                       columns, and the detail panel
 components/boards/board-mutation.ts   apply → send → refresh, for one edit
 components/boards/board-controls.tsx  the composers and the column tools
-components/boards/card-drag.tsx       the pointer gesture, and one card's grip
+components/boards/card-drag.tsx       the pointer gesture, one card's grip, and
+                                      the face every tile is drawn with
 components/boards/card-moves.ts       moves, queued per card, and the 409
 components/boards/card-detail.tsx     one card, read or editable
+components/boards/use-due-clock.ts    the reader's clock, absent until hydrated
 components/boards/board-skeleton.tsx  the loading.tsx fallback
 ```
 
@@ -753,6 +766,46 @@ The three rules that came with the boundary, all still in force:
 
 Selection is a URL rather than state, so there is nothing to lift into a
 provider either.
+
+### Who has this, and when is it due
+
+`assignee_id` and `due_at` are on every card body, and both are shown on the
+tile as well as in the panel — a board is scanned rather than opened, and an
+answer that needs a click is not an answer to "who has this".
+
+Two decisions worth knowing.
+
+**Unassigning is a value, not an omission.** Both columns are nullable and the
+API reads the two fields through `Optional[string]`, so absent ("leave it
+alone"), `null` ("clear it") and a value ("set it") are three different
+requests. `lib/api/endpoints.ts` builds the PATCH body key by key rather than
+spreading its argument, because `JSON.stringify` deletes an `undefined` and
+would silently turn "unassign this card" into "change nothing". `BoardChange`
+carries the same three states into the optimistic board, which is why the
+reducer uses `=== undefined` for these two fields where it uses `??` for the
+other two.
+
+**The due date is the only thing this app renders in the reader's own zone.**
+Everything else is formatted in a fixed UTC (see `lib/workspace/format.ts` for
+why), and for a `created_at` that is right. For a deadline it is not: 23:00Z on
+the 31st is the *1st* to a reader in Auckland, and a board that says "31 Aug"
+tells them a card is due yesterday.
+
+The server cannot know the reader's zone, so `useDueClock` returns `null` until
+the browser has hydrated — via `useSyncExternalStore`, whose `getServerSnapshot`
+makes that a contract rather than a side effect of when effects run. While it is
+null the date renders in the fixed UTC form with the zone named, and **nothing
+claims the card is late**: a lateness computed on the server is computed against
+a machine in another country and would be re-rendered as its opposite a frame
+later. Once there is a clock the label switches to the reader's zone and the
+overdue marker appears, and a one-minute tick keeps it true on a board left
+open.
+
+Lateness itself is zone-independent — it is one instant compared with another —
+so `isOverdue` never asks for a zone. The test suite runs in `Pacific/Auckland`
+(`vitest.config.mts`) so that none of this can pass by accident of the machine
+being in UTC, and `__tests__/board-view.test.tsx` renders the server's HTML with
+`renderToString` and hydrates it, asserting React reports no mismatch.
 
 ### Moving a card: the headline interaction
 

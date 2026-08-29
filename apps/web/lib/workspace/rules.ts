@@ -31,6 +31,7 @@
  */
 
 import { byteLength, codePointLength } from "@/lib/auth/rules";
+import { sameDue } from "@/lib/board/due";
 
 /** `maxNameLength` in `apps/api/internal/api/crud.go`. Code points. */
 export const MAX_NAME_CODE_POINTS = 200;
@@ -136,24 +137,69 @@ export function validateCardTitle(value: string): FieldError {
 }
 
 /**
+ * A due date, as the card editor collects it.
+ *
+ * Mirrors `parseDueAt` in `apps/api/internal/api/cardfields.go`, which answers
+ * 400 for anything `time.Parse(time.RFC3339, ...)` refuses. Blank is not a
+ * failure: an empty control is "no due date", which `PATCH /cards/:id` accepts
+ * as a null and treats as a request to clear the field.
+ *
+ * This is looser than the API in one direction and never stricter, which is the
+ * rule this file exists to keep. `Date` accepts a few forms `time.RFC3339` does
+ * not — a date with no time, most usefully — and `lib/board/due.ts` converts
+ * whatever it accepted into an instant with an offset before it is sent, so the
+ * request the API sees is always one it can parse.
+ *
+ * Reachable at all only because `<input type="datetime-local">` degrades to a
+ * plain text box where it is unsupported. Where it is supported the browser is
+ * already refusing everything below.
+ */
+export function validateDueAt(value: string): FieldError {
+  const trimmed = value.trim();
+
+  if (trimmed === "") {
+    return undefined;
+  }
+
+  if (Number.isNaN(new Date(trimmed).getTime())) {
+    return "Enter a date and time, or clear the field to remove the due date.";
+  }
+
+  return undefined;
+}
+
+/** The four fields of a card that `PATCH /cards/:id` can change. */
+export type CardFields = {
+  title: string;
+  description: string;
+  assigneeId: string | null;
+  dueAt: string | null;
+};
+
+/**
  * Whether a card edit would say anything.
  *
- * `patchCardHandler` answers 400 for a body that mentions neither field ("at
- * least one of title or description is required"), so submitting an untouched
- * card would collect an error for doing nothing.
+ * `patchCardHandler` answers 400 for a body that mentions none of the four
+ * fields ("at least one of title, description, assignee_id or due_at is
+ * required"), so submitting an untouched card would collect an error for doing
+ * nothing.
  *
  * The comparison is against the *trimmed* input because the API trims before it
  * stores: a title with a trailing space added is not a change the server would
  * record, so offering to save it would produce a write that changes nothing and
  * a board that re-renders identically.
+ *
+ * The due date is compared with {@link sameDue} rather than by string, because
+ * the control that collects it has minute granularity and the stored value does
+ * not — see its comment for why comparing instants here would send a PATCH
+ * every time somebody opened a card and pressed Save.
  */
-export function cardChanged(
-  current: { title: string; description: string },
-  next: { title: string; description: string },
-): boolean {
+export function cardChanged(current: CardFields, next: CardFields): boolean {
   return (
     current.title !== next.title.trim() ||
-    current.description !== next.description.trim()
+    current.description !== next.description.trim() ||
+    current.assigneeId !== next.assigneeId ||
+    !sameDue(current.dueAt, next.dueAt)
   );
 }
 

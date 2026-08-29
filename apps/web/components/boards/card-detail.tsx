@@ -4,8 +4,10 @@ import Link from "next/link";
 import { useRouter } from "next/navigation";
 import { type FormEvent, useEffect, useId, useRef, useState } from "react";
 
-import { deleteCard, updateCard } from "@/lib/api/endpoints";
-import type { Card } from "@/lib/api/types";
+import { type CardPatch, deleteCard, updateCard } from "@/lib/api/endpoints";
+import type { Card, Member } from "@/lib/api/types";
+import { assigneeName } from "@/lib/board/assignee";
+import { dueFromInput, dueLabel, dueToInput, isOverdue, sameDue } from "@/lib/board/due";
 import type { BoardChange } from "@/lib/board/mutations";
 import { isPendingId } from "@/lib/board/mutations";
 import { formatDateTime } from "@/lib/workspace/format";
@@ -16,8 +18,9 @@ import {
   maxLengthFor,
   validateCardTitle,
   validateDescription,
+  validateDueAt,
 } from "@/lib/workspace/rules";
-import { TextAreaField, TextField } from "@/components/workspace/fields";
+import { SelectField, TextAreaField, TextField } from "@/components/workspace/fields";
 import { useBoardMutation } from "./board-mutation";
 import styles from "./board.module.css";
 import workspace from "@/components/workspace/workspace.module.css";
@@ -28,12 +31,14 @@ import workspace from "@/components/workspace/workspace.module.css";
  * # Every field the API exposes, and nothing it does not
  *
  * `cardBody` in `apps/api/internal/api/cards.go` is `id`, `board_id`,
- * `column_id`, `title`, `description`, `created_at`, `updated_at`. All seven
- * are accounted for here, three of them by being somewhere better than a row in
- * a table:
+ * `column_id`, `title`, `description`, `assignee_id`, `due_at`, `created_at`,
+ * `updated_at`. All nine are accounted for here, three of them by being
+ * somewhere better than a row in a table:
  *
- * - **`title`** is the heading, **`description`** the body, **`created_at`**
- *   and **`updated_at`** the two facts underneath.
+ * - **`title`** is the heading, **`description`** the body, **`assignee_id`**,
+ *   **`due_at`**, **`created_at`** and **`updated_at`** the four facts
+ *   underneath. The first two of those are also on the tile, because a board is
+ *   scanned rather than opened — see `CardFace` in `card-drag.tsx`.
  * - **`column_id`** is shown as the column's *name*, resolved from the columns
  *   the page already has. An opaque uuid tells a user nothing; the column is
  *   the one piece of a card's state that is not visible from the card itself.
@@ -85,13 +90,29 @@ export type CardDetailProps = {
   card: Card;
   /** The name of the column the card is in, or null when it is not shown. */
   columnName: string | null;
+  /**
+   * Everyone in the workspace, for the assignee picker and for naming the
+   * current assignee. Null when `GET /members` did not load — the panel then
+   * shows the card without offering to reassign it, rather than offering a
+   * picker with nobody in it.
+   */
+  members: readonly Member[] | null;
+  /** The reader's clock, or null before there is one. See `use-due-clock.ts`. */
+  now: number | null;
   /** The board without this card open — where the close link goes. */
   closeHref: string;
   /** Omit to render the card read-only. */
   editing?: CardEditing;
 };
 
-export function CardDetail({ card, columnName, closeHref, editing }: CardDetailProps) {
+export function CardDetail({
+  card,
+  columnName,
+  members,
+  now,
+  closeHref,
+  editing,
+}: CardDetailProps) {
   const [mode, setMode] = useState<"read" | "edit" | "delete">("read");
 
   // A card the server has not acknowledged has no id to address, so there is
@@ -112,6 +133,7 @@ export function CardDetail({ card, columnName, closeHref, editing }: CardDetailP
         card={card}
         closeHref={closeHref}
         editing={editing}
+        members={members}
         onDone={() => setMode("read")}
       />
     );
@@ -119,6 +141,9 @@ export function CardDetail({ card, columnName, closeHref, editing }: CardDetailP
 
   const created = formatDateTime(card.createdAt);
   const updated = formatDateTime(card.updatedAt);
+  const assignee = card.assigneeId === null ? null : assigneeName(members, card.assigneeId);
+  const due = dueLabel(card.dueAt, now);
+  const overdue = now !== null && isOverdue(card.dueAt, now);
 
   return (
     <article aria-labelledby="card-title" className={styles.detail} id="card">
@@ -145,6 +170,32 @@ export function CardDetail({ card, columnName, closeHref, editing }: CardDetailP
            * contain — the two-requests-are-not-one-snapshot case. Saying so is
            * better than printing a uuid or leaving the row blank. */}
           {columnName ?? "Not in a column shown on this board"}
+        </dd>
+
+        <dt className={styles.detailTerm}>Assignee</dt>
+        <dd className={styles.detailValue}>
+          {card.assigneeId === null
+            ? "Nobody"
+            : (assignee ??
+              // Assigned, and this page cannot say to whom — a member list that
+              // did not load, or one read before the member was added. The uuid
+              // is deliberately not printed: it would name the person to nobody
+              // and expose a user id to everybody.
+              "Someone not in this workspace's member list")}
+        </dd>
+
+        <dt className={styles.detailTerm}>Due</dt>
+        <dd className={styles.detailValue}>
+          {due === null ? (
+            "No due date"
+          ) : (
+            <time dateTime={card.dueAt ?? undefined}>
+              {due}
+              {overdue && (
+                <span className={styles.detailOverdue}> — overdue</span>
+              )}
+            </time>
+          )}
         </dd>
 
         {created !== null && (
@@ -194,30 +245,67 @@ export function CardDetail({ card, columnName, closeHref, editing }: CardDetailP
 }
 
 /**
- * The card's title and description, as a form.
+ * The picker's options: everyone in the workspace, and nobody.
+ *
+ * The empty option is first and is not a placeholder — it is the value that
+ * unassigns the card, which is the request `Optional[string]` exists on the API
+ * side to make expressible. A picker that opened on the current assignee with
+ * no way back to "nobody" would waste that, and there would be no other way to
+ * take a card off somebody.
+ *
+ * The address is beside the name because display names are not unique and two
+ * people called Alex are otherwise the same option twice.
+ */
+function assigneeOptions(
+  members: readonly Member[],
+): readonly { value: string; label: string }[] {
+  return [
+    { value: "", label: "Unassigned" },
+    ...members.map((member) => ({
+      value: member.userId,
+      label: `${member.displayName} (${member.email})`,
+    })),
+  ];
+}
+
+/**
+ * The card's title, description, assignee and due date, as a form.
  *
  * # Only what changed is sent
  *
- * `PATCH /cards/:id` takes both fields as nullable pointers and leaves out what
- * it is not given, so sending only the edited field is not an optimisation —
- * it is the difference between renaming a card and overwriting a colleague's
- * description with the copy this page loaded a minute ago. The card body is
- * whole in the response either way, so nothing here has to merge.
+ * `PATCH /cards/:id` leaves out what it is not given, so sending only the edited
+ * field is not an optimisation — it is the difference between renaming a card
+ * and overwriting a colleague's description with the copy this page loaded a
+ * minute ago. The card body is whole in the response either way, so nothing here
+ * has to merge.
  *
  * A form that changed nothing closes instead of submitting: the handler answers
- * 400 to a body mentioning neither field, and "at least one of title or
- * description is required" is a strange thing to tell somebody who pressed Save
- * on a card they did not touch.
+ * 400 to a body mentioning none of the four fields, and "at least one of title,
+ * description, assignee_id or due_at is required" is a strange thing to tell
+ * somebody who pressed Save on a card they did not touch.
  *
- * # The limits are the API's own
+ * # Unassigning is a value, not an omission
+ *
+ * The assignee and the due date reach nullable columns, and the API reads both
+ * through `Optional[string]` so that **absent** ("leave it alone") and **null**
+ * ("clear it") are different requests. That is the whole reason the picker has
+ * an empty option and the date field can be emptied: a form that could only ever
+ * *set* those fields would let a card be assigned by mistake and never handed
+ * back. `CardPatch` in `lib/api/endpoints.ts` carries the same three states
+ * across the wire, and `BoardChange` carries them into the optimistic board, so
+ * the unassignment is drawn the moment it is asked for rather than a round trip
+ * later.
+ *
+ * # The limits and the formats are the API's own
  *
  * 200 code points on the title and 10,000 on the description, from
  * `maxNameLength` and `maxDescriptionLength` in `crud.go`, counted with
  * `codePointLength` because the service counts with `utf8.RuneCountInString`
- * and `String.length` is neither bytes nor code points. Both are checked before
- * the request rather than after the 400, and neither is stricter than the
- * service — a client-side rule the server would have accepted is a refusal with
- * no authority behind it.
+ * and `String.length` is neither bytes nor code points. The due date is
+ * converted to RFC 3339 **with an offset** by `lib/board/due.ts`, because
+ * `parseDueAt` requires one. All three are checked before the request rather
+ * than after the 400, and none is stricter than the service — a client-side rule
+ * the server would have accepted is a refusal with no authority behind it.
  *
  * An empty description is allowed and clears the field, because
  * `optionalText(..., allowEmpty: true)` says so on the other side. An empty
@@ -227,21 +315,34 @@ function CardEditor({
   card,
   closeHref,
   editing,
+  members,
   onDone,
 }: {
   card: Card;
   closeHref: string;
   editing: CardEditing;
+  members: readonly Member[] | null;
   onDone: () => void;
 }) {
   const ids = useId();
   const titleId = `${ids}-title`;
   const descriptionId = `${ids}-description`;
+  const assigneeId = `${ids}-assignee`;
+  const dueId = `${ids}-due`;
 
   const [title, setTitle] = useState(card.title);
   const [description, setDescription] = useState(card.description);
+  // "" is the empty option, which is what makes unassigning reachable. A select
+  // whose value is `string | null` would need the null spelled as some sentinel
+  // in the DOM anyway; "" is the sentinel the platform already has.
+  const [assignee, setAssignee] = useState(card.assigneeId ?? "");
+  // Read once, in the reader's own zone. This component only ever mounts in a
+  // browser — it is behind an Edit button — so there is no server render here to
+  // disagree with, which is why the panel needs `now` and this form does not.
+  const [due, setDue] = useState(() => dueToInput(card.dueAt));
   const [titleError, setTitleError] = useState<string | undefined>(undefined);
   const [descriptionError, setDescriptionError] = useState<string | undefined>(undefined);
+  const [dueError, setDueError] = useState<string | undefined>(undefined);
 
   const titleRef = useRef<HTMLInputElement | null>(null);
   const { run, pending } = useBoardMutation(editing.applyChange, editing.report);
@@ -260,26 +361,38 @@ function CardEditor({
     const problems = {
       title: validateCardTitle(title),
       description: validateDescription(description),
+      due: validateDueAt(due),
     };
 
     setTitleError(problems.title);
     setDescriptionError(problems.description);
+    setDueError(problems.due);
 
-    if (problems.title !== undefined || problems.description !== undefined) {
+    if (
+      problems.title !== undefined ||
+      problems.description !== undefined ||
+      problems.due !== undefined
+    ) {
       return;
     }
 
-    if (!cardChanged(card, { title, description })) {
+    const next = {
+      title: title.trim(),
+      description: description.trim(),
+      assigneeId: assignee === "" ? null : assignee,
+      dueAt: dueFromInput(due),
+    };
+
+    if (!cardChanged(card, next)) {
       onDone();
 
       return;
     }
 
-    const next = { title: title.trim(), description: description.trim() };
-
     // Only the fields that actually differ, so an edit to one cannot overwrite
-    // somebody else's edit to the other.
-    const body: { title?: string; description?: string } = {};
+    // somebody else's edit to another. A key left out is "leave it alone"; a key
+    // present and null is "clear it" — see `CardPatch`.
+    const body: CardPatch = {};
 
     if (next.title !== card.title) {
       body.title = next.title;
@@ -287,6 +400,17 @@ function CardEditor({
 
     if (next.description !== card.description) {
       body.description = next.description;
+    }
+
+    if (next.assigneeId !== card.assigneeId) {
+      body.assigneeId = next.assigneeId;
+    }
+
+    // `sameDue` and not `!==`, because the control has minute granularity and
+    // the stored value does not: comparing the strings would send a PATCH for a
+    // card due at 17:00:30 every time somebody opened it and pressed Save.
+    if (!sameDue(next.dueAt, card.dueAt)) {
+      body.dueAt = next.dueAt;
     }
 
     run({
@@ -331,6 +455,38 @@ function CardEditor({
           optional
           rows={6}
           value={description}
+        />
+
+        {members === null ? (
+          // No picker rather than an empty one. `GET /members` did not answer,
+          // so the only options this form could offer are none — and a control
+          // whose sole choice is "Unassigned" is a button that silently
+          // unassigns the card.
+          <p className={styles.detailEmpty}>
+            The member list did not load, so the assignee cannot be changed here.
+            Reload the board to try again — the rest of this form still works.
+          </p>
+        ) : (
+          <SelectField
+            disabled={pending}
+            id={assigneeId}
+            label="Assignee"
+            onChange={setAssignee}
+            options={assigneeOptions(members)}
+            value={assignee}
+          />
+        )}
+
+        <TextField
+          disabled={pending}
+          error={dueError}
+          hint="In your own time zone. Clear the field to remove the due date."
+          id={dueId}
+          label="Due"
+          onChange={setDue}
+          optional
+          type="datetime-local"
+          value={due}
         />
 
         <div className={styles.composerActions}>

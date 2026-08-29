@@ -61,11 +61,18 @@ export function changeFor(event: RealtimeEvent): BoardChange | null {
       return { kind: "card.created", columnId: event.card.columnId, card: event.card };
 
     case "card.updated":
+      // Every field stated, none of them optional here. The payload is the
+      // *whole* card — `patchCardHandler` publishes `newCardBody(card)` rather
+      // than the fields that changed, precisely so a client can replace one
+      // wholesale — so "leave it alone" is not a thing this event can mean, and
+      // an unassignment arrives as the null it is.
       return {
         kind: "card.updated",
         cardId: event.card.id,
         title: event.card.title,
         description: event.card.description,
+        assigneeId: event.card.assigneeId,
+        dueAt: event.card.dueAt,
       };
 
     case "card.moved":

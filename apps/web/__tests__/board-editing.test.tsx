@@ -94,6 +94,11 @@ function card(id: string, columnId: string, title: string, description = "") {
     columnId,
     title,
     description,
+    // Widened, because the assignment tests below build cards that have one.
+    // The inferred type of a bare `null` is `null`, which would make every such
+    // fixture a type error rather than a card.
+    assigneeId: null as string | null,
+    dueAt: null as string | null,
     createdAt: "2026-08-02T09:00:00Z",
     updatedAt: "2026-08-02T09:00:00Z",
   };
@@ -125,10 +130,37 @@ function cardBody(id: string, columnId: string, title: string, description = "")
     column_id: columnId,
     title,
     description,
+    assignee_id: null,
+    due_at: null,
     created_at: "2026-08-02T09:00:00Z",
     updated_at: "2026-08-02T09:00:00Z",
   };
 }
+
+/**
+ * The workspace's members, as `GET /members` returns them.
+ *
+ * Two, with different initials, because one member cannot tell an avatar that
+ * resolved the right name from one that resolved the only name there was.
+ */
+const MEMBERS = [
+  {
+    membershipId: "mem-1",
+    userId: "user-dana",
+    email: "dana@example.test",
+    displayName: "Dana Okoro",
+    role: "admin",
+    joinedAt: "2026-07-01T09:00:00Z",
+  },
+  {
+    membershipId: "mem-2",
+    userId: "user-sam",
+    email: "sam@example.test",
+    displayName: "Sam Ito",
+    role: "member",
+    joinedAt: "2026-07-02T09:00:00Z",
+  },
+];
 
 const COLUMNS = [column("c-todo", "To do"), column("c-doing", "Doing"), column("c-done", "Done")];
 
@@ -143,10 +175,12 @@ function renderBoard(
   columns: ReturnType<typeof column>[] = COLUMNS,
   cards: ReturnType<typeof card>[] = CARDS,
   selectedCardId: string | null = null,
+  members: typeof MEMBERS | null = MEMBERS,
 ) {
   return render(
     <BoardView
       boardId={BOARD}
+      members={members}
       projectId={PROJECT}
       selectedCardId={selectedCardId}
       snapshot={groupCardsIntoColumns(columns as never, cards as never)}
@@ -486,6 +520,7 @@ describe("adding a card", () => {
     view.rerender(
       <BoardView
         boardId={BOARD}
+        members={MEMBERS}
         projectId={PROJECT}
         selectedCardId={null}
         snapshot={groupCardsIntoColumns(COLUMNS as never, [
@@ -790,6 +825,7 @@ describe("deleting a column", () => {
     view.rerender(
       <BoardView
         boardId={BOARD}
+        members={MEMBERS}
         projectId={PROJECT}
         selectedCardId={null}
         snapshot={groupCardsIntoColumns(
@@ -900,6 +936,194 @@ describe("editing a card", () => {
 
     expect(screen.getByText("Give the card a title.")).toBeInTheDocument();
     expect(fetchStub).not.toHaveBeenCalled();
+  });
+
+  /*
+   * Assignment and due dates (#157).
+   *
+   * The interesting half of these is not that a field can be set — it is that
+   * **clearing** one is a different request from leaving it alone. The API
+   * reads both fields through `Optional[string]` precisely so that a body
+   * carrying `"assignee_id": null` unassigns the card while a body not
+   * mentioning it leaves the assignee where it was, and a client that could
+   * only ever set them would let a card be assigned by mistake and never handed
+   * back.
+   */
+  function assignedCard() {
+    return {
+      ...card("card-2", "c-doing", "Kilo", "Some detail"),
+      assigneeId: "user-dana",
+      // 23:00 UTC on the 31st, which is 11:00 on the 1st where this suite runs.
+      dueAt: "2026-08-31T23:00:00Z",
+    };
+  }
+
+  function openEditorFor(
+    cards: ReturnType<typeof card>[],
+    members: typeof MEMBERS | null = MEMBERS,
+  ) {
+    renderBoard(COLUMNS, cards, "card-2", members);
+    fireEvent.click(screen.getByRole("button", { name: "Edit card" }));
+  }
+
+  it("assigns a card by sending the member's user id", async () => {
+    const fetchStub = respond(200, { card: cardBody("card-2", "c-doing", "Kilo") });
+
+    vi.stubGlobal("fetch", withRealtime(fetchStub));
+    openEditor();
+    fireEvent.change(screen.getByLabelText("Assignee"), {
+      target: { value: "user-dana" },
+    });
+    fireEvent.submit(screen.getByRole("button", { name: "Save card" }).closest("form")!);
+
+    await waitFor(() => expect(fetchStub).toHaveBeenCalled());
+    expect(sentBody(fetchStub)).toEqual({ assignee_id: "user-dana" });
+  });
+
+  it("offers the real members, and the empty option that unassigns", () => {
+    const fetchStub = respond(200, {});
+
+    vi.stubGlobal("fetch", withRealtime(fetchStub));
+    openEditor();
+
+    // The address is beside the name because display names are not unique, and
+    // two colleagues called Alex would otherwise be the same option twice.
+    expect(
+      within(screen.getByLabelText("Assignee"))
+        .getAllByRole("option")
+        .map((option) => option.textContent),
+    ).toEqual([
+      "Unassigned",
+      "Dana Okoro (dana@example.test)",
+      "Sam Ito (sam@example.test)",
+    ]);
+  });
+
+  it("unassigns by sending a null, not by omitting the field", async () => {
+    const fetchStub = respond(200, { card: cardBody("card-2", "c-doing", "Kilo") });
+
+    vi.stubGlobal("fetch", withRealtime(fetchStub));
+    openEditorFor([assignedCard(), CARDS[3]]);
+    fireEvent.change(screen.getByLabelText("Assignee"), { target: { value: "" } });
+    fireEvent.submit(screen.getByRole("button", { name: "Save card" }).closest("form")!);
+
+    await waitFor(() => expect(fetchStub).toHaveBeenCalled());
+    // An omitted key would be "leave the assignee alone", and the card would
+    // come back still assigned to somebody the user just took it off.
+    expect(sentBody(fetchStub)).toEqual({ assignee_id: null });
+  });
+
+  it("sends a due date as an instant with an offset, read from the reader's clock", async () => {
+    const fetchStub = respond(200, { card: cardBody("card-2", "c-doing", "Kilo") });
+
+    vi.stubGlobal("fetch", withRealtime(fetchStub));
+    openEditor();
+    fireEvent.change(screen.getByLabelText(/^Due/), {
+      target: { value: "2026-09-01T11:00" },
+    });
+    fireEvent.submit(screen.getByRole("button", { name: "Save card" }).closest("form")!);
+
+    await waitFor(() => expect(fetchStub).toHaveBeenCalled());
+    // The control has no zone; the reader's is +12 here. Sending the wall clock
+    // as though it were UTC would move the deadline twelve hours, and
+    // `parseDueAt` requires the offset anyway.
+    expect(sentBody(fetchStub)).toEqual({ due_at: "2026-08-31T23:00:00.000Z" });
+  });
+
+  it("opens the due date in the reader's own wall clock", () => {
+    const fetchStub = respond(200, {});
+
+    vi.stubGlobal("fetch", withRealtime(fetchStub));
+    openEditorFor([assignedCard(), CARDS[3]]);
+
+    expect(screen.getByLabelText(/^Due/)).toHaveValue("2026-09-01T11:00");
+  });
+
+  it("clears a due date by emptying the field", async () => {
+    const fetchStub = respond(200, { card: cardBody("card-2", "c-doing", "Kilo") });
+
+    vi.stubGlobal("fetch", withRealtime(fetchStub));
+    openEditorFor([assignedCard(), CARDS[3]]);
+    fireEvent.change(screen.getByLabelText(/^Due/), { target: { value: "" } });
+    fireEvent.submit(screen.getByRole("button", { name: "Save card" }).closest("form")!);
+
+    await waitFor(() => expect(fetchStub).toHaveBeenCalled());
+    expect(sentBody(fetchStub)).toEqual({ due_at: null });
+  });
+
+  it("does not resend a due date whose seconds the control cannot show", () => {
+    const fetchStub = respond(200, {});
+    const withSeconds = { ...assignedCard(), dueAt: "2026-08-31T23:00:30Z" };
+
+    vi.stubGlobal("fetch", withRealtime(fetchStub));
+    openEditorFor([withSeconds, CARDS[3]]);
+    fireEvent.submit(screen.getByRole("button", { name: "Save card" }).closest("form")!);
+
+    // Opening a card and pressing Save must not quietly move its deadline
+    // thirty seconds earlier — which is what a string comparison would do here.
+    expect(fetchStub).not.toHaveBeenCalled();
+    expect(screen.getByRole("heading", { name: "Kilo" })).toBeInTheDocument();
+  });
+
+  it("shows the new assignee on the tile before the answer arrives", async () => {
+    const { fetchStub, settle } = pending();
+
+    vi.stubGlobal("fetch", withRealtime(fetchStub));
+    openEditor();
+    fireEvent.change(screen.getByLabelText("Assignee"), {
+      target: { value: "user-sam" },
+    });
+    fireEvent.submit(screen.getByRole("button", { name: "Save card" }).closest("form")!);
+
+    // Optimistic, like every other board mutation — assignment should not be
+    // the one control that waits.
+    const doing = await screen.findByRole("list", { name: "Doing" });
+
+    await waitFor(() =>
+      expect(within(doing).getByText("assigned to Sam Ito")).toBeInTheDocument(),
+    );
+
+    settle(200, { card: cardBody("card-2", "c-doing", "Kilo", "Some detail") });
+  });
+
+  it("ROLLBACK: puts the assignee back on the tile when the save is refused", async () => {
+    const { fetchStub, settle } = pending();
+
+    vi.stubGlobal("fetch", withRealtime(fetchStub));
+    openEditorFor([assignedCard(), CARDS[3]]);
+    fireEvent.change(screen.getByLabelText("Assignee"), { target: { value: "" } });
+    fireEvent.submit(screen.getByRole("button", { name: "Save card" }).closest("form")!);
+
+    const doing = await screen.findByRole("list", { name: "Doing" });
+
+    await waitFor(() =>
+      expect(within(doing).queryByText("assigned to Dana Okoro")).not.toBeInTheDocument(),
+    );
+
+    // 400 is the answer to an assignee this organization cannot assign to —
+    // `assigneeNotAMember` — and the same shape covers a refused unassignment.
+    settle(400, { error: "assignee_id must name a member of this organization" });
+
+    await waitFor(() =>
+      expect(within(doing).getByText("assigned to Dana Okoro")).toBeInTheDocument(),
+    );
+    expect(failureBanner()).toHaveTextContent(/member of this organization/);
+  });
+
+  it("says why the assignee cannot be changed when the member list did not load", () => {
+    const fetchStub = respond(200, {});
+
+    vi.stubGlobal("fetch", withRealtime(fetchStub));
+    openEditorFor([assignedCard(), CARDS[3]], null);
+
+    // No picker rather than an empty one: a control whose only option is
+    // "Unassigned" is a button that silently unassigns the card.
+    expect(screen.queryByLabelText("Assignee")).not.toBeInTheDocument();
+    expect(screen.getByText(/member list did not load/)).toBeInTheDocument();
+    // The rest of the form still works, which is the point of not failing the
+    // whole board over it.
+    expect(screen.getByLabelText("Title")).toBeInTheDocument();
+    expect(screen.getByLabelText(/^Due/)).toBeInTheDocument();
   });
 
   it("ROLLBACK: puts the old title back on the tile when the save is refused", async () => {

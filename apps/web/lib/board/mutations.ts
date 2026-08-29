@@ -71,7 +71,22 @@ import type { BoardSnapshot, ColumnWithCards } from "./snapshot";
  */
 export type BoardChange =
   | { kind: "card.created"; columnId: string; card: Card }
-  | { kind: "card.updated"; cardId: string; title?: string; description?: string }
+  | {
+      kind: "card.updated";
+      cardId: string;
+      title?: string;
+      description?: string;
+      /**
+       * Absent leaves the assignee alone; **null unassigns**. The same three
+       * states `PATCH /cards/:id` distinguishes, kept apart here for the same
+       * reason — an optimistic board that collapsed null into "no change"
+       * would leave the old assignee on the card until the refresh landed and
+       * then visibly drop them.
+       */
+      assigneeId?: string | null;
+      /** Absent leaves the due date alone; null clears it. */
+      dueAt?: string | null;
+    }
   | { kind: "card.deleted"; cardId: string }
   | { kind: "card.moved"; cardId: string; columnId: string; afterCardId: string | null }
   | { kind: "column.created"; column: Column }
@@ -134,10 +149,16 @@ export function applyBoardChange(
       );
 
     case "card.updated": {
+      // `??` for the two fields where absent and null mean the same thing, and
+      // an explicit `=== undefined` for the two where they do not. A `??` on
+      // `assigneeId` would read a deliberate unassignment as "leave it alone",
+      // which is the one edit this branch would then be unable to draw.
       const edit = (card: Card): Card => ({
         ...card,
         title: change.title ?? card.title,
         description: change.description ?? card.description,
+        assigneeId: change.assigneeId === undefined ? card.assigneeId : change.assigneeId,
+        dueAt: change.dueAt === undefined ? card.dueAt : change.dueAt,
       });
 
       return mapColumns(snapshot, (entry) => ({

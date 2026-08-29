@@ -19,7 +19,9 @@
  * instead of a bare `vi.mock`.
  */
 
-import { render, screen, within } from "@testing-library/react";
+import { act, render, screen, within } from "@testing-library/react";
+import { hydrateRoot } from "react-dom/client";
+import { renderToString } from "react-dom/server";
 import type { ReactNode } from "react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
@@ -50,6 +52,8 @@ vi.mock("next/link", () => ({
 }));
 
 const { BoardView } = await import("@/components/boards/board-view");
+const { CardFace } = await import("@/components/boards/card-drag");
+const { useDueClock } = await import("@/components/boards/use-due-clock");
 const { CardDetail, CardNotOnBoard } = await import("@/components/boards/card-detail");
 const { BoardSkeleton } = await import("@/components/boards/board-skeleton");
 const { groupCardsIntoColumns } = await import("@/lib/board/snapshot");
@@ -73,10 +77,37 @@ function card(id: string, columnId: string, title: string, description = ""): Ca
     columnId,
     title,
     description,
+    assigneeId: null,
+    dueAt: null,
     createdAt: "2026-08-02T09:00:00Z",
     updatedAt: "2026-08-02T14:32:00Z",
   };
 }
+
+/**
+ * The workspace's members, as `GET /members` returns them.
+ *
+ * Two, with different initials, because one member cannot tell an avatar that
+ * resolved the right name from one that resolved the only name there was.
+ */
+const MEMBERS = [
+  {
+    membershipId: "mem-1",
+    userId: "user-dana",
+    email: "dana@example.test",
+    displayName: "Dana Okoro",
+    role: "admin",
+    joinedAt: "2026-07-01T09:00:00Z",
+  },
+  {
+    membershipId: "mem-2",
+    userId: "user-sam",
+    email: "sam@example.test",
+    displayName: "Sam Ito",
+    role: "member",
+    joinedAt: "2026-07-02T09:00:00Z",
+  },
+];
 
 const COLUMNS = [column("c-todo", "To do"), column("c-doing", "Doing")];
 
@@ -97,6 +128,7 @@ function renderBoard(
   return render(
     <BoardView
       boardId={BOARD}
+      members={MEMBERS}
       projectId="p-1"
       selectedCardId={selectedCardId}
       snapshot={groupCardsIntoColumns(columns, cards)}
@@ -188,11 +220,231 @@ describe("BoardView", () => {
   });
 });
 
+/**
+ * A card's assignee and due date, on the tile and in the panel.
+ *
+ * The dates below are years away on purpose. The overdue marker is a comparison
+ * against the real clock, and a fixture due "in a minute" would be a test that
+ * passes today and fails on a slow machine; 2020 is past and 2099 is future for
+ * as long as this code is worth running.
+ *
+ * The *labels* are exact, and they are the reader's own zone —
+ * `vitest.config.mts` runs this suite in Pacific/Auckland, so an instant late
+ * in a UTC day is rendered on the following local day. See
+ * `__tests__/board-due.test.ts` for why that is the interesting case.
+ */
+describe("a card's assignee and due date", () => {
+  const OVERDUE = "2020-01-01T00:00:00Z";
+  const LATER = "2099-08-31T23:00:00Z";
+
+  function assigned(userId: string | null, dueAt: string | null): Card {
+    return { ...card("card-1", "c-doing", "Alpha"), assigneeId: userId, dueAt };
+  }
+
+  it("puts the assignee's initials on the tile and their name in its label", () => {
+    render(<CardFace card={assigned("user-dana", null)} members={MEMBERS} now={null} />);
+
+    // Two letters for the eye, the whole name for everything else. Initials
+    // collide; "DO" announced on its own has told a listener nothing.
+    expect(screen.getByText("DO")).toHaveAttribute("aria-hidden", "true");
+    expect(screen.getByText("assigned to Dana Okoro")).toBeInTheDocument();
+  });
+
+  it("says the assignee is not in the list rather than printing their id", () => {
+    // A member added since this page was read, or a member list that did not
+    // load. Either way the uuid must not reach the screen: it names the person
+    // to nobody and exposes a user id to everybody.
+    const { container } = render(
+      <CardFace card={assigned("user-new", null)} members={MEMBERS} now={null} />,
+    );
+
+    expect(
+      screen.getByText("assigned to a member not in this list"),
+    ).toBeInTheDocument();
+    expect(container.textContent).not.toContain("user-new");
+  });
+
+  it("renders nothing extra for a card with neither", () => {
+    const { container } = render(
+      <CardFace card={assigned(null, null)} members={MEMBERS} now={null} />,
+    );
+
+    // Most cards. The row is drawn only when it has something in it, so a board
+    // of plain cards looks exactly as it did before #157.
+    expect(container.textContent).toBe("Alpha");
+  });
+
+  it("makes no claim about being overdue before the reader's clock is known", () => {
+    /*
+     * `now === null` is the server render and the first client render — the two
+     * that have to produce identical HTML. A claim made here would be a claim
+     * against the server's clock, re-rendered as its opposite a frame later,
+     * which is the hydration mismatch this design exists to avoid.
+     *
+     * The date is still shown, in the fixed UTC form every other timestamp in
+     * this app uses, with the zone named so it is not mistaken for the
+     * reader's.
+     */
+    render(<CardFace card={assigned(null, OVERDUE)} members={MEMBERS} now={null} />);
+
+    expect(screen.getByText(/1 Jan 2020, 00:00 UTC/)).toBeInTheDocument();
+    expect(screen.queryByText(/overdue/)).not.toBeInTheDocument();
+  });
+
+  it("marks a passed due date overdue once there is a clock", () => {
+    render(
+      <CardFace card={assigned(null, OVERDUE)} members={MEMBERS} now={Date.now()} />,
+    );
+
+    // The word, not only the colour — `.cardDueOverdue` is bold as well as red
+    // for the same reason.
+    expect(screen.getByText("overdue,")).toBeInTheDocument();
+  });
+
+  it("does not mark a future due date overdue", () => {
+    render(<CardFace card={assigned(null, LATER)} members={MEMBERS} now={Date.now()} />);
+
+    expect(screen.queryByText(/overdue/)).not.toBeInTheDocument();
+  });
+
+  it("renders the due date in the reader's own zone once there is a clock", () => {
+    render(<CardFace card={assigned(null, LATER)} members={MEMBERS} now={Date.now()} />);
+
+    // 23:00 UTC on the 31st is 11:00 on the 1st here. A board that showed
+    // "31 Aug" would be telling this reader a card is due yesterday.
+    expect(screen.getByText(/1 Sept 2099, 11:00/)).toBeInTheDocument();
+  });
+
+  it("carries the instant in the markup whatever zone the text is in", () => {
+    const { container } = render(
+      <CardFace card={assigned(null, LATER)} members={MEMBERS} now={Date.now()} />,
+    );
+
+    expect(container.querySelector("time")).toHaveAttribute("datetime", LATER);
+  });
+
+  it("shows both on the card's tile in the board", () => {
+    renderBoard(COLUMNS, [assigned("user-sam", LATER), CARDS[3]]);
+
+    // Through the whole board rather than the face alone, because the props
+    // have to reach it: `members` from the page and the clock from the board,
+    // three components down.
+    expect(
+      screen.getByRole("link", { name: /Alpha[\s\S]*assigned to Sam Ito[\s\S]*Due/ }),
+    ).toBeInTheDocument();
+  });
+
+  it("names the assignee and the due date in the detail panel", () => {
+    render(
+      <CardDetail
+        card={assigned("user-dana", OVERDUE)}
+        closeHref="/board"
+        columnName="Doing"
+        members={MEMBERS}
+        now={Date.now()}
+      />,
+    );
+
+    expect(screen.getByText("Dana Okoro")).toBeInTheDocument();
+    expect(screen.getByText("— overdue")).toBeInTheDocument();
+  });
+
+  it("says nobody and no due date rather than leaving the rows blank", () => {
+    render(
+      <CardDetail
+        card={assigned(null, null)}
+        closeHref="/board"
+        columnName="Doing"
+        members={MEMBERS}
+        now={Date.now()}
+      />,
+    );
+
+    expect(screen.getByText("Nobody")).toBeInTheDocument();
+    expect(screen.getByText("No due date")).toBeInTheDocument();
+  });
+});
+
+describe("useDueClock", () => {
+  /** A card that has been overdue for years, drawn by whatever clock it is given. */
+  function DueProbe() {
+    return (
+      <CardFace
+        card={{ ...card("card-1", "c-doing", "Alpha"), dueAt: "2020-01-01T00:00:00Z" }}
+        members={MEMBERS}
+        now={useDueClock()}
+      />
+    );
+  }
+
+  it("is null on the first render, which is the one the server has to match", () => {
+    const seen: (number | null)[] = [];
+
+    function Probe() {
+      seen.push(useDueClock());
+
+      return null;
+    }
+
+    render(<Probe />);
+
+    expect(seen[0]).toBeNull();
+    expect(seen.length).toBeGreaterThan(1);
+    expect(typeof seen[seen.length - 1]).toBe("number");
+  });
+
+  it("makes no claim about the clock in the HTML the server sends", () => {
+    // `renderToString` is the only way to reach `getServerSnapshot`, which a
+    // client-only `render()` never calls — so without this the server half of
+    // the contract would be untested and a `getServerSnapshot` returning
+    // `Date.now()` would pass every other test in this file.
+    const html = renderToString(<DueProbe />);
+
+    expect(html).toContain("1 Jan 2020, 00:00 UTC");
+    expect(html).not.toContain("overdue");
+  });
+
+  it("hydrates the server's HTML without a mismatch, then marks the card overdue", async () => {
+    /*
+     * The acceptance criterion itself, end to end: server HTML, hydrated by a
+     * browser in a different zone (Pacific/Auckland — see `vitest.config.mts`)
+     * and with a clock the server did not have.
+     *
+     * React reports a hydration mismatch through `console.error` rather than by
+     * throwing, so the spy is the assertion. Without it this test would pass
+     * against a component that mismatched on every load and recovered by
+     * re-rendering the whole tree on the client.
+     */
+    const complaints: unknown[][] = [];
+    const spy = vi
+      .spyOn(console, "error")
+      .mockImplementation((...args: unknown[]) => void complaints.push(args));
+
+    const container = document.createElement("div");
+
+    container.innerHTML = renderToString(<DueProbe />);
+    document.body.appendChild(container);
+
+    await act(async () => {
+      hydrateRoot(container, <DueProbe />);
+    });
+
+    expect(complaints).toEqual([]);
+    // And the reason the whole dance is worth it: after hydration the card is
+    // marked late, by the reader's clock, in the reader's own zone.
+    expect(container.textContent).toContain("overdue,");
+    expect(container.textContent).toContain("1 Jan 2020, 13:00");
+
+    spy.mockRestore();
+    container.remove();
+  });
+});
+
 describe("CardDetail", () => {
   const OPEN = card("card-2", "c-doing", "Kilo", "First line\nSecond line");
 
   it("shows the title, the description and the column it is in", () => {
-    render(<CardDetail card={OPEN} closeHref="/board" columnName="Doing" />);
+    render(<CardDetail members={MEMBERS} now={null} card={OPEN} closeHref="/board" columnName="Doing" />);
 
     expect(screen.getByRole("heading", { name: "Kilo" })).toBeInTheDocument();
     expect(screen.getByText(/First line/)).toBeInTheDocument();
@@ -200,7 +452,7 @@ describe("CardDetail", () => {
   });
 
   it("shows both timestamps to the minute, so they can differ visibly", () => {
-    render(<CardDetail card={OPEN} closeHref="/board" columnName="Doing" />);
+    render(<CardDetail members={MEMBERS} now={null} card={OPEN} closeHref="/board" columnName="Doing" />);
 
     expect(screen.getByText(/2 Aug 2026, 09:00 UTC/)).toBeInTheDocument();
     expect(screen.getByText(/2 Aug 2026, 14:32 UTC/)).toBeInTheDocument();
@@ -209,7 +461,7 @@ describe("CardDetail", () => {
   it("never shows a position or a rank", () => {
     // ADR 0004: no response contains one, so nothing here can render one.
     const { container } = render(
-      <CardDetail card={OPEN} closeHref="/board" columnName="Doing" />,
+      <CardDetail members={MEMBERS} now={null} card={OPEN} closeHref="/board" columnName="Doing" />,
     );
 
     expect(container.textContent).not.toMatch(/position|rank/i);
@@ -217,14 +469,14 @@ describe("CardDetail", () => {
 
   it("says so when the card has no description", () => {
     render(
-      <CardDetail card={card("card-1", "c-doing", "Alpha")} closeHref="/board" columnName="Doing" />,
+      <CardDetail members={MEMBERS} now={null} card={card("card-1", "c-doing", "Alpha")} closeHref="/board" columnName="Doing" />,
     );
 
     expect(screen.getByText("This card has no description.")).toBeInTheDocument();
   });
 
   it("says so when the card's column is not on the board", () => {
-    render(<CardDetail card={OPEN} closeHref="/board" columnName={null} />);
+    render(<CardDetail members={MEMBERS} now={null} card={OPEN} closeHref="/board" columnName={null} />);
 
     expect(
       screen.getByText("Not in a column shown on this board"),
@@ -232,7 +484,7 @@ describe("CardDetail", () => {
   });
 
   it("closes back to the board", () => {
-    render(<CardDetail card={OPEN} closeHref="/app/projects/p-1/boards/b-1" columnName="Doing" />);
+    render(<CardDetail members={MEMBERS} now={null} card={OPEN} closeHref="/app/projects/p-1/boards/b-1" columnName="Doing" />);
 
     expect(screen.getByRole("link", { name: "Close" })).toHaveAttribute(
       "href",

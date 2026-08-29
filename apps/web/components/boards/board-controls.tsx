@@ -123,6 +123,12 @@ export function CardComposer({
       columnId,
       title: typed,
       description: "",
+      // Null for the same reason the description is "": the request does not
+      // mention either field, and `createCardRequest` reads an absent
+      // assignee_id or due_at as "nobody" and "no date". A card is assigned and
+      // dated in the detail panel, where there is room to choose.
+      assigneeId: null,
+      dueAt: null,
       createdAt: now(),
       updatedAt: now(),
     };

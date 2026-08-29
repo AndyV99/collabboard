@@ -74,10 +74,37 @@ function card(id: string, columnId: string, title: string) {
     columnId,
     title,
     description: "",
+    assigneeId: null,
+    dueAt: null,
     createdAt: "2026-08-02T09:00:00Z",
     updatedAt: "2026-08-02T09:00:00Z",
   };
 }
+
+/**
+ * The workspace's members, as `GET /members` returns them.
+ *
+ * Two, with different initials, because one member cannot tell an avatar that
+ * resolved the right name from one that resolved the only name there was.
+ */
+const MEMBERS = [
+  {
+    membershipId: "mem-1",
+    userId: "user-dana",
+    email: "dana@example.test",
+    displayName: "Dana Okoro",
+    role: "admin",
+    joinedAt: "2026-07-01T09:00:00Z",
+  },
+  {
+    membershipId: "mem-2",
+    userId: "user-sam",
+    email: "sam@example.test",
+    displayName: "Sam Ito",
+    role: "member",
+    joinedAt: "2026-07-02T09:00:00Z",
+  },
+];
 
 function cardBody(id: string, columnId: string, title: string) {
   return {
@@ -86,6 +113,8 @@ function cardBody(id: string, columnId: string, title: string) {
     column_id: columnId,
     title,
     description: "",
+    assignee_id: null,
+    due_at: null,
     created_at: "2026-08-02T09:00:00Z",
     updated_at: "2026-08-02T09:00:00Z",
   };
@@ -107,6 +136,7 @@ function renderBoard(cards = CARDS, columns = COLUMNS) {
   return render(
     <BoardView
       boardId={BOARD}
+      members={MEMBERS}
       projectId={PROJECT}
       selectedCardId={null}
       snapshot={groupCardsIntoColumns(columns as never, cards as never)}
@@ -422,6 +452,7 @@ describe("the board while the server is deciding", () => {
     rerender(
       <BoardView
         boardId={BOARD}
+        members={MEMBERS}
         projectId={PROJECT}
         selectedCardId={null}
         snapshot={

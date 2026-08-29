@@ -28,6 +28,8 @@ const CARDS_OK = {
       column_id: "col1",
       title: "Ship it",
       description: "",
+      assignee_id: null,
+      due_at: null,
       created_at: "2026-08-08T10:00:00Z",
       updated_at: "2026-08-08T10:00:00Z",
     },

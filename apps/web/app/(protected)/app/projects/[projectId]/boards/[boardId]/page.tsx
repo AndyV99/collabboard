@@ -1,6 +1,12 @@
 import type { Metadata } from "next";
 
-import { getBoard, getProject, listCardsByBoard, listColumns } from "@/lib/api/endpoints";
+import {
+  getBoard,
+  getProject,
+  listCardsByBoard,
+  listColumns,
+  listMembers,
+} from "@/lib/api/endpoints";
 import type { ApiError } from "@/lib/api/errors";
 import { serverApi } from "@/lib/api/server";
 import { countCards, groupCardsIntoColumns } from "@/lib/board/snapshot";
@@ -25,15 +31,16 @@ export const metadata: Metadata = {
 /**
  * A board: its columns, every card on it, and whichever card the URL has open.
  *
- * # Four requests, all at once, and never one per card
+ * # Five requests, all at once, and never one per card
  *
- * `GET /boards/:id`, `GET /projects/:id`, `GET /boards/:id/columns` and
- * `GET /boards/:id/cards`. That is the whole page — a board with four columns
- * and two hundred cards makes exactly the same four requests as an empty one,
- * because the cards endpoint answers with the entire board (`ListCardsByBoard`,
- * served by `cards_tenant_board_idx`) rather than per column. Fetching per
- * column would be O(columns) and fetching per card O(cards); both are wrong,
- * and the second is wrong by two orders of magnitude here.
+ * `GET /boards/:id`, `GET /projects/:id`, `GET /boards/:id/columns`,
+ * `GET /boards/:id/cards` and `GET /members`. That is the whole page — a board
+ * with four columns and two hundred cards makes exactly the same five requests
+ * as an empty one, because the cards endpoint answers with the entire board
+ * (`ListCardsByBoard`, served by `cards_tenant_board_idx`) rather than per
+ * column. Fetching per column would be O(columns) and fetching per card
+ * O(cards); both are wrong, and the second is wrong by two orders of magnitude
+ * here.
  *
  * They go out together because none of them depends on another's answer. The
  * tempting version — read the board, then read its columns and cards only if it
@@ -44,7 +51,20 @@ export const metadata: Metadata = {
  * tenant's board id returns an empty list rather than anything to leak.
  *
  * The project is read for the breadcrumb, exactly as #62 established, and for
- * the check below.
+ * the check below. The members are read for the assignee picker and for turning
+ * a card's `assignee_id` into a name — one request for the whole board, because
+ * the alternative is a lookup per assigned card, and because a picker that
+ * fetched its own options on open would put a network round trip inside a
+ * dropdown.
+ *
+ * # A member list that does not load is not a board that does not load
+ *
+ * `membersResult` is the one read here whose failure is *not* fatal to the
+ * screen. Columns and cards are the board; members are an annotation on it, and
+ * a workspace whose directory is briefly unreachable should still be able to
+ * read, move, write and reorder its cards. So the failure is passed down as
+ * `null` — see `BoardView`'s `members` prop — and the assignee picker is the
+ * only thing that goes away.
  *
  * # 404 is the board's answer, not the cards'
  *
@@ -94,12 +114,14 @@ export default async function BoardPage({ params, searchParams }: Props) {
 
   const [{ projectId, boardId }, query] = await Promise.all([params, searchParams]);
 
-  const [boardResult, projectResult, columnsResult, cardsResult] = await Promise.all([
-    serverApi(getBoard(boardId)),
-    serverApi(getProject(projectId)),
-    serverApi(listColumns(boardId)),
-    serverApi(listCardsByBoard(boardId)),
-  ]);
+  const [boardResult, projectResult, columnsResult, cardsResult, membersResult] =
+    await Promise.all([
+      serverApi(getBoard(boardId)),
+      serverApi(getProject(projectId)),
+      serverApi(listColumns(boardId)),
+      serverApi(listCardsByBoard(boardId)),
+      serverApi(listMembers()),
+    ]);
 
   const notFound = (
     <div className={styles.page}>
@@ -193,6 +215,7 @@ export default async function BoardPage({ params, searchParams }: Props) {
        * the refresh arrived. See the comment at the top of `board-view.tsx`. */}
       <BoardView
         boardId={theBoard.id}
+        members={membersResult.ok ? membersResult.data : null}
         projectId={project.id}
         selectedCardId={openCardId}
         snapshot={snapshot}

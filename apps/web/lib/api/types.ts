@@ -431,13 +431,26 @@ export function parseColumn(value: unknown): Column | null {
   return { id, boardId, name, createdAt, updatedAt };
 }
 
-/** A card in a column. Ordering is the API's, for the same reason as columns. */
+/**
+ * A card in a column. Ordering is the API's, for the same reason as columns.
+ *
+ * `assigneeId` and `dueAt` are `string | null` rather than optional, because
+ * `cardBody` in `apps/api/internal/api/cards.go` carries both on every card
+ * **without `omitempty`** — deliberately, so that "nobody is assigned" and
+ * "this body does not mention assignment" are different things on the wire.
+ * {@link parseCard} keeps that distinction: an absent key is a malformed body,
+ * not an absent value.
+ */
 export type Card = {
   id: string;
   boardId: string;
   columnId: string;
   title: string;
   description: string;
+  /** The `user_id` of the member this card belongs to, or null. */
+  assigneeId: string | null;
+  /** RFC 3339, in UTC as `crud.go`'s `timestamp` renders it, or null. */
+  dueAt: string | null;
   createdAt: string;
   updatedAt: string;
 };
@@ -455,6 +468,14 @@ export function parseCard(value: unknown): Card | null {
   const createdAt = str(value, "created_at");
   const updatedAt = str(value, "updated_at");
 
+  // `undefined` from `nullableStr` is "absent, or not a string" — both of which
+  // are malformed here, because the API emits the key on every card. Defaulting
+  // to null instead would turn a renamed field on the API side into a board
+  // where nobody is assigned to anything and nothing is ever due, which is a
+  // lie the client would render confidently.
+  const assigneeId = nullableStr(value, "assignee_id");
+  const dueAt = nullableStr(value, "due_at");
+
   if (
     id === null ||
     boardId === null ||
@@ -462,10 +483,22 @@ export function parseCard(value: unknown): Card | null {
     title === null ||
     description === null ||
     createdAt === null ||
-    updatedAt === null
+    updatedAt === null ||
+    assigneeId === undefined ||
+    dueAt === undefined
   ) {
     return null;
   }
 
-  return { id, boardId, columnId, title, description, createdAt, updatedAt };
+  return {
+    id,
+    boardId,
+    columnId,
+    title,
+    description,
+    assigneeId,
+    dueAt,
+    createdAt,
+    updatedAt,
+  };
 }
