@@ -325,8 +325,16 @@ variable "database_max_conns" {
 }
 
 variable "cache_host" {
-  description = "ElastiCache primary endpoint."
+  description = "ElastiCache primary endpoint, as a DNS name. Never an address: the API verifies the TLS certificate against this value, Go sends no SNI for an IP literal, and the ElastiCache certificate carries no IP SAN -- so an address fails verification with an error that reads like a broken trust store rather than like a wrong hostname."
   type        = string
+
+  validation {
+    # Not a full address parser -- it only has to catch the one shape that
+    # silently breaks TLS verification, and `can(cidrnetmask(...))` is the
+    # cheapest way to ask "is this an IPv4 literal" in HCL.
+    condition     = !can(cidrnetmask("${var.cache_host}/32"))
+    error_message = "cache_host must be the ElastiCache primary endpoint's DNS name, not an address. REDIS_TLS_ENABLED is on and the client verifies the certificate against this name; an IP literal sends no SNI and matches no SAN, so every connection fails verification."
+  }
 }
 
 variable "cache_port" {
