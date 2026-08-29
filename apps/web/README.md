@@ -438,13 +438,14 @@ delete from memberships m using users u
   answers 403; it marks its refusals with `x-collabboard-refusal`, which
   `relayApiError` never sets. Without that the sign-in form would have to match
   on message text, which would make the copy load-bearing.
-- **The shell reads the signed-in user's name from `GET /members`.** The session
-  cookie has a user id and an organization, and `GET /me` adds a role and a
-  session id — neither has a display name or an address. Listing every member to
-  render one name is heavier than the job deserves; filed as #75. Every failure
-  degrades to "Signed in" rather than redirecting, because `serverApi` cannot
-  clear a cookie and a redirect from there would loop against `/login`, which
-  bounces anyone who has one.
+- **The shell reads the signed-in user's name from `GET /me`.** The session
+  cookie has a user id and an organization and no name, so the frame needs one
+  request. It used to be `GET /members` — the only endpoint that had a name and
+  an address together — with the shell searching the result for itself; #75 put
+  both on `meResponse` and #78 deleted the search. Every failure degrades to
+  "Signed in" rather than redirecting, because `serverApi` cannot clear a cookie
+  and a redirect from there would loop against `/login`, which bounces anyone
+  who has one.
 
 ### Accessibility, as implemented
 
@@ -473,7 +474,7 @@ lib/auth/routes.ts      the paths, and safeReturnPath's open-redirect check
 lib/auth/submit.ts      posting a form to /api/auth/*
 lib/session/require.ts  requireSession(): the one redirect in the app
 lib/session/request-path.ts  how a layout learns which URL it is rendering
-lib/session/viewer.ts   the signed-in user's name, via GET /members
+lib/session/me.ts       the signed-in principal, via GET /me
 ```
 
 ## The workspace: projects, boards and people
@@ -612,15 +613,24 @@ lib/workspace/format.ts                   timestamps, in a fixed locale and zone
 
 ### Known rough edge
 
-`app/(protected)/layout.tsx` awaits `loadViewer()`, which is a `GET /members`
-call made only to render one name (#75, #78). Because that await is *above* every
-`loading.tsx`, the segment fallbacks cannot paint until it resolves — on a slow
-API the whole signed-in area waits on a request none of the pages need. #78
-deletes that call, which removes the problem rather than working around it.
+`app/(protected)/layout.tsx` awaits `loadCurrentUser()` to render one name, and
+that await is *above* every `loading.tsx` — so the segment fallbacks cannot paint
+until it resolves, and on a slow API the whole signed-in area waits on a request
+none of the pages need.
 
-It is also why a board page makes **five** API requests and not four: four of
-its own, plus that one. The five are constant — a board with 240 cards makes the
-same five as an empty one.
+#78 halved this rather than removing it. The call was `GET /members`, which read
+every colleague in the organization and searched the result for the signed-in
+row: O(members) work, every colleague's address on the wire to render one name,
+and the signed-in frame coupled to a surface it has no other reason to call. It
+is now `GET /me`, which asks the question directly. **The blocking is
+unchanged** — one request above the fallbacks is still one request above the
+fallbacks — and fixing that is a different change: a Suspense boundary around
+the header, or a shell that renders the name from the session cookie. Tracked
+as #168 rather than folded in here.
+
+It is also why a board page makes **six** API requests and not five: five of its
+own, plus this one. All six are constant — a board with 240 cards makes the same
+six as an empty one.
 
 ### Session layer files
 
