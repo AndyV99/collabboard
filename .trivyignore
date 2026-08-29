@@ -1,0 +1,68 @@
+# Vulnerabilities deliberately not fixed yet, for the image scan in the `image`
+# job of .github/workflows/ci.yml.
+#
+# ---------------------------------------------------------------------------
+# WHAT BELONGS HERE, AND WHAT DOES NOT
+# ---------------------------------------------------------------------------
+# The gate is HIGH and CRITICAL with `ignore-unfixed: true`. So a finding with
+# no published fix never reaches this file — it is reported in the log by the
+# preceding step and cannot be acted on, and failing the build on it would make
+# the check permanently red for a reason nobody in this repository can resolve.
+#
+# This file is therefore only for the narrow case of a **fixable** finding that
+# is deliberately being deferred. That is a decision, so every entry needs:
+#
+#   * the CVE id
+#   * the date it was added
+#   * the issue tracking the fix
+#   * one line on why it is safe to defer, specific to how this image uses it
+#
+# An entry with no expiry is how a suppression outlives the reason for it, so
+# prefer `# expires: YYYY-MM-DD` and treat a passed date as a bug.
+#
+# ---------------------------------------------------------------------------
+# NOT THE PLACE FOR A BASE IMAGE BUMP
+# ---------------------------------------------------------------------------
+# If the fix is "take a newer base image", the answer is to bump the pinned tag
+# in the Dockerfile — `ARG NODE_VERSION` / `ARG GO_VERSION` / `ARG
+# RUNTIME_DIGEST` — which is Dependabot's job (#22) and arrives as a commit
+# somebody reviewed. Adding the CVE here instead trades a reviewed bump for a
+# silent one.
+
+# ---------------------------------------------------------------------------
+# apps/web
+# ---------------------------------------------------------------------------
+
+# CVE-2026-14456 — libssl3 / libcrypto3 3.5.7-r0, fixed in 3.5.8-r0.
+#
+# added:    2026-08-28
+# issue:    #145
+# expires:  2026-11-28
+#
+# Fixable in Alpine and not by any change this repository can make. The web
+# image pins NODE_VERSION=22.23.2 on alpine3.24, and the floating
+# `node:22-alpine3.24` tag currently resolves to that same 22.23.2 carrying
+# libssl3-3.5.7-r0 — so bumping the pin fixes nothing. Verified rather than
+# assumed:
+#
+#     docker run --rm node:22-alpine3.24 apk list --installed | grep libssl3
+#     libssl3-3.5.7-r0
+#
+# `RUN apk upgrade` in the runtime stage would fix it today and is deliberately
+# not taken: it makes the same Dockerfile produce a different image on different
+# days, which contradicts the pinning argument both Dockerfiles state in their
+# own comments. #145 carries that judgement call and the removal condition.
+#
+# The Next server does not expose this library to untrusted input directly — its
+# TLS is terminated at the load balancer — which is why deferring is acceptable
+# rather than merely convenient.
+CVE-2026-14456
+
+# ---------------------------------------------------------------------------
+# apps/api
+# ---------------------------------------------------------------------------
+#
+# Nothing. Distroless carries no package manager and no userland, and the Go
+# stdlib findings that were present when this gate was written (8 fixable HIGH
+# CVEs against 1.26.5) were fixed the way findings are supposed to be fixed —
+# by bumping ARG GO_VERSION to 1.26.6 in the same PR, not by an entry here.
