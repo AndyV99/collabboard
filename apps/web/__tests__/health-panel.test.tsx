@@ -51,6 +51,48 @@ describe("HealthPanel", () => {
     expect(screen.getByText("postgres")).toBeInTheDocument();
   });
 
+  // The deployed policy from #31: outside development the API omits the driver
+  // error entirely, so the panel receives a component with a status and no
+  // `error` field. It must still render the outage rather than a blank row --
+  // which is what makes redaction acceptable on a page an operator uses.
+  //
+  // Note there is deliberately no redaction logic on this side. The policy
+  // lives in one place, in the API, because two independent redaction rules
+  // drift and the quiet direction of that drift is the one that leaks.
+  it("renders a degraded dependency that carries no error text", () => {
+    const probe: HealthProbe = {
+      outcome: "reachable",
+      url: URL,
+      httpStatus: 503,
+      health: {
+        status: "unavailable",
+        components: {
+          postgres: { status: "ok" },
+          redis: { status: "unavailable" },
+        },
+      },
+    };
+
+    const { container } = render(<HealthPanel probe={probe} />);
+
+    expect(screen.getByText("Degraded")).toBeInTheDocument();
+    expect(screen.getByText("HTTP 503")).toBeInTheDocument();
+    // The failing dependency is still named, which is the half an operator
+    // needs and the half redaction must not take away.
+    expect(screen.getByText("redis")).toBeInTheDocument();
+    expect(screen.getByText("postgres")).toBeInTheDocument();
+
+    // And no driver text appears. Asserted against the rendered output rather
+    // than the props, so a future change that started echoing something from
+    // elsewhere would fail.
+    //
+    // Deliberately not a "no port numbers" assertion: the panel displays the
+    // configured endpoint URL, which contains one. That is client-side
+    // configuration the operator set, not topology the API disclosed, and
+    // conflating the two would make this test fail for the wrong reason.
+    expect(container.textContent).not.toMatch(/dial tcp|refused|timeout|rds\.amazonaws/i);
+  });
+
   it("explains an unreachable API instead of rendering an empty panel", () => {
     const probe: HealthProbe = {
       outcome: "unreachable",
