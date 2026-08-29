@@ -33,7 +33,7 @@ func healthBody(t *testing.T, disclose bool) (int, []byte, string) {
 
 	logger := slog.New(slog.NewJSONHandler(&logged, nil))
 
-	router := NewRouter(logger, BodyLimits{}, HealthDeps{
+	router := NewRouter(logger, BodyLimits{}, nil, HealthDeps{
 		Postgres:       leakyPinger{msg: leakyPostgres},
 		Redis:          leakyPinger{msg: leakyRedis},
 		DiscloseErrors: disclose,

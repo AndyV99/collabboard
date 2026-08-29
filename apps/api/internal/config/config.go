@@ -10,6 +10,7 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"fmt"
+	"net"
 	"net/url"
 	"os"
 	"strconv"
@@ -153,6 +154,22 @@ type HTTPConfig struct {
 	// with every field escaped character-by-character, and it cuts what an
 	// unauthenticated caller can make this process read by 16x.
 	MaxUnauthenticatedRequestBytes int
+
+	// TrustedProxies is the list of CIDR blocks whose X-Forwarded-For header
+	// this service believes. Empty — the default — means trust nobody, so
+	// ClientIP() is the peer address and a forged header changes nothing.
+	//
+	// This is a security boundary, not a tuning knob. Every entry is a range of
+	// addresses that may assert who the client is, so a too-wide value hands
+	// that assertion to whatever else is in the range. The correct deployed
+	// value is the load balancer's own subnets and nothing else; 0.0.0.0/0
+	// would restore Gin's insecure default, and Load rejects it.
+	//
+	// Getting it wrong in the other direction is quieter and is why this exists:
+	// with an ALB in front and nobody trusted, every request appears to come
+	// from the load balancer, so the per-address login budget becomes a single
+	// bucket shared by every user — one attacker locks out everyone.
+	TrustedProxies []string
 }
 
 // Addr renders the listen address for net/http.
@@ -301,6 +318,8 @@ func Load() (Config, error) {
 			MaxRequestBytes: envInt("HTTP_MAX_REQUEST_BYTES", DefaultMaxRequestBytes, &errs),
 			MaxUnauthenticatedRequestBytes: envInt(
 				"HTTP_MAX_UNAUTHENTICATED_REQUEST_BYTES", DefaultMaxUnauthenticatedRequestBytes, &errs),
+
+			TrustedProxies: envCIDRList("HTTP_TRUSTED_PROXIES", &errs),
 		},
 		Postgres: PostgresConfig{
 			Host:              envString("POSTGRES_HOST", "localhost"),
@@ -485,6 +504,68 @@ func resolveAllowedOrigins(env string) []string {
 	}
 
 	return []string{"localhost:3000", "127.0.0.1:3000"}
+}
+
+// envCIDRList parses a comma-separated list of CIDR blocks.
+//
+// It validates rather than merely splitting, and that is the whole point.
+// gin's SetTrustedProxies returns an error for an unparseable entry, but by
+// then the engine is being built and the failure is a log line beside a running
+// server — a server that is, at that moment, trusting nobody and silently
+// running the single-bucket rate limiter this setting exists to prevent.
+// Failing in Load turns that into a service that does not start.
+//
+// A bare address is accepted and normalised to a single-host block, because
+// "10.0.1.7" is what an operator writes when they mean one machine and
+// rejecting it teaches nothing. Everything else is an error.
+func envCIDRList(key string, errs *[]string) []string {
+	raw, ok := os.LookupEnv(key)
+	if !ok || strings.TrimSpace(raw) == "" {
+		return nil
+	}
+
+	var cidrs []string
+
+	for _, entry := range strings.Split(raw, ",") {
+		trimmed := strings.TrimSpace(entry)
+		if trimmed == "" {
+			continue
+		}
+
+		// Refused explicitly rather than left to net.ParseCIDR, which accepts
+		// it happily. Trusting every address is exactly gin's insecure default,
+		// and an operator who writes it has almost certainly reached for "allow
+		// the load balancer" and overshot. The message says what to write
+		// instead, because the right value is not guessable from the error.
+		if trimmed == "0.0.0.0/0" || trimmed == "::/0" {
+			*errs = append(*errs, fmt.Sprintf(
+				"%s must not contain %s: that trusts every peer to assert the client address, "+
+					"which is the default this setting exists to replace. Name the load balancer's subnets.",
+				key, trimmed))
+
+			continue
+		}
+
+		if _, _, err := net.ParseCIDR(trimmed); err == nil {
+			cidrs = append(cidrs, trimmed)
+
+			continue
+		}
+
+		if ip := net.ParseIP(trimmed); ip != nil {
+			if ip.To4() != nil {
+				cidrs = append(cidrs, trimmed+"/32")
+			} else {
+				cidrs = append(cidrs, trimmed+"/128")
+			}
+
+			continue
+		}
+
+		*errs = append(*errs, fmt.Sprintf("%s entry %q is neither a CIDR block nor an address", key, trimmed))
+	}
+
+	return cidrs
 }
 
 func envString(key, def string) string {

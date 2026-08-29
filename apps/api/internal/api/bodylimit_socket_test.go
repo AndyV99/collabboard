@@ -369,7 +369,7 @@ func TestTheWebSocketUpgradeIsNotCappedIntoFailure(t *testing.T) {
 
 	issuer := testIssuer(t)
 
-	router := NewRouter(discardLogger(), BodyLimits{Default: 1},
+	router := NewRouter(discardLogger(), BodyLimits{Default: 1}, nil,
 		HealthDeps{Postgres: stubPinger{}, Redis: stubPinger{}},
 		AuthDeps{Service: &countingAuthService{}, Verifier: issuer, Store: newCRUDStore()},
 		RealtimeDeps{Connect: echoUpgradeHandler(t, subprotocol)})

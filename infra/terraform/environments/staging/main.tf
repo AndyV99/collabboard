@@ -259,9 +259,14 @@ module "ecs" {
   web_target_group_arn = module.alb.web_target_group_arn
   api_container_port   = var.api_container_port
   web_container_port   = var.web_container_port
-  api_url              = module.alb.api_url
-  web_hostname         = var.web_hostname
-  api_hostname         = var.api_hostname
+
+  # The public subnets, not the private ones. The ALB's interfaces live in the
+  # public subnets, so that is the peer address an API task observes -- see
+  # modules/network/outputs.tf, where #101's original guess is corrected.
+  trusted_proxy_cidrs = module.network.public_subnet_cidrs
+  api_url             = module.alb.api_url
+  web_hostname        = var.web_hostname
+  api_hostname        = var.api_hostname
 
   api_cpu           = var.api_cpu
   api_memory        = var.api_memory

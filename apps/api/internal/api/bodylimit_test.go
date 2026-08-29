@@ -129,7 +129,7 @@ func newBodyLimitFixture(t *testing.T, limits BodyLimits) *bodyLimitFixture {
 	tenantID := uuid.New()
 	service := &countingAuthService{}
 
-	router := NewRouter(discardLogger(), limits,
+	router := NewRouter(discardLogger(), limits, nil,
 		HealthDeps{Postgres: stubPinger{}, Redis: stubPinger{}},
 		AuthDeps{Service: service, Verifier: issuer, Store: tenantStore},
 		RealtimeDeps{Publisher: &recordingPublisher{}})

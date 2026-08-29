@@ -556,6 +556,7 @@ func newBoardFixture(t *testing.T) *boardFixture {
 	f := &boardFixture{
 		router: NewRouter(logger,
 			BodyLimits{},
+			nil,
 			HealthDeps{Postgres: stubPinger{}, Redis: stubPinger{}},
 			AuthDeps{Service: &membershipService{issuer: issuer}, Verifier: issuer, Store: tenantStore},
 			RealtimeDeps{Publisher: publisher}),

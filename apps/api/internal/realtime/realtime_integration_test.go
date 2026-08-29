@@ -86,6 +86,7 @@ func newRedisInstance(t *testing.T, issuer *auth.Issuer, reauthorizeInterval tim
 	// below about fan-out is also an assertion about the write path.
 	router := api.NewRouter(discardLogger(),
 		api.BodyLimits{},
+		nil,
 		api.HealthDeps{},
 		api.AuthDeps{Service: stubAuthService{}, Verifier: issuer, Store: appStore},
 		api.RealtimeDeps{Connect: hub.ConnectHandler(), Publisher: hub.EventPublisher()})
