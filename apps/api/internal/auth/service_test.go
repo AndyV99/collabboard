@@ -187,6 +187,30 @@ func TestRegisterRejectsADuplicateAddressAndWeakInput(t *testing.T) {
 			want: auth.ErrInvalidInput,
 		},
 		{
+			// The case this issue is about. `users.email` demands
+			// position('@') > 1, and the old check asked only that an `@`
+			// appear somewhere -- so this passed validation, reached the
+			// INSERT, violated the constraint, and came back 500. A wrong
+			// value the user can fix, reported as a server fault.
+			name: "nothing before the @",
+			in:   auth.RegisterInput{Email: "@example.com", Password: testPassword, DisplayName: "Someone"},
+			want: auth.ErrInvalidInput,
+		},
+		{
+			// The boundary on the other side: exactly one character before
+			// the `@` satisfies position('@') > 1, so it must be ACCEPTED.
+			// A fix that rejected this would be stricter than the column,
+			// which is the same disagreement pointing the other way.
+			name: "one character before the @ is enough",
+			in:   auth.RegisterInput{Email: "a@example.com", Password: testPassword, DisplayName: "Someone"},
+			want: nil,
+		},
+		{
+			name: "empty address",
+			in:   auth.RegisterInput{Email: "", Password: testPassword, DisplayName: "Someone"},
+			want: auth.ErrInvalidInput,
+		},
+		{
 			name: "no display name",
 			in:   auth.RegisterInput{Email: "anon@example.com", Password: testPassword, DisplayName: "   "},
 			want: auth.ErrInvalidInput,

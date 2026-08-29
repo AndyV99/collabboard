@@ -64,7 +64,6 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
-	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -297,11 +296,13 @@ func authorizeAddMember(ctx context.Context, q store.Querier, actorID uuid.UUID,
 // is a property of this endpoint, not of the caller. No role can grant it, so
 // no owner should be able to discover that theirs almost could.
 func validateAddMember(email, role string) (string, error) {
-	switch {
-	case email == "":
-		return "", fmt.Errorf("%w: email is required", ErrInvalidInput)
-	case len(email) > maxEmailLength || !strings.Contains(email, "@"):
-		return "", fmt.Errorf("%w: email is not a valid address", ErrInvalidInput)
+	// Shared with registration rather than restated, so the two cannot drift.
+	// This path does not INSERT a user -- ADR 0008 adds an existing account to
+	// an organization -- so a malformed address here answers "not found" rather
+	// than 500ing on the column constraint. That makes the looseness harmless
+	// today and is exactly why it would have survived unnoticed.
+	if err := validateEmailAddress(email); err != nil {
+		return "", err
 	}
 
 	switch role {
