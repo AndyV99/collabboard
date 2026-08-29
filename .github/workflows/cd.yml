@@ -70,7 +70,18 @@ jobs:
   # ---------------------------------------------------------------------------
   build:
     name: build and push
-    runs-on: ubuntu-latest
+    # An arm64 runner, because the task definitions declare ARM64 (#120) and
+    # the two images reach that differently. apps/api cross-compiles -- CGO is
+    # off, so Go targets arm64 from any builder for free -- but apps/web cannot:
+    # `next build`'s standalone output traces sharp's native binding, and npm
+    # picks that variant from the platform it installs on. Cross-building the
+    # web image would ship an x64 `.node` inside an arm64 image and fail at
+    # runtime rather than at build.
+    #
+    # Emulating arm64 on an x64 runner would work and would turn a two-minute
+    # `npm ci && next build` into something closer to fifteen. Native is
+    # simpler and, on a public repository, free.
+    runs-on: ubuntu-24.04-arm
     timeout-minutes: 30
     environment: staging
     permissions:
@@ -100,6 +111,23 @@ jobs:
       - uses: actions/checkout@v7
         with:
           ref: ${{ steps.resolve.outputs.sha }}
+
+      # A runner on the wrong architecture must fail the build, not produce a
+      # silently wrong image. Without this the web image would build happily on
+      # an x64 runner, push, deploy, and die at task start with an exec format
+      # error that names no architecture -- ten minutes into an apply, in the
+      # one failure mode #120 exists to prevent.
+      - name: Fail if the runner cannot build the target architecture natively
+        run: |
+          set -euo pipefail
+          arch="$(uname -m)"
+          if [ "$arch" != "aarch64" ]; then
+            echo "::error title=Wrong runner architecture::This job builds ARM64 images natively and is running on ${arch}."
+            echo 'The task definitions declare ARM64 (infra/terraform/modules/ecs/main.tf).'
+            echo 'Either restore an arm64 runner, or change both Dockerfiles and cpu_architecture together.'
+            exit 1
+          fi
+          echo "runner architecture: ${arch}"
 
       - uses: aws-actions/configure-aws-credentials@v5
         with:

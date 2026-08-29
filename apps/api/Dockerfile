@@ -52,18 +52,19 @@ ARG RUNTIME_DIGEST=sha256:f5b485ea962d9bd1186b2f6b3a061191539b905b82ec395de78cbf
 # ---------------------------------------------------------------------------
 # Target architecture — MUST match `runtime_platform` in modules/ecs/main.tf
 # ---------------------------------------------------------------------------
-# amd64, matching that module's `cpu_architecture = "X86_64"`. This is not a
+# arm64, matching that module's `cpu_architecture = "ARM64"`. This is not a
 # free choice: an amd64 image on an ARM64 task definition (and the reverse)
 # fails at task start with an exec format error, which surfaces as a task that
-# will not stay up rather than as anything naming the architecture.
+# will not stay up rather than as anything naming the architecture. The two
+# values must therefore change in the same commit, and `terraform test` asserts
+# the module's half so that a one-sided edit fails rather than deploys.
 #
-# ARM64 Fargate is ~20% cheaper and the rest of the environment is already
-# Graviton (db.t4g.micro, cache.t4g.micro), so arm64 is very likely the right
-# end state — CGO is off, so it is a one-word change here. It is deliberately
-# not made in this PR: flipping it means changing this ARG and
-# `cpu_architecture` in the same commit, and a Dockerfile PR is not where a
-# Terraform change should be reviewed. Filed as a follow-up instead.
-ARG TARGET_ARCH=amd64
+# ARM64 because Fargate charges ~20% less for it and the rest of the
+# environment is already Graviton (db.t4g.micro, cache.t4g.micro) — the API and
+# web tiers were the only x86 things left. It costs nothing here: CGO is off,
+# so Go cross-compiles to it from the native builder below with no cross
+# toolchain and no emulation.
+ARG TARGET_ARCH=arm64
 
 # ---------------------------------------------------------------------------
 # Stage 1: build

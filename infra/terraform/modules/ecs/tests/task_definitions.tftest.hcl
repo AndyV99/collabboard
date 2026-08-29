@@ -395,3 +395,44 @@ run "rejects_a_stop_timeout_below_the_application_drain_budget" {
 
   expect_failures = [var.stop_timeout_seconds]
 }
+
+# ---------------------------------------------------------------------------
+# The architecture, which fails in a way that names nothing
+# ---------------------------------------------------------------------------
+
+# An amd64 image on an ARM64 task definition -- or the reverse -- fails at task
+# start with an exec format error. The task never reaches healthy, the apply
+# times out on wait_for_steady_state ten minutes later, and nothing in the error
+# mentions an architecture.
+#
+# The Dockerfiles' TARGET_ARCH and this value are two halves of one decision
+# living in two files that no tool relates to each other. This assertion is the
+# relating: it pins the module's half, so a future edit that flips one side
+# alone fails at `terraform test` rather than at deploy.
+run "every_task_definition_declares_the_architecture_the_images_are_built_for" {
+  command = apply
+
+  assert {
+    condition = alltrue([
+      for definition in [
+        aws_ecs_task_definition.api,
+        aws_ecs_task_definition.api_migrate,
+        aws_ecs_task_definition.api_provision,
+        aws_ecs_task_definition.web,
+        aws_ecs_task_definition.admin,
+      ] :
+      definition.runtime_platform[0].cpu_architecture == "ARM64"
+    ])
+    error_message = "every task definition must declare ARM64, matching TARGET_ARCH in apps/api/Dockerfile and apps/web/Dockerfile. A mismatch is an exec format error at task start, which names no architecture."
+  }
+
+  # The admin task is included above and deserves a word, because it is the one
+  # whose image this repository does not build: it runs
+  # public.ecr.aws/docker/library/postgres, which publishes a multi-arch index
+  # and so resolves for arm64 on its own. If that image is ever pinned to a
+  # single-architecture digest, this assertion is what will notice.
+  assert {
+    condition     = alltrue([for d in [aws_ecs_task_definition.api, aws_ecs_task_definition.web] : d.runtime_platform[0].operating_system_family == "LINUX"])
+    error_message = "the operating system family must stay LINUX"
+  }
+}

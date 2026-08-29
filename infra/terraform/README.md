@@ -64,27 +64,51 @@ lives.
 
 ## What this costs
 
-Roughly **$61/month** in us-east-1 at the committed staging settings, mostly
-idle:
+Roughly **$107/month** in us-east-1 at the committed staging settings, running
+continuously. This table covers the whole stack — #101's base infrastructure,
+#102's load balancer and services, and #103's registry.
 
 | | |
 |---|---|
 | NAT gateway ×1 | $32.85 + $0.045/GB |
+| Application Load Balancer | $16.43 + LCU, realistically **~$22** at low traffic |
+| Fargate, 3 tasks × 0.25 vCPU / 0.5 GB, **ARM64** | $21.63 |
 | RDS `db.t4g.micro`, single-AZ | $11.68 |
-| RDS gp3 storage, 20 GB | $2.30, up to $5.75 if autoscaling fills |
 | ElastiCache `cache.t4g.micro` ×1 | $11.68 |
+| RDS gp3 storage, 20 GB | $2.30, up to $5.75 if autoscaling fills |
 | KMS customer-managed keys ×2 | $2.00 |
-| S3, CloudWatch Logs | ~$1.00 |
+| Secrets Manager, 3 secrets | $1.20 |
+| S3, ECR, CloudWatch Logs | ~$1.30 |
 
-The NAT gateway is over half of it and buys nothing until #102 exists — nothing
-runs in the private subnets yet, and the data tier has no egress in any
-configuration. Setting `nat_gateway_count = 0` drops this to about **$28/month**
-with no other change. It must be back to at least `1` before the ECS service
-lands, or tasks cannot pull their image.
+Two numbers in that table are estimates rather than list prices and should be
+read as such. The **ALB's LCU charge** depends on connections, and this
+application holds a WebSocket open per viewer, which is the dimension LCUs are
+least forgiving about — $22 is a low-traffic guess, not a ceiling. **NAT data
+processing** is $0.045/GB on everything the private subnets send or receive,
+including every image pull.
+
+### The levers, largest first
+
+- **The NAT gateway is the single biggest line.** `nat_gateway_count = 0` used
+  to drop $32.85 with no other change, and **no longer works**: the tasks live
+  in private subnets and genuinely need egress to pull an image, and
+  `modules/security-groups` rejects an empty NAT list at plan time rather than
+  building a listener nothing can reach. Replacing it with VPC interface
+  endpoints (ECR, S3, Secrets Manager, CloudWatch Logs) is the real alternative
+  — roughly $14/month of endpoints against $33 of NAT — and is not done here.
+- **ARM64 saves ~$5.41/month** against the same shape on X86_64 ($21.63 vs
+  $27.04), which is where the arithmetic in #120 comes from. It is free in every
+  other sense: the images build for it at the same speed and the rest of the
+  environment was already Graviton.
+- **`api_min_capacity = 1`** saves $7.21/month and costs something real: ADR
+  0005's Redis fan-out never executes with one task, so the project's headline
+  feature would run in a shape nothing has exercised.
+- **Destroying the environment** takes it to approximately zero. See
+  OPERATOR-INPUTS.md §5 for what survives `destroy` and keeps billing.
 
 A faithful production shape — NAT per AZ, Multi-AZ RDS, a cache replica — is
-about **$140/month**. `docs/adr/0012-network-shape-and-cost.md` sets out what
-each deviation gives up.
+about **$190/month** on top of the same compute.
+`docs/adr/0012-network-shape-and-cost.md` sets out what each deviation gives up.
 
 ## Three things #102 must know
 
