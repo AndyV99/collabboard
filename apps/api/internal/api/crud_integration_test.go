@@ -453,6 +453,7 @@ func crossTenantCalls(v hierarchy) []crossTenantCall {
 		{"GET /projects/:id", http.MethodGet, "/api/v1/projects/" + v.project.String(), nil},
 		{"PATCH /projects/:id", http.MethodPatch, "/api/v1/projects/" + v.project.String(), map[string]string{"name": "seized"}},
 		{"POST /projects/:id/archive", http.MethodPost, "/api/v1/projects/" + v.project.String() + "/archive", nil},
+		{"DELETE /projects/:id/archive", http.MethodDelete, "/api/v1/projects/" + v.project.String() + "/archive", nil},
 		{"POST /projects/:id/boards", http.MethodPost, "/api/v1/projects/" + v.project.String() + "/boards", map[string]string{"name": "seized"}},
 		{"GET /projects/:id/boards", http.MethodGet, "/api/v1/projects/" + v.project.String() + "/boards", nil},
 		{"GET /boards/:id", http.MethodGet, "/api/v1/boards/" + v.board.String(), nil},
@@ -987,5 +988,160 @@ func TestRevokingAMembershipUnassignsTheirCardsRatherThanFailing(t *testing.T) {
 
 	if strings.Contains(after.raw, bob.userID.String()) {
 		t.Errorf("the card still names a user who is no longer a member: %s", after.raw)
+	}
+}
+
+// Archiving used to be a one-way door: the project left the list, everything
+// inside it stayed reachable if you already knew an id, and nothing in the API
+// would tell you the project existed. A user who archived the wrong project had
+// no way back through the product.
+func TestArchiveAndUnarchiveRoundTrip(t *testing.T) {
+	s := newServer(t, generousLimits())
+
+	alice := s.register(t, "alice")
+	alpha := build(t, s, alice, "alpha", "alpha-one")
+
+	projectPath := "/api/v1/projects/" + alpha.project.String()
+	archivePath := projectPath + "/archive"
+
+	listNames := func(t *testing.T, query string) string {
+		t.Helper()
+
+		resp := s.do(t, http.MethodGet, "/api/v1/projects"+query, alice.accessToken, nil)
+		if resp.status != http.StatusOK {
+			t.Fatalf("listing%s -> %d %s", query, resp.status, resp.raw)
+		}
+
+		return resp.raw
+	}
+
+	t.Run("a new project is in the default list and not the archived one", func(t *testing.T) {
+		if !strings.Contains(listNames(t, ""), alpha.project.String()) {
+			t.Error("a fresh project is missing from the default list")
+		}
+
+		if strings.Contains(listNames(t, "?archived=true"), alpha.project.String()) {
+			t.Error("a fresh project appears in the archived list")
+		}
+	})
+
+	t.Run("archiving moves it between the two lists", func(t *testing.T) {
+		resp := s.do(t, http.MethodPost, archivePath, alice.accessToken, nil)
+
+		t.Logf("archive -> %d %s", resp.status, resp.raw)
+
+		if resp.status != http.StatusOK {
+			t.Fatalf("status = %d, want 200", resp.status)
+		}
+
+		if strings.Contains(listNames(t, ""), alpha.project.String()) {
+			t.Error("an archived project is still in the default list")
+		}
+
+		// The half that did not exist: it is now findable.
+		if !strings.Contains(listNames(t, "?archived=true"), alpha.project.String()) {
+			t.Error("an archived project is not in the archived list either, so it is unreachable")
+		}
+	})
+
+	// The decision this PR makes explicit. Archiving means "stop showing me
+	// this", not "seal it": somebody following a link to a card from a chat
+	// message gets the card, not a wall.
+	t.Run("a board inside an archived project is still readable by id", func(t *testing.T) {
+		resp := s.do(t, http.MethodGet, "/api/v1/boards/"+alpha.board.String(), alice.accessToken, nil)
+
+		t.Logf("board in archived project -> %d %s", resp.status, resp.raw)
+
+		if resp.status != http.StatusOK {
+			t.Errorf("status = %d, want 200: archiving is not a cascade and not a lock", resp.status)
+		}
+	})
+
+	t.Run("unarchiving puts it back", func(t *testing.T) {
+		resp := s.do(t, http.MethodDelete, archivePath, alice.accessToken, nil)
+
+		t.Logf("unarchive -> %d %s", resp.status, resp.raw)
+
+		if resp.status != http.StatusOK {
+			t.Fatalf("status = %d, want 200 (%s)", resp.status, resp.raw)
+		}
+
+		if !strings.Contains(resp.raw, `"archived_at":null`) {
+			t.Errorf("the restored project still carries an archived_at: %s", resp.raw)
+		}
+
+		if !strings.Contains(listNames(t, ""), alpha.project.String()) {
+			t.Error("an unarchived project is not back in the default list")
+		}
+
+		if strings.Contains(listNames(t, "?archived=true"), alpha.project.String()) {
+			t.Error("an unarchived project is still in the archived list")
+		}
+	})
+
+	// Same contract as archive, which is idempotent for the same reason: a
+	// retried request is a success rather than a 404.
+	t.Run("unarchiving an active project is idempotent", func(t *testing.T) {
+		first := s.do(t, http.MethodDelete, archivePath, alice.accessToken, nil)
+		second := s.do(t, http.MethodDelete, archivePath, alice.accessToken, nil)
+
+		t.Logf("unarchive twice -> %d then %d", first.status, second.status)
+
+		if first.status != http.StatusOK || second.status != http.StatusOK {
+			t.Errorf("statuses = %d, %d; both should be 200", first.status, second.status)
+		}
+	})
+
+	t.Run("archiving twice keeps the original timestamp", func(t *testing.T) {
+		first := s.do(t, http.MethodPost, archivePath, alice.accessToken, nil)
+		second := s.do(t, http.MethodPost, archivePath, alice.accessToken, nil)
+
+		if first.status != http.StatusOK || second.status != http.StatusOK {
+			t.Fatalf("statuses = %d, %d; both should be 200", first.status, second.status)
+		}
+
+		if first.raw != second.raw {
+			t.Errorf("archiving twice changed the row:\n  first:  %s\n  second: %s", first.raw, second.raw)
+		}
+	})
+
+	// An unparseable filter is an error, not a silent false. `?archived=yes` is
+	// what people type, and answering it with the unfiltered list is a wrong
+	// answer delivered with a 200.
+	t.Run("an unparseable archived filter is refused", func(t *testing.T) {
+		resp := s.do(t, http.MethodGet, "/api/v1/projects?archived=yes", alice.accessToken, nil)
+
+		t.Logf("?archived=yes -> %d %s", resp.status, resp.raw)
+
+		if resp.status != http.StatusBadRequest {
+			t.Errorf("status = %d, want 400 (%s)", resp.status, resp.raw)
+		}
+	})
+}
+
+// The archived list is tenant-scoped like every other list. Without this, a
+// second collection reachable only through a query parameter is exactly the
+// kind of surface that gets added without a policy behind it.
+func TestTheArchivedListIsTenantScoped(t *testing.T) {
+	s := newServer(t, generousLimits())
+
+	alice := s.register(t, "alice")
+	bob := s.register(t, "bob")
+
+	alpha := build(t, s, alice, "alpha", "alpha-one")
+
+	archived := s.do(t, http.MethodPost,
+		"/api/v1/projects/"+alpha.project.String()+"/archive", alice.accessToken, nil)
+	if archived.status != http.StatusOK {
+		t.Fatalf("archiving failed: %d %s", archived.status, archived.raw)
+	}
+
+	resp := s.do(t, http.MethodGet, "/api/v1/projects?archived=true", bob.accessToken, nil)
+
+	t.Logf("bob reads the archived list -> %d %s", resp.status, resp.raw)
+
+	if strings.Contains(resp.raw, alpha.project.String()) ||
+		strings.Contains(resp.raw, "alpha project") {
+		t.Errorf("bob can see alice's archived project: %s", resp.raw)
 	}
 }

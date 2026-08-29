@@ -158,6 +158,31 @@ SET archived_at = coalesce(archived_at, now())
 WHERE id = @project_id
 RETURNING *;
 
+-- name: UnarchiveProject :one
+-- The other direction, idempotent by construction: unarchiving an active
+-- project writes the null it already holds and returns the row, so a retried
+-- request is a success rather than a 404 -- the same contract as ArchiveProject
+-- and for the same reason.
+--
+-- Nothing cascades, because nothing cascaded on the way in. Archiving never
+-- touched the project's boards, columns or cards, so there is no state to
+-- restore here beyond the flag itself.
+UPDATE projects
+SET archived_at = NULL
+WHERE id = @project_id
+RETURNING *;
+
+-- name: ListArchivedProjects :many
+-- The counterpart to ListProjects, which filters these out.
+--
+-- Most recently archived first, rather than by name: the caller is somebody
+-- looking for the project they just archived by mistake, and that one is at the
+-- top. Name is the tiebreak so the order is total and a test can rely on it.
+SELECT *
+FROM projects
+WHERE archived_at IS NOT NULL
+ORDER BY archived_at DESC, name;
+
 -- name: CreateBoard :one
 -- INSERT ... SELECT rather than VALUES, so that a project id naming a row this
 -- tenant cannot see produces *no row* instead of a foreign-key violation. The
