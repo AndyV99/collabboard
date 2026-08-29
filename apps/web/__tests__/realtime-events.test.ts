@@ -42,6 +42,8 @@ function cardBody(id: string, columnId: string, title: string, description = "")
     column_id: columnId,
     title,
     description,
+    assignee_id: null,
+    due_at: null,
     created_at: "2026-08-02T09:00:00Z",
     updated_at: "2026-08-02T09:00:00Z",
   };
@@ -90,6 +92,8 @@ function card(id: string, columnId: string, title: string): Card {
     columnId,
     title,
     description: "",
+    assigneeId: null,
+    dueAt: null,
     createdAt: "2026-08-02T09:00:00Z",
     updatedAt: "2026-08-02T09:00:00Z",
   };
@@ -284,6 +288,44 @@ describe("parsing each event type", () => {
 });
 
 describe("applying an event to the board", () => {
+  it("carries somebody else's assignment onto this board", () => {
+    /*
+     * The other half of #157: assigning a card in one browser has to show in
+     * another. `patchCardHandler` publishes `newCardBody(card)` — the whole
+     * card, not the fields that changed — so this event is a wholesale replace
+     * and every field on it is stated, `null` included.
+     */
+    const assigned = applyLiveEvent(
+      board(),
+      eventOf("card.updated", {
+        card: {
+          ...cardBody("card-1", "c-doing", "Alpha"),
+          assignee_id: "user-dana",
+          due_at: "2026-08-31T17:00:00Z",
+        },
+      }),
+    );
+
+    const card = assigned.columns[1].cards.find((entry) => entry.id === "card-1");
+
+    expect(card).toMatchObject({
+      assigneeId: "user-dana",
+      dueAt: "2026-08-31T17:00:00Z",
+    });
+
+    // And the unassignment, which is the one an `??` in `applyBoardChange`
+    // would silently drop — leaving this board showing Dana on a card nobody
+    // is on any more.
+    const unassigned = applyLiveEvent(
+      assigned,
+      eventOf("card.updated", { card: cardBody("card-1", "c-doing", "Alpha") }),
+    );
+
+    expect(
+      unassigned.columns[1].cards.find((entry) => entry.id === "card-1"),
+    ).toMatchObject({ assigneeId: null, dueAt: null });
+  });
+
   it("moves a card to the position the anchor names", () => {
     const after = applyLiveEvent(
       board(),

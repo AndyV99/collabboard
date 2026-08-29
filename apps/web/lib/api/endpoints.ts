@@ -264,23 +264,85 @@ export function getCard(cardId: string): Endpoint<Card> {
   return { method: "GET", path: `/cards/${seg(cardId)}`, parse: card };
 }
 
+/**
+ * `POST /columns/:id/cards`.
+ *
+ * `assigneeId` and `dueAt` are plain optionals here, matching
+ * `createCardRequest` on the other side: a card being created has no prior
+ * value, so absent and null both mean "nobody" and "no date". That is exactly
+ * the distinction {@link updateCard} cannot collapse.
+ */
 export function createCard(
   columnId: string,
-  input: { title: string; description?: string },
+  input: {
+    title: string;
+    description?: string;
+    assigneeId?: string;
+    dueAt?: string;
+  },
 ): Endpoint<Card> {
   return {
     method: "POST",
     path: `/columns/${seg(columnId)}/cards`,
-    body: input,
+    body: {
+      title: input.title,
+      description: input.description,
+      assignee_id: input.assigneeId,
+      due_at: input.dueAt,
+    },
     parse: card,
   };
 }
 
-export function updateCard(
-  cardId: string,
-  input: { title?: string; description?: string },
-): Endpoint<Card> {
-  return { method: "PATCH", path: `/cards/${seg(cardId)}`, body: input, parse: card };
+/**
+ * A card edit, in the three states `PATCH /cards/:id` distinguishes.
+ *
+ * `assigneeId` and `dueAt` reach nullable columns, and the API reads them
+ * through `Optional[string]` (`internal/api/optional.go`) precisely so that
+ * three different requests can be told apart:
+ *
+ * - **absent** — leave the field as it is;
+ * - **`null`** — clear it: unassign the card, or take the due date off;
+ * - **a string** — set it.
+ *
+ * `undefined` is how a caller says "absent", because {@link updateCard} drops
+ * such a key before it builds the body. There is deliberately no way to send an
+ * explicit `undefined`: a JSON body cannot carry one, and a key whose value
+ * `JSON.stringify` would silently delete is not a third state, it is a bug
+ * waiting for someone to write `assigneeId: maybeUndefined` and mean "clear".
+ */
+export type CardPatch = {
+  title?: string;
+  description?: string;
+  assigneeId?: string | null;
+  dueAt?: string | null;
+};
+
+export function updateCard(cardId: string, input: CardPatch): Endpoint<Card> {
+  // Built key by key rather than spread, because the whole contract of this
+  // request is *which keys are present*. A `{ ...input }` with an `assigneeId`
+  // the caller left undefined would look identical to one they set to null
+  // after `JSON.stringify` had finished with it — the difference between
+  // "leave the assignee alone" and "unassign this card".
+  const body: Record<string, string | null> = {};
+
+  if (input.title !== undefined) {
+    body.title = input.title;
+  }
+
+  if (input.description !== undefined) {
+    body.description = input.description;
+  }
+
+  if (input.assigneeId !== undefined) {
+    body.assignee_id = input.assigneeId;
+  }
+
+  if (input.dueAt !== undefined) {
+    body.due_at = input.dueAt;
+  }
+
+  return { method: "PATCH", path: `/cards/${seg(cardId)}`, body, parse: card };
 }
 
 /**

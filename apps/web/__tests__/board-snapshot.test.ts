@@ -38,6 +38,8 @@ function card(id: string, columnId: string, title: string, createdAt: string): C
     columnId,
     title,
     description: "",
+    assigneeId: null,
+    dueAt: null,
     createdAt,
     updatedAt: createdAt,
   };

@@ -43,6 +43,8 @@ function card(id: string, columnId: string, title: string, description = ""): Ca
     columnId,
     title,
     description,
+    assigneeId: null,
+    dueAt: null,
     createdAt: "2026-08-02T09:00:00Z",
     updatedAt: "2026-08-02T09:00:00Z",
   };
@@ -127,6 +129,80 @@ describe("cards", () => {
 
     // `optionalText(..., allowEmpty: true)` on the API means "" is a value.
     expect(next.columns[0].cards[0].description).toBe("");
+  });
+
+  it("assigns, reassigns and unassigns, and can tell the three apart", () => {
+    /*
+     * The one branch in this reducer where `??` would be a bug. `assignee_id`
+     * reaches a nullable column and the API distinguishes absent from null, so
+     * "nobody is assigned to this any more" has to be expressible — and a
+     * reducer that read null as "leave it alone" would draw the *old* assignee
+     * until the refresh landed and then visibly drop them.
+     */
+    const assigned = applyBoardChange(SNAPSHOT, {
+      kind: "card.updated",
+      cardId: "card-2",
+      assigneeId: "user-dana",
+    });
+
+    expect(assigned.columns[1].cards[1].assigneeId).toBe("user-dana");
+
+    const reassigned = applyBoardChange(assigned, {
+      kind: "card.updated",
+      cardId: "card-2",
+      assigneeId: "user-sam",
+    });
+
+    expect(reassigned.columns[1].cards[1].assigneeId).toBe("user-sam");
+
+    const unassigned = applyBoardChange(reassigned, {
+      kind: "card.updated",
+      cardId: "card-2",
+      assigneeId: null,
+    });
+
+    expect(unassigned.columns[1].cards[1].assigneeId).toBeNull();
+  });
+
+  it("leaves the assignee alone when the change does not mention one", () => {
+    const assigned = applyBoardChange(SNAPSHOT, {
+      kind: "card.updated",
+      cardId: "card-2",
+      assigneeId: "user-dana",
+      dueAt: "2026-08-31T17:00:00Z",
+    });
+
+    // A rename must not unassign the card, which is exactly what an
+    // `assigneeId: undefined` treated as null would do.
+    const renamed = applyBoardChange(assigned, {
+      kind: "card.updated",
+      cardId: "card-2",
+      title: "Kilo renamed",
+    });
+
+    expect(renamed.columns[1].cards[1]).toMatchObject({
+      title: "Kilo renamed",
+      assigneeId: "user-dana",
+      dueAt: "2026-08-31T17:00:00Z",
+    });
+  });
+
+  it("sets and clears a due date", () => {
+    const dated = applyBoardChange(SNAPSHOT, {
+      kind: "card.updated",
+      cardId: "card-2",
+      dueAt: "2026-08-31T17:00:00Z",
+    });
+
+    expect(dated.columns[1].cards[1].dueAt).toBe("2026-08-31T17:00:00Z");
+
+    const cleared = applyBoardChange(dated, {
+      kind: "card.updated",
+      cardId: "card-2",
+      dueAt: null,
+    });
+
+    expect(cleared.columns[1].cards[1].dueAt).toBeNull();
   });
 
   it("removes a deleted card and leaves the rest in order", () => {
