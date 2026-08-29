@@ -132,6 +132,7 @@ resource "aws_security_group" "alb" {
 }
 
 resource "aws_vpc_security_group_ingress_rule" "alb_http" {
+  # checkov:skip=CKV_AWS_260:The listener on this port issues a 301 to HTTPS and routes to no target group -- see modules/alb, aws_lb_listener.http. Refusing port 80 outright would not improve security; it would mean a person typing the hostname without a scheme gets a connection timeout instead of being redirected, and browsers try http:// first. Skipped inline rather than in .checkov.yml on purpose: a DIFFERENT rule opening port 80 to the internet should still fail the build.
   security_group_id = aws_security_group.alb.id
   description       = "HTTP from anywhere; the listener does nothing but redirect to HTTPS"
   cidr_ipv4         = "0.0.0.0/0"
