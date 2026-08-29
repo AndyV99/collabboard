@@ -64,12 +64,96 @@ env:
 
 jobs:
   # ---------------------------------------------------------------------------
+  # Is there anything to deploy to?
+  # ---------------------------------------------------------------------------
+  # Until an AWS account has been applied to, none of the repository variables
+  # below exist, and every job after this one would fail at
+  # `configure-aws-credentials` with "Could not load credentials from any
+  # providers". That was the state of `main` after #103 merged: every single
+  # push produced a red CD run.
+  #
+  # Which is a worse outcome than it looks. This repository has twice argued
+  # that a permanently red gate is one people learn to route around --
+  # .checkov.yml says it, .trivyignore says it -- and CD is that at the loudest
+  # setting, because it notifies on every merge. The day a deploy genuinely
+  # breaks, the failure would look identical to the two hundred before it.
+  #
+  # So: no deploy identity means skip, loudly and on purpose. Not silently --
+  # a workflow that quietly does nothing is how "CD is set up" stays true on
+  # paper for six months. The notice names what is missing and where the list
+  # lives.
+  #
+  # Every required variable is checked here, before any credential is requested,
+  # because a run that assumes the role and then dies on a missing
+  # ECS_CLUSTER_NAME has burned an OIDC exchange to report something a string
+  # comparison could have.
+  preflight:
+    name: preflight
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      configured: ${{ steps.check.outputs.configured }}
+    steps:
+      - name: Check the deploy identity and its inputs
+        id: check
+        env:
+          AWS_DEPLOY_ROLE_ARN: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
+          ECS_CLUSTER_NAME: ${{ vars.ECS_CLUSTER_NAME }}
+          API_SERVICE_NAME: ${{ vars.API_SERVICE_NAME }}
+          WEB_SERVICE_NAME: ${{ vars.WEB_SERVICE_NAME }}
+          API_REPOSITORY_URL: ${{ vars.API_REPOSITORY_URL }}
+          WEB_REPOSITORY_URL: ${{ vars.WEB_REPOSITORY_URL }}
+          MIGRATE_TASK_DEFINITION: ${{ vars.MIGRATE_TASK_DEFINITION }}
+          RUN_TASK_NETWORK_CONFIGURATION: ${{ vars.RUN_TASK_NETWORK_CONFIGURATION }}
+          WEB_URL: ${{ vars.WEB_URL }}
+        run: |
+          set -euo pipefail
+
+          required="AWS_DEPLOY_ROLE_ARN ECS_CLUSTER_NAME API_SERVICE_NAME
+                    WEB_SERVICE_NAME API_REPOSITORY_URL WEB_REPOSITORY_URL
+                    MIGRATE_TASK_DEFINITION RUN_TASK_NETWORK_CONFIGURATION WEB_URL"
+
+          missing=""
+          for name in $required; do
+            if [ -z "${!name:-}" ]; then
+              missing="${missing} ${name}"
+            fi
+          done
+
+          if [ -z "$missing" ]; then
+            echo 'configured=true' >> "$GITHUB_OUTPUT"
+            echo "::notice title=Deploying::All deploy variables are set."
+            exit 0
+          fi
+
+          echo 'configured=false' >> "$GITHUB_OUTPUT"
+
+          # The distinction that keeps this from becoming a permanent excuse:
+          # nothing configured is "not stood up yet"; SOME things configured is
+          # a half-finished setup, which is a mistake somebody should see rather
+          # than a state to skip past quietly.
+          if [ -z "${AWS_DEPLOY_ROLE_ARN:-}" ] && [ "$(echo $missing | wc -w)" -eq 9 ]; then
+            echo "::notice title=No deploy target yet::Skipping deploy. No AWS environment has been applied, so none of the deploy variables are set."
+            echo 'This is expected until the staging environment exists. The variables, what each one'
+            echo 'is for, and the `terraform output` that produces it are listed in'
+            echo 'infra/terraform/OPERATOR-INPUTS.md section 2.6.'
+            exit 0
+          fi
+
+          echo "::error title=Partially configured::Some deploy variables are set and these are not:${missing}"
+          echo 'A half-configured pipeline is a mistake rather than a state to skip past. See'
+          echo 'infra/terraform/OPERATOR-INPUTS.md section 2.6 for the full list and its sources.'
+          exit 1
+
+  # ---------------------------------------------------------------------------
   # Build and push. One job, both images, because they share the login and the
   # SHA and splitting them would double the OIDC exchange for no parallelism
   # worth having at this size.
   # ---------------------------------------------------------------------------
   build:
     name: build and push
+    needs: preflight
+    if: needs.preflight.outputs.configured == 'true'
     # An arm64 runner, because the task definitions declare ARM64 (#120) and
     # the two images reach that differently. apps/api cross-compiles -- CGO is
     # off, so Go targets arm64 from any builder for free -- but apps/web cannot:
