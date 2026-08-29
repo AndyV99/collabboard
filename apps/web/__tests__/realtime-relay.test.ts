@@ -18,7 +18,13 @@
 
 import { describe, expect, it, vi } from "vitest";
 
-import { relayBoardStream, type RelaySocket } from "@/lib/realtime/relay";
+import {
+  DEFAULT_RELAY_BUFFER_BYTES,
+  RELAY_BUFFER_ENV,
+  relayBoardStream,
+  relayBufferBytes,
+  type RelaySocket,
+} from "@/lib/realtime/relay";
 import { apiWebSocketUrl, looksLikeUuid } from "@/lib/realtime/stream";
 
 const BOARD = "11111111-1111-4111-8111-111111111111";
@@ -144,7 +150,9 @@ describe("relaying", () => {
 
     relay.handlers.open?.();
 
-    expect(relay.sent).toEqual([JSON.stringify({ type: "subscribe", board_id: BOARD })]);
+    expect(relay.sent).toEqual([
+      JSON.stringify({ type: "subscribe", board_id: BOARD }),
+    ]);
   });
 
   it("passes frames through untouched, so the browser parses them once", async () => {
@@ -244,7 +252,9 @@ describe("resolving the API's WebSocket URL", () => {
     // Two environment variables naming one service is two things to get out of
     // step, and the failure when they disagree is a realtime path silently
     // pointed at the wrong environment while every REST call is correct.
-    expect(apiWebSocketUrl("http://localhost:8080")).toBe("ws://localhost:8080/api/v1/ws");
+    expect(apiWebSocketUrl("http://localhost:8080")).toBe(
+      "ws://localhost:8080/api/v1/ws",
+    );
     expect(apiWebSocketUrl("https://api.example.com")).toBe(
       "wss://api.example.com/api/v1/ws",
     );
@@ -264,4 +274,160 @@ describe("refusing a board id before opening anything", () => {
     expect(looksLikeUuid("../../auth/refresh")).toBe(false);
     expect(looksLikeUuid("")).toBe(false);
   });
+});
+
+/**
+ * Backpressure (#99).
+ *
+ * The relay reads the upstream socket as fast as the API produces frames,
+ * whether or not the browser is reading — that is what makes it a relay. Before
+ * this bound, a browser that stopped reading did not slow it down; it made this
+ * process hold every frame for it, in memory, without limit. A backgrounded tab
+ * whose socket is throttled, a suspended laptop, a congested link: all of them.
+ *
+ * The API bounds exactly this for its own connections (REALTIME_SEND_BUFFER,
+ * 4002) and that protects the API, not the web tier — behind the relay, the
+ * API's consumer is always reading.
+ */
+describe("a browser that stops reading", () => {
+  /** Starts a relay whose stream is never read from. */
+  function startUnread(maxBufferedBytes: number) {
+    const fake = fakeSocket();
+    const controller = new AbortController();
+
+    const stream = relayBoardStream({
+      boardId: BOARD,
+      accessToken: TOKEN,
+      url: "ws://api.test/api/v1/ws",
+      signal: controller.signal,
+      heartbeatMs: 10_000,
+      maxBufferedBytes,
+      openSocket: () => fake.socket,
+    });
+
+    return { ...fake, stream, controller };
+  }
+
+  /** One frame whose encoded size is comfortably known. */
+  function pushFrame(handlers: Handlers, index: number): void {
+    handlers.message?.({
+      data: JSON.stringify({
+        type: "card.updated",
+        payload: "x".repeat(200),
+        index,
+      }),
+    });
+  }
+
+  it("is dropped once it is far enough behind, instead of buffering forever", async () => {
+    const relay = startUnread(1000);
+
+    relay.handlers.open?.();
+
+    // Nothing reads `relay.stream`. Every frame accumulates.
+    for (let i = 0; i < 50; i++) {
+      pushFrame(relay.handlers, i);
+    }
+
+    // The upstream socket is released rather than left draining into a stream
+    // nobody is taking from — which is the memory that was leaking.
+    expect(relay.closes.length).toBeGreaterThan(0);
+
+    // And the last thing written is the close, so the browser is told rather
+    // than left to infer it from a stream that simply stops.
+    const reader = relay.stream.getReader();
+    const decoder = new TextDecoder();
+    const messages: string[] = [];
+
+    for (;;) {
+      const { done, value } = await reader.read();
+
+      if (done) {
+        break;
+      }
+
+      messages.push(decoder.decode(value));
+    }
+
+    const last = messages[messages.length - 1] ?? "";
+
+    expect(last).toContain(`"t":"closed"`);
+    expect(last).toContain(`"code":4002`);
+  });
+
+  // The bound has to be a bound, not merely an eventual stop: the whole point
+  // is that the queue does not grow with the number of frames the API sends.
+  it("stops accumulating rather than growing with the flood", async () => {
+    const small = startUnread(1000);
+
+    small.handlers.open?.();
+
+    for (let i = 0; i < 5000; i++) {
+      pushFrame(small.handlers, i);
+    }
+
+    const reader = small.stream.getReader();
+    const decoder = new TextDecoder();
+    let buffered = 0;
+
+    for (;;) {
+      const { done, value } = await reader.read();
+
+      if (done) {
+        break;
+      }
+
+      buffered += decoder.decode(value).length;
+    }
+
+    // 5000 frames of ~250 bytes would be well over a megabyte unbounded. The
+    // ceiling is the budget plus the one frame that crossed it plus the close.
+    expect(buffered).toBeLessThan(1000 * 3);
+  });
+
+  // A reading browser must be untouched by any of this. Without this the fix
+  // could "pass" by shedding everybody.
+  it("does not drop a browser that is keeping up", async () => {
+    const relay = start();
+
+    relay.handlers.open?.();
+
+    for (let i = 0; i < 200; i++) {
+      relay.handlers.message?.({
+        data: JSON.stringify({ type: "card.updated", index: i }),
+      });
+      // Read as we go, which is what a live browser does.
+      await relay.drain(relay.seen.length + 1);
+    }
+
+    const everything = relay.seen.join("");
+
+    expect(everything).not.toContain(`"code":4002`);
+    expect(relay.closes).toHaveLength(0);
+  });
+});
+
+describe("the relay buffer setting", () => {
+  it("defaults when unset", () => {
+    expect(relayBufferBytes({})).toBe(DEFAULT_RELAY_BUFFER_BYTES);
+    expect(relayBufferBytes({ [RELAY_BUFFER_ENV]: "  " })).toBe(
+      DEFAULT_RELAY_BUFFER_BYTES,
+    );
+  });
+
+  it("takes a usable value", () => {
+    expect(relayBufferBytes({ [RELAY_BUFFER_ENV]: "4096" })).toBe(4096);
+  });
+
+  // A zero or negative budget sheds every viewer on their first frame, which is
+  // a denial of service written as a configuration value. `Number("")` is 0 and
+  // `Number("1MB")` is NaN, so both shapes have to be caught.
+  it.each(["0", "-1", "1MB", "abc", "1.5", ""])(
+    "falls back rather than accepting %s",
+    (value) => {
+      expect(relayBufferBytes({ [RELAY_BUFFER_ENV]: value })).toBe(
+        DEFAULT_RELAY_BUFFER_BYTES,
+      );
+    },
+  );
 });
