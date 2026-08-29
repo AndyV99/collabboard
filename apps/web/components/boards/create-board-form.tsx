@@ -7,7 +7,7 @@ import { api } from "@/lib/api/browser";
 import { createBoard } from "@/lib/api/endpoints";
 import { describeWriteFailure } from "@/lib/workspace/outcomes";
 import { boardHref } from "@/lib/workspace/routes";
-import { MAX_NAME_CODE_POINTS, validateName } from "@/lib/workspace/rules";
+import { MAX_NAME_CODE_POINTS, maxLengthFor, validateName } from "@/lib/workspace/rules";
 import { FormMessage, TextField } from "@/components/workspace/fields";
 import styles from "@/components/workspace/workspace.module.css";
 
@@ -108,7 +108,7 @@ export function CreateBoardForm({
         id={nameId}
         inputRef={nameRef}
         label="Board name"
-        maxLength={MAX_NAME_CODE_POINTS}
+        maxLength={maxLengthFor(MAX_NAME_CODE_POINTS)}
         onChange={setName}
         value={name}
       />

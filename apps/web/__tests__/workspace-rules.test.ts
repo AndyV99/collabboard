@@ -10,10 +10,13 @@
 
 import { describe, expect, it } from "vitest";
 
+import { byteLength, codePointLength } from "@/lib/auth/rules";
 import {
   MAX_DESCRIPTION_CODE_POINTS,
   MAX_EMAIL_BYTES,
   MAX_NAME_CODE_POINTS,
+  maxLengthFor,
+  maxLengthForBytes,
   projectChanged,
   validateDescription,
   validateMemberEmail,
@@ -126,5 +129,83 @@ describe("projectChanged", () => {
 
   it("is true when the description is being cleared", () => {
     expect(projectChanged(project, { name: "Launch", description: "" })).toBe(true);
+  });
+});
+
+/**
+ * The `maxLength` attribute, which counts in a third unit again.
+ *
+ * `maxLength` is **UTF-16 code units**. The API counts names in code points and
+ * addresses in bytes, so the attribute has to be derived from each rather than
+ * borrowed, and the direction of the error matters: looser than the API is a
+ * courtesy stop that lets the real check speak, while stricter is a refusal
+ * with no authority behind it — the browser silently truncating input the
+ * server would have accepted, with no message and nothing to read.
+ */
+describe("maxLengthFor", () => {
+  it("is never stricter than the code-point limit it is derived from", () => {
+    // The property, over the four shapes a code point can take in UTF-16 and
+    // UTF-8. A code point is at most two code units, so twice is the smallest
+    // safe multiplier — asserting `>=` rather than `=== 2 * n` leaves room for
+    // a future value that is more generous still.
+    for (const character of ["a", "é", "字", "🙂", "👩‍🔬"]) {
+      for (const limit of [1, 10, MAX_NAME_CODE_POINTS, MAX_DESCRIPTION_CODE_POINTS]) {
+        const atTheLimit = character.repeat(limit);
+
+        if (codePointLength(atTheLimit) > limit) {
+          // A grapheme cluster like 👩‍🔬 is several code points, so repeating it
+          // `limit` times overshoots. The API would refuse it too, so it says
+          // nothing about the attribute.
+          continue;
+        }
+
+        expect(atTheLimit.length).toBeLessThanOrEqual(maxLengthFor(limit));
+      }
+    }
+  });
+
+  it("admits a name of exactly 200 emoji, which the API accepts", () => {
+    // 200 code points to `utf8.RuneCountInString`, 400 code units to the
+    // browser. `maxLength={200}` would have stopped this at 100 emoji.
+    const name = "🙂".repeat(MAX_NAME_CODE_POINTS);
+
+    expect(codePointLength(name)).toBe(MAX_NAME_CODE_POINTS);
+    expect(name.length).toBe(MAX_NAME_CODE_POINTS * 2);
+    expect(validateName(name, "Project")).toBeUndefined();
+    expect(name.length).toBeLessThanOrEqual(maxLengthFor(MAX_NAME_CODE_POINTS));
+  });
+});
+
+describe("maxLengthForBytes", () => {
+  it("is never stricter than the byte limit it is derived from", () => {
+    /*
+     * The identity function, and the reason it is safe: the cheapest a UTF-16
+     * code unit can be in UTF-8 is one byte, for ASCII. So a string the
+     * attribute admits at N units is at least N bytes and at most whatever
+     * non-ASCII inflates it to — the attribute can only ever be looser.
+     *
+     * Asserted rather than reasoned about, because the whole of #87 was a unit
+     * confusion that read as obviously fine.
+     */
+    for (const character of ["a", "é", "字", "🙂"]) {
+      const atTheAttributeLimit = character.repeat(
+        Math.floor(maxLengthForBytes(MAX_EMAIL_BYTES) / character.length),
+      );
+
+      expect(atTheAttributeLimit.length).toBeLessThanOrEqual(
+        maxLengthForBytes(MAX_EMAIL_BYTES),
+      );
+      expect(byteLength(atTheAttributeLimit)).toBeGreaterThanOrEqual(
+        atTheAttributeLimit.length,
+      );
+    }
+  });
+
+  it("admits every address the API would, ASCII being the tight case", () => {
+    const longest = `${"a".repeat(MAX_EMAIL_BYTES - "@b.c".length)}@b.c`;
+
+    expect(byteLength(longest)).toBe(MAX_EMAIL_BYTES);
+    expect(validateMemberEmail(longest)).toBeUndefined();
+    expect(longest.length).toBeLessThanOrEqual(maxLengthForBytes(MAX_EMAIL_BYTES));
   });
 });

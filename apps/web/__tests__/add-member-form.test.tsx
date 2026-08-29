@@ -19,6 +19,7 @@ vi.mock("next/navigation", () => ({
 const { __resetBrowserApiForTests } = await import("@/lib/api/browser");
 const { AddMemberForm } = await import("@/components/members/add-member-form");
 const { ROLE_ADMIN, grantableRoles } = await import("@/lib/workspace/roles");
+const { MAX_EMAIL_BYTES, maxLengthForBytes } = await import("@/lib/workspace/rules");
 
 type FetchStub = (input: string, init?: RequestInit) => Promise<Response>;
 
@@ -190,5 +191,27 @@ describe("what it says afterwards", () => {
     submit();
 
     await waitFor(() => expect(screen.getByRole("alert")).toHaveFocus());
+  });
+});
+
+describe("the address field's limit", () => {
+  it("is derived from the byte limit, which is a different unit again", () => {
+    /*
+     * `maxEmailLength` counts bytes; `maxLength` counts UTF-16 code units. The
+     * two happen to coincide at the same number, because the cheapest a code
+     * unit can be in UTF-8 is one byte — so the attribute can only ever be
+     * looser than the API, never tighter.
+     *
+     * The coincidence is why this is worth an assertion. `maxLength={254}`
+     * derived from a byte limit looks exactly like the #87 bug, and the next
+     * reader "fixing" it to `maxLengthFor(254)` would be changing a number that
+     * was already right.
+     */
+    render(<AddMemberForm roles={grantableRoles("owner")} />);
+
+    expect(screen.getByLabelText("Email address")).toHaveAttribute(
+      "maxlength",
+      String(maxLengthForBytes(MAX_EMAIL_BYTES)),
+    );
   });
 });

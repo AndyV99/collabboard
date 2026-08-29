@@ -17,6 +17,11 @@ vi.mock("next/navigation", () => ({
 }));
 
 const { __resetBrowserApiForTests } = await import("@/lib/api/browser");
+const {
+  MAX_DESCRIPTION_CODE_POINTS,
+  MAX_NAME_CODE_POINTS,
+  maxLengthFor,
+} = await import("@/lib/workspace/rules");
 const { CreateProjectForm } = await import("@/components/projects/create-project-form");
 const { RenameProjectForm } = await import("@/components/projects/rename-project-form");
 const { ArchiveProject } = await import("@/components/projects/archive-project");
@@ -343,5 +348,64 @@ describe("CreateBoardForm", () => {
     submitVia("Create board");
 
     await waitFor(() => expect(screen.getByRole("alert")).toHaveTextContent("Reload"));
+  });
+});
+
+/**
+ * The `maxLength` attribute on every workspace form (#87).
+ *
+ * These forms were written before `maxLengthFor` existed and passed the
+ * code-point limit straight through. `maxLength` counts **UTF-16 code units**,
+ * so a 200-code-point limit used as the attribute stops a name at 100 emoji —
+ * the browser silently truncating input the API would have accepted, with no
+ * message and nothing for the user to read.
+ *
+ * The attribute is what is asserted, not the typing. jsdom does not enforce
+ * `maxLength` on a programmatic `change`, so a test that typed 200 emoji and
+ * submitted would pass against the bug — which is exactly how this survived
+ * three screens. `__tests__/workspace-rules.test.ts` covers the arithmetic.
+ */
+describe("field limits are the API's, in the API's units", () => {
+  function limitOf(label: string | RegExp): number {
+    return Number(screen.getByLabelText(label).getAttribute("maxlength"));
+  }
+
+  it("lets a 200-emoji project name through on the create form", () => {
+    render(<CreateProjectForm />);
+
+    expect(limitOf("Project name")).toBe(maxLengthFor(MAX_NAME_CODE_POINTS));
+    expect(limitOf(/Description/)).toBe(maxLengthFor(MAX_DESCRIPTION_CODE_POINTS));
+    expect("🙂".repeat(MAX_NAME_CODE_POINTS).length).toBeLessThanOrEqual(
+      limitOf("Project name"),
+    );
+  });
+
+  it("lets a 200-emoji project name through on the rename form", () => {
+    render(<RenameProjectForm project={PROJECT} />);
+
+    expect(limitOf("Project name")).toBe(maxLengthFor(MAX_NAME_CODE_POINTS));
+    expect(limitOf(/Description/)).toBe(maxLengthFor(MAX_DESCRIPTION_CODE_POINTS));
+  });
+
+  it("lets a 200-emoji board name through", () => {
+    render(<CreateBoardForm projectId="p-1" />);
+
+    expect(limitOf("Board name")).toBe(maxLengthFor(MAX_NAME_CODE_POINTS));
+  });
+
+  it("sends a 200-emoji name whole, because the rule is the rule and not the attribute", async () => {
+    // The behavioural half. It does not exercise the attribute — see the note
+    // above — but it does prove `validateName` counts the way Go counts, so the
+    // client is not refusing what the browser now lets through.
+    const fetchStub = respond(201, { project: PROJECT_BODY });
+    const name = "🙂".repeat(MAX_NAME_CODE_POINTS);
+
+    vi.stubGlobal("fetch", fetchStub);
+    render(<CreateProjectForm />);
+    fill("Project name", name);
+    submitVia(/Create project/);
+
+    await waitFor(() => expect(fetchStub).toHaveBeenCalled());
+    expect(sentBody(fetchStub)).toEqual({ name, description: "" });
   });
 });

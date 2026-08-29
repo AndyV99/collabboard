@@ -65,11 +65,34 @@ export type FieldError = string | undefined;
  * `components/workspace/fields.tsx` says it is — a courtesy stop against a
  * runaway paste — and {@link validateName} and friends remain the rule.
  *
- * The forms written before #64 pass the limit itself. Filed as its own issue
- * rather than corrected here, because it is a bug in three other screens.
+ * Every form derived from a code-point limit goes through here. #87 was the
+ * three screens written before this function existed and passed the limit
+ * itself.
  */
 export function maxLengthFor(codePoints: number): number {
   return codePoints * 2;
+}
+
+/**
+ * A `maxLength` attribute that cannot be stricter than a **byte** limit.
+ *
+ * The third unit on this screen, and the one that looks like a mistake and is
+ * not. `maxEmailLength` counts bytes (`len()` in Go); `maxLength` counts UTF-16
+ * code units; and the smallest number of bytes a code unit can cost is **one**,
+ * for ASCII. So a string of N code units is at least N bytes, and any string the
+ * attribute admits at N is one the byte limit was going to admit too — every
+ * non-ASCII character makes the attribute *looser*, never tighter, which is the
+ * safe direction and the one this file's opening rule allows.
+ *
+ * It is therefore the identity function, and it exists anyway. `maxLength={254}`
+ * derived from a byte limit is indistinguishable at the call site from
+ * `maxLength={200}` derived from a code-point limit, which is the bug #87 was
+ * about; naming the unit is what stops the next reader "fixing" the one that is
+ * already right. It is also where the change would land if `maxEmailLength` ever
+ * became a rune count.
+ */
+export function maxLengthForBytes(bytes: number): number {
+  return bytes;
 }
 
 /**
