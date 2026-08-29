@@ -33,8 +33,43 @@ describe("describeLoadFailure", () => {
     ["unauthorized", false],
     ["forbidden", false],
     ["not_found", false],
+    // A malformed id in the URL. Retrying produces the identical 400 forever,
+    // so offering the button is a loop with no exit.
+    ["bad_request", false],
   ])("offers a retry for %s: %s", (kind, retryable) => {
     expect(describeLoadFailure(error(kind), "projects").retryable).toBe(retryable);
+  });
+
+  // #82. `pathUUID` in crud.go answers 400 for a malformed id before any lookup
+  // happens, so every workspace screen can produce one from a hand-edited or
+  // truncated URL -- a link that lost its last characters in a chat client, an
+  // id pasted with a stray space. The default branch used to catch it and tell
+  // those users the server was broken, with a retry button that could never
+  // work.
+  it("treats a malformed id as an address that names nothing, not a server fault", () => {
+    const failure = describeLoadFailure(error("bad_request"), "boards");
+
+    expect(failure.retryable).toBe(false);
+    expect(failure.message).not.toMatch(/our side|went wrong|try again/i);
+
+    // Same copy as not_found, because from the reader's side it is the same
+    // situation and the screen cannot show the difference.
+    expect(failure).toEqual(describeLoadFailure(error("not_found"), "boards"));
+  });
+
+  // describeWriteFailure relays the API's 400 verbatim and is right to -- that
+  // message is about what the user just typed. This one must not: the API says
+  // `board_id must be a uuid`, which names a path segment nobody typed as a
+  // field, and putting it on a page about a missing board leaks an internal
+  // parameter name for no benefit.
+  it("does not relay the API's message for a malformed id", () => {
+    const failure = describeLoadFailure(
+      error("bad_request", { message: "board_id must be a uuid" }),
+      "boards",
+    );
+
+    expect(failure.message).not.toContain("board_id");
+    expect(failure.message).not.toContain("uuid");
   });
 
   it("does not send an expired session to /login, which would bounce it back", () => {
