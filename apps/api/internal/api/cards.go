@@ -43,18 +43,37 @@ type cardBody struct {
 	ColumnID    string `json:"column_id"`
 	Title       string `json:"title"`
 	Description string `json:"description"`
-	CreatedAt   string `json:"created_at"`
-	UpdatedAt   string `json:"updated_at"`
+
+	// Always emitted, null when unset, rather than omitempty. A client
+	// replacing a card wholesale from an event payload has to be able to tell
+	// "unassigned" from "this body does not mention assignment", and omitempty
+	// makes those two identical on the wire.
+	AssigneeID *string `json:"assignee_id"`
+	DueAt      *string `json:"due_at"`
+
+	CreatedAt string `json:"created_at"`
+	UpdatedAt string `json:"updated_at"`
 }
 
 type createCardRequest struct {
 	Title       string `json:"title" binding:"required"`
 	Description string `json:"description"`
+
+	// Plain pointers, not Optional: on a create there is no prior value, so
+	// absent and null both mean "no assignee" and there is no third state.
+	AssigneeID *string `json:"assignee_id"`
+	DueAt      *string `json:"due_at"`
 }
 
 type patchCardRequest struct {
 	Title       *string `json:"title"`
 	Description *string `json:"description"`
+
+	// Optional, not a pointer, because these columns are nullable and
+	// unassigning is a request a user makes. See internal/api/optional.go for
+	// why a pointer cannot express it.
+	AssigneeID Optional[string] `json:"assignee_id"`
+	DueAt      Optional[string] `json:"due_at"`
 }
 
 // moveCardRequest is the whole move: which column, and which card to sit behind.
@@ -65,7 +84,7 @@ type moveCardRequest struct {
 }
 
 func newCardBody(card store.Card) cardBody {
-	return cardBody{
+	body := cardBody{
 		ID:          card.ID.String(),
 		BoardID:     card.BoardID.String(),
 		ColumnID:    card.ColumnID.String(),
@@ -74,6 +93,18 @@ func newCardBody(card store.Card) cardBody {
 		CreatedAt:   timestamp(card.CreatedAt),
 		UpdatedAt:   timestamp(card.UpdatedAt),
 	}
+
+	if card.AssigneeID != nil {
+		assignee := card.AssigneeID.String()
+		body.AssigneeID = &assignee
+	}
+
+	if card.DueAt != nil {
+		due := timestamp(*card.DueAt)
+		body.DueAt = &due
+	}
+
+	return body
 }
 
 // createCardHandler appends a card to a column.
@@ -102,6 +133,16 @@ func createCardHandler(logger *slog.Logger, tenantStore TenantStore, publisher E
 			return
 		}
 
+		assignee, ok := parseAssignee(c, req.AssigneeID)
+		if !ok {
+			return
+		}
+
+		dueAt, ok := parseDueAt(c, req.DueAt)
+		if !ok {
+			return
+		}
+
 		card, ok := tenantScopedPublish(c, logger, tenantStore, publisher, "card.create.failed",
 			func(ctx context.Context, q store.Querier) (store.Card, error) {
 				column, err := q.LockColumn(ctx, columnID)
@@ -109,10 +150,21 @@ func createCardHandler(logger *slog.Logger, tenantStore TenantStore, publisher E
 					return store.Card{}, err
 				}
 
+				// Inside the transaction, so the membership it reads is the one
+				// the insert will be checked against rather than one that was
+				// true a moment ago.
+				if assignee != nil {
+					if err := assigneeIsMember(ctx, q, *assignee); err != nil {
+						return store.Card{}, err
+					}
+				}
+
 				card, err := q.CreateCard(ctx, store.CreateCardParams{
 					ColumnID:    columnID,
 					Title:       title,
 					Description: description,
+					AssigneeID:  assignee,
+					DueAt:       dueAt,
 				})
 
 				return asNotFound(subjectColumn, card, err)
@@ -217,19 +269,48 @@ func patchCardHandler(logger *slog.Logger, tenantStore TenantStore, publisher Ev
 			return
 		}
 
-		if title == nil && description == nil {
+		assignee, ok := parseAssignee(c, req.AssigneeID.Value)
+		if !ok {
+			return
+		}
+
+		dueAt, ok := parseDueAt(c, req.DueAt.Value)
+		if !ok {
+			return
+		}
+
+		// `Set()` and not "is the value non-nil": a present-and-null
+		// assignee_id is a request to unassign, which is a change, and treating
+		// it as "nothing was asked for" would answer 400 for a legitimate
+		// edit.
+		if title == nil && description == nil && !req.AssigneeID.Set() && !req.DueAt.Set() {
 			c.AbortWithStatusJSON(http.StatusBadRequest,
-				errorResponse{Error: "at least one of title or description is required"})
+				errorResponse{Error: "at least one of title, description, assignee_id or due_at is required"})
 
 			return
 		}
 
 		card, ok := tenantScopedPublish(c, logger, tenantStore, publisher, "card.update.failed",
 			func(ctx context.Context, q store.Querier) (store.Card, error) {
+				if assignee != nil {
+					if err := assigneeIsMember(ctx, q, *assignee); err != nil {
+						return store.Card{}, err
+					}
+				}
+
 				card, err := q.UpdateCard(ctx, store.UpdateCardParams{
 					CardID:      cardID,
 					Title:       title,
 					Description: description,
+
+					// SetAssignee carries the presence of the key; AssigneeID
+					// carries its value. Together they say "leave it alone",
+					// "assign it to this person" and "unassign" -- which one
+					// nullable argument could not.
+					SetAssignee: req.AssigneeID.Set(),
+					AssigneeID:  assignee,
+					SetDueAt:    req.DueAt.Set(),
+					DueAt:       dueAt,
 				})
 
 				return asNotFound(subjectCard, card, err)

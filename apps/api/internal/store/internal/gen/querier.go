@@ -23,6 +23,15 @@ type Querier interface {
 	// Appends to the end of the column, taking board_id from the column rather than
 	// from the caller: the composite foreign key would reject a disagreement, but
 	// deriving it means there is no argument to disagree with. Run under LockColumn.
+	//
+	// assignee_id and due_at are plain nullable arguments here, unlike in UpdateCard
+	// below: on an INSERT there is no prior value, so "absent" and "null" mean the
+	// same thing and one parameter says both.
+	//
+	// The composite foreign key (tenant_id, assignee_id) -> memberships means the
+	// database refuses an assignee who is not a member of this tenant. That is the
+	// backstop, not the check: a violation would surface as an unmapped error, so
+	// the handler asks GetMembership first and answers 400. See internal/api/cards.go.
 	CreateCard(ctx context.Context, arg CreateCardParams) (Card, error)
 	// Appends: one past the current maximum. Run under LockBoard, so two concurrent
 	// creates cannot read the same maximum and both claim it.
@@ -190,6 +199,21 @@ type Querier interface {
 	// is the only statement here that writes every row in a column.
 	RebalanceColumnCards(ctx context.Context, columnID uuid.UUID) error
 	UpdateBoard(ctx context.Context, arg UpdateBoardParams) (Board, error)
+	// Two different shapes in one statement, because the columns differ in kind.
+	//
+	// title and description are NOT NULL, so `coalesce(narg, col)` says everything
+	// there is to say: a null argument means "leave it alone", and there is no
+	// third state to express.
+	//
+	// assignee_id and due_at ARE nullable, and for them coalesce is not enough --
+	// it cannot tell "leave it alone" from "set it to null", because both arrive as
+	// a null argument. Clearing an assignee is a thing a user does, so the caller
+	// has to be able to say it. Hence the paired boolean: set_assignee = false
+	// leaves the column untouched, set_assignee = true writes whatever assignee_id
+	// holds, null included.
+	//
+	// The alternative would be a sentinel value meaning "clear", which is the same
+	// ambiguity moved somewhere it is harder to see.
 	UpdateCard(ctx context.Context, arg UpdateCardParams) (Card, error)
 	UpdateColumn(ctx context.Context, arg UpdateColumnParams) (Column, error)
 	// A PATCH: sqlc.narg makes "absent" a distinguishable value, so omitting a field

@@ -757,3 +757,235 @@ func allIntegral(positions []string) bool {
 
 	return len(positions) > 0
 }
+
+// Assignee and due date, against a real database — because the interesting
+// properties here are all enforced by the schema rather than by Go.
+//
+// `00003_domain.sql` gives cards an assignee_id whose foreign key is
+// deliberately against `memberships (tenant_id, user_id)` rather than `users`,
+// with `ON DELETE SET NULL (assignee_id)`. Two consequences follow from that
+// choice and neither is observable without a database: a card cannot be
+// assigned to somebody outside its organization, and revoking a membership
+// un-assigns their cards instead of failing.
+func TestAssigneeAndDueDate(t *testing.T) {
+	s := newServer(t, generousLimits())
+
+	alice := s.register(t, "alice")
+	alpha := build(t, s, alice, "alpha", "alpha-one")
+
+	card := alpha.cards["alpha-one"]
+	cardPath := "/api/v1/cards/" + card.String()
+
+	t.Run("a new card has neither, and says so explicitly", func(t *testing.T) {
+		resp := s.do(t, http.MethodGet, cardPath, alice.accessToken, nil)
+
+		t.Logf("fresh card -> %d %s", resp.status, resp.raw)
+
+		// Present-and-null rather than omitted. A client replacing a card
+		// wholesale from an event payload has to be able to tell "unassigned"
+		// from "this body does not mention assignment".
+		if !strings.Contains(resp.raw, `"assignee_id":null`) {
+			t.Errorf("card body should carry an explicit null assignee_id: %s", resp.raw)
+		}
+
+		if !strings.Contains(resp.raw, `"due_at":null`) {
+			t.Errorf("card body should carry an explicit null due_at: %s", resp.raw)
+		}
+	})
+
+	t.Run("assign to self and set a due date", func(t *testing.T) {
+		resp := s.do(t, http.MethodPatch, cardPath, alice.accessToken, map[string]any{
+			"assignee_id": alice.userID.String(),
+			"due_at":      "2026-12-31T17:00:00Z",
+		})
+
+		t.Logf("assign -> %d %s", resp.status, resp.raw)
+
+		if resp.status != http.StatusOK {
+			t.Fatalf("status = %d, want 200 (%s)", resp.status, resp.raw)
+		}
+
+		if !strings.Contains(resp.raw, alice.userID.String()) {
+			t.Errorf("response does not carry the assignee: %s", resp.raw)
+		}
+	})
+
+	// The distinction the Optional type exists for. An absent key must leave
+	// the assignee alone; a *pointer* would report both as nil and this edit
+	// would silently unassign.
+	t.Run("editing the title leaves the assignee alone", func(t *testing.T) {
+		resp := s.do(t, http.MethodPatch, cardPath, alice.accessToken,
+			map[string]any{"title": "renamed, still assigned"})
+
+		t.Logf("title only -> %d %s", resp.status, resp.raw)
+
+		if !strings.Contains(resp.raw, alice.userID.String()) {
+			t.Errorf("a title-only patch dropped the assignee: %s", resp.raw)
+		}
+	})
+
+	t.Run("explicit null unassigns", func(t *testing.T) {
+		resp := s.do(t, http.MethodPatch, cardPath, alice.accessToken,
+			map[string]any{"assignee_id": nil})
+
+		t.Logf("unassign -> %d %s", resp.status, resp.raw)
+
+		if resp.status != http.StatusOK {
+			t.Fatalf("status = %d, want 200 (%s)", resp.status, resp.raw)
+		}
+
+		if !strings.Contains(resp.raw, `"assignee_id":null`) {
+			t.Errorf("explicit null did not unassign: %s", resp.raw)
+		}
+
+		// And it is a change, so it must not be refused as an empty patch.
+		if resp.status == http.StatusBadRequest {
+			t.Error("unassigning was treated as 'nothing was asked for'")
+		}
+	})
+
+	t.Run("a malformed due date is refused", func(t *testing.T) {
+		resp := s.do(t, http.MethodPatch, cardPath, alice.accessToken,
+			map[string]any{"due_at": "31/12/2026"})
+
+		t.Logf("bad due_at -> %d %s", resp.status, resp.raw)
+
+		if resp.status != http.StatusBadRequest {
+			t.Errorf("status = %d, want 400 (%s)", resp.status, resp.raw)
+		}
+	})
+}
+
+// The property the composite foreign key exists for, and the one that would be
+// a cross-tenant data leak if it failed: alice cannot assign her card to bob,
+// who is a real user in a different organization.
+//
+// The answer must also be indistinguishable from assigning to a user id that
+// names nobody at all. A different status or message for the two would let
+// anyone with a card to edit probe for user ids across the tenant boundary, one
+// guess at a time.
+func TestACardCannotBeAssignedAcrossTheTenantBoundary(t *testing.T) {
+	s := newServer(t, generousLimits())
+
+	alice := s.register(t, "alice")
+	bob := s.register(t, "bob")
+
+	alpha := build(t, s, alice, "alpha", "alpha-one")
+	cardPath := "/api/v1/cards/" + alpha.cards["alpha-one"].String()
+
+	t.Logf("alice=%s (tenant %s)  bob=%s (tenant %s)",
+		alice.userID, alice.tenantID, bob.userID, bob.tenantID)
+
+	realUserElsewhere := s.do(t, http.MethodPatch, cardPath, alice.accessToken,
+		map[string]any{"assignee_id": bob.userID.String()})
+
+	fictionalUser := s.do(t, http.MethodPatch, cardPath, alice.accessToken,
+		map[string]any{"assignee_id": uuid.NewString()})
+
+	t.Logf("bob (real, other tenant) -> %d %s", realUserElsewhere.status, realUserElsewhere.raw)
+	t.Logf("nobody at all            -> %d %s", fictionalUser.status, fictionalUser.raw)
+
+	if realUserElsewhere.status == http.StatusOK {
+		t.Fatal("a card was assigned to a member of another organization")
+	}
+
+	if realUserElsewhere.status != http.StatusBadRequest {
+		t.Errorf("status = %d, want 400", realUserElsewhere.status)
+	}
+
+	// The assertion that matters: the two are the same answer.
+	if realUserElsewhere.status != fictionalUser.status {
+		t.Errorf("a real user in another tenant (%d) answers differently from a fictional one (%d): "+
+			"this is a membership oracle across the tenant boundary",
+			realUserElsewhere.status, fictionalUser.status)
+	}
+
+	if realUserElsewhere.raw != fictionalUser.raw {
+		t.Errorf("the two answers differ in body:\n  real elsewhere: %s\n  fictional:      %s",
+			realUserElsewhere.raw, fictionalUser.raw)
+	}
+
+	// And nothing about bob leaked into the refusal.
+	if strings.Contains(realUserElsewhere.raw, bob.userID.String()) ||
+		strings.Contains(realUserElsewhere.raw, bob.email) {
+		t.Errorf("the refusal echoes the other tenant's user: %s", realUserElsewhere.raw)
+	}
+}
+
+// The behaviour `ON DELETE SET NULL (assignee_id)` exists for, which nothing
+// exercised until now.
+//
+// `00003_domain.sql` points the assignee foreign key at
+// `memberships (tenant_id, user_id)` rather than at `users`, with a
+// column-list SET NULL. The column list is the whole point: without it the
+// action would try to null `tenant_id` too, which is NOT NULL, and revoking a
+// membership would fail with a constraint violation instead of tidying up
+// after itself. So somebody leaving an organization un-assigns their cards
+// rather than making the membership undeletable.
+//
+// There is no endpoint that revokes a membership yet, so this goes through the
+// owner pool -- the same route the registration cleanup uses. That is honest
+// about what is being tested: the schema's behaviour, not an HTTP surface that
+// does not exist.
+func TestRevokingAMembershipUnassignsTheirCardsRatherThanFailing(t *testing.T) {
+	s := newServer(t, generousLimits())
+
+	alice := s.register(t, "alice")
+	bob := s.register(t, "bob")
+
+	// Bob joins alice's organization, so he is assignable there.
+	added := s.do(t, http.MethodPost, "/api/v1/members", alice.accessToken,
+		map[string]any{"email": bob.email, "role": "member"})
+
+	t.Logf("add bob to alice's org -> %d %s", added.status, added.raw)
+
+	if added.status != http.StatusCreated && added.status != http.StatusOK {
+		t.Fatalf("could not add bob as a member: %d %s", added.status, added.raw)
+	}
+
+	alpha := build(t, s, alice, "alpha", "alpha-one")
+	cardPath := "/api/v1/cards/" + alpha.cards["alpha-one"].String()
+
+	assigned := s.do(t, http.MethodPatch, cardPath, alice.accessToken,
+		map[string]any{"assignee_id": bob.userID.String()})
+
+	t.Logf("assign to bob -> %d %s", assigned.status, assigned.raw)
+
+	if assigned.status != http.StatusOK {
+		t.Fatalf("assigning to a fellow member failed: %d %s", assigned.status, assigned.raw)
+	}
+
+	if !strings.Contains(assigned.raw, bob.userID.String()) {
+		t.Fatalf("the card is not assigned to bob: %s", assigned.raw)
+	}
+
+	// Revoke it. This is the operation the FK's action governs.
+	owner := testDB.OwnerPool(t, 2)
+
+	tag, err := owner.Exec(context.Background(),
+		`DELETE FROM memberships WHERE tenant_id = $1 AND user_id = $2`, alice.tenantID, bob.userID)
+	if err != nil {
+		t.Fatalf("revoking the membership failed, which is the bug this test exists to catch: %v", err)
+	}
+
+	if tag.RowsAffected() != 1 {
+		t.Fatalf("expected to revoke exactly one membership, revoked %d", tag.RowsAffected())
+	}
+
+	after := s.do(t, http.MethodGet, cardPath, alice.accessToken, nil)
+
+	t.Logf("card after revocation -> %d %s", after.status, after.raw)
+
+	// The card survives -- it belongs to the organization, not to the assignee.
+	if after.status != http.StatusOK {
+		t.Fatalf("the card did not survive the revocation: %d %s", after.status, after.raw)
+	}
+
+	if !strings.Contains(after.raw, `"assignee_id":null`) {
+		t.Errorf("the assignee should have been nulled by the revocation: %s", after.raw)
+	}
+
+	if strings.Contains(after.raw, bob.userID.String()) {
+		t.Errorf("the card still names a user who is no longer a member: %s", after.raw)
+	}
+}
