@@ -560,6 +560,51 @@ func TestRejectionCases(t *testing.T) {
 		}
 	})
 
+	// The case #76 is about, and the only place it can actually be proved.
+	//
+	// `users.email` carries CHECK (position('@' IN email) > 1). The unit tests
+	// run against a fake store that has no such constraint, so before the fix
+	// they reported this address as *accepted* -- the failure only existed
+	// where the column did. Against a real Postgres it violated the constraint
+	// on INSERT, fell through writeAuthError's mapping, and came back 500: a
+	// value the user could fix, reported as a server fault.
+	t.Run("address with nothing before the @", func(t *testing.T) {
+		resp := s.do(t, http.MethodPost, "/api/v1/auth/register", "", map[string]string{
+			"email":        "@example.com",
+			"password":     integrationPass,
+			"display_name": "Someone",
+		})
+
+		t.Logf("nothing before the @ -> %d %s", resp.status, resp.raw)
+
+		if resp.status == http.StatusInternalServerError {
+			t.Fatalf("registration answered 500 for a malformed address; the column constraint is being "+
+				"reached instead of the validator (%s)", resp.raw)
+		}
+
+		if resp.status != http.StatusBadRequest {
+			t.Errorf("status = %d, want 400", resp.status)
+		}
+	})
+
+	// The boundary immediately on the other side of that constraint. One
+	// character before the `@` satisfies position('@') > 1, so it must be
+	// accepted -- a fix that rejected it would be stricter than the column,
+	// which is the same disagreement pointing the other way.
+	t.Run("one character before the @ is accepted", func(t *testing.T) {
+		resp := s.do(t, http.MethodPost, "/api/v1/auth/register", "", map[string]string{
+			"email":        "a@example.com",
+			"password":     integrationPass,
+			"display_name": "Someone",
+		})
+
+		t.Logf("one character before the @ -> %d %s", resp.status, resp.raw)
+
+		if resp.status != http.StatusCreated && resp.status != http.StatusOK {
+			t.Errorf("status = %d, want the registration to succeed (%s)", resp.status, resp.raw)
+		}
+	})
+
 	t.Run("unknown refresh token", func(t *testing.T) {
 		resp := s.do(t, http.MethodPost, "/api/v1/auth/refresh", "",
 			map[string]string{"refresh_token": uuid.NewString()})

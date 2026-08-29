@@ -920,10 +920,51 @@ func findOrganization(orgs []Organization, id uuid.UUID) (Organization, bool) {
 	return Organization{}, false
 }
 
-func validateRegistration(email, password, displayName string) error {
+// validateEmailAddress is the one place an address is judged, so that
+// validation and storage cannot disagree about what is acceptable.
+//
+// The rule is not chosen here; it is copied from the column. `users.email` in
+// migrations/00002_tenancy.sql carries
+//
+//	CHECK (position('@' IN email) > 1)
+//
+// which is 1-indexed, so it demands at least one character before the `@` --
+// Go index >= 1. The previous check asked only that an `@` appear *somewhere*,
+// which is strictly looser, and the gap between the two was reachable:
+// "@example.com" passed validation, reached the INSERT, violated the
+// constraint, and fell through writeAuthError's mapping to a 500. A wrong
+// value the user can fix was reported as a server fault.
+//
+// # What this deliberately does NOT do
+//
+// It does not try to be an address validator. "a@" still passes here and still
+// passes the column, and that is not an oversight: the only thing that
+// establishes an address is usable is sending mail to it, and a stricter Go
+// rule than the column would recreate exactly the disagreement this function
+// exists to remove -- in the safer direction, but with two sources of truth
+// again. If addresses need to be real, that is address confirmation, not a
+// tighter regexp.
+//
+// The invariant to preserve: this may be as strict as the column, never looser.
+func validateEmailAddress(email string) error {
 	switch {
-	case email == "" || len(email) > maxEmailLength || !strings.Contains(email, "@"):
+	case email == "":
+		return fmt.Errorf("%w: email is required", ErrInvalidInput)
+	case len(email) > maxEmailLength:
 		return fmt.Errorf("%w: email is not a valid address", ErrInvalidInput)
+	case strings.Index(email, "@") < 1:
+		return fmt.Errorf("%w: email is not a valid address", ErrInvalidInput)
+	default:
+		return nil
+	}
+}
+
+func validateRegistration(email, password, displayName string) error {
+	if err := validateEmailAddress(email); err != nil {
+		return err
+	}
+
+	switch {
 	case displayName == "" || utf8.RuneCountInString(displayName) > maxDisplayNameLength:
 		return fmt.Errorf("%w: display name must be 1-%d characters", ErrInvalidInput, maxDisplayNameLength)
 	case len(password) < MinPasswordLength:
