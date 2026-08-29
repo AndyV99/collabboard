@@ -24,6 +24,7 @@ vi.mock("next/link", () => ({
 }));
 
 const { LoginForm } = await import("@/components/auth/login-form");
+const { MAX_ORGANIZATION_NAME_CODE_POINTS } = await import("@/lib/auth/rules");
 
 function fill(label: string | RegExp, value: string): void {
   fireEvent.change(screen.getByLabelText(label), { target: { value } });
@@ -570,19 +571,25 @@ describe("recovering an account that has no workspace", () => {
   });
 
   it("refuses an over-long workspace name without reaching the network", async () => {
-    // Mirrors the cap the sign-up form applies. `organization_name` is unbounded
-    // server-side (#67), so this is a client-side mitigation rather than the
-    // fix — and it is counted in code points, because the API counts runes and
-    // `String.length` counts UTF-16 units.
+    // Mirrors the cap the sign-up form applies, which since #67 mirrors the
+    // service: `maxOrganizationNameLength` is 200 runes and
+    // `organizations.name` carries a matching CHECK. It is counted in code
+    // points because the API counts runes and `String.length` counts UTF-16
+    // units — 201 emoji is 402 units, and a check on `.length` would refuse a
+    // name a hundred characters shorter than the limit.
     const { calls } = await reachStrandedAccount(CREATED);
     const before = calls.length;
 
-    fill(/workspace name/i, "🔐".repeat(129));
+    fill(/workspace name/i, "🔐".repeat(MAX_ORGANIZATION_NAME_CODE_POINTS + 1));
     recover();
 
     const alert = await screen.findByRole("alert");
 
-    await waitFor(() => expect(alert).toHaveTextContent(/at most 128 characters/i));
+    await waitFor(() =>
+      expect(alert).toHaveTextContent(
+        new RegExp(`at most ${MAX_ORGANIZATION_NAME_CODE_POINTS} characters`, "i"),
+      ),
+    );
     expect(calls).toHaveLength(before);
     expect(screen.getByLabelText(/workspace name/i)).toHaveAttribute("aria-invalid", "true");
   });
@@ -590,7 +597,7 @@ describe("recovering an account that has no workspace", () => {
   it("clears the name error as the name is shortened", async () => {
     await reachStrandedAccount(CREATED);
 
-    fill(/workspace name/i, "🔐".repeat(129));
+    fill(/workspace name/i, "🔐".repeat(MAX_ORGANIZATION_NAME_CODE_POINTS + 1));
     recover();
     await screen.findByRole("alert");
 

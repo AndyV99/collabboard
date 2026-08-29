@@ -47,16 +47,21 @@ export const MAX_EMAIL_BYTES = 254;
 export const MAX_DISPLAY_NAME_CODE_POINTS = 128;
 
 /**
- * A cap on the organization name.
+ * `maxOrganizationNameLength` in `apps/api/internal/auth/service.go`. Code
+ * points, matching `utf8.RuneCountInString`.
  *
- * The one number here that is *not* a mirror, because there is nothing to
- * mirror: `apps/api` checks no length and `organizations.name` is `text` with
- * only a "not blank" constraint. That is issue #67 — it is the one unbounded
- * user-supplied field on registration — and this is a client-side mitigation,
- * not the fix. Set to the display name's limit, which is well above any real
- * workspace name, and it does not stop anyone posting to the API directly.
+ * A mirror since #67. It used to be the one number in this file that was not
+ * one — `apps/api` checked no length at all, `organizations.name` was `text`
+ * with only a "not blank" constraint, and this was a client-side mitigation set
+ * to the display name's limit for want of anything better to copy.
+ *
+ * The service now caps it at 200, the same as every other name on the API
+ * (`maxNameLength` in `internal/api/crud.go`), and `organizations` carries a
+ * matching CHECK from migration 00007. Raising this from 128 to 200 is not
+ * loosening a rule: at 128 this file was **stricter than the service**, which is
+ * the one thing its opening paragraph says a rule here must never be.
  */
-export const MAX_ORGANIZATION_NAME_CODE_POINTS = 128;
+export const MAX_ORGANIZATION_NAME_CODE_POINTS = 200;
 
 /** `len(s)` in Go: UTF-8 bytes. */
 export function byteLength(value: string): number {

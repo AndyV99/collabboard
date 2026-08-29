@@ -12,6 +12,7 @@ import { describe, expect, it } from "vitest";
 import {
   MAX_DISPLAY_NAME_CODE_POINTS,
   MAX_EMAIL_BYTES,
+  MAX_ORGANIZATION_NAME_CODE_POINTS,
   MAX_PASSWORD_BYTES,
   MIN_PASSWORD_BYTES,
   byteLength,
@@ -35,12 +36,37 @@ const valid = {
 
 describe("the constants mirror apps/api", () => {
   it("uses the API's numbers", () => {
-    // `MinPasswordLength`, `MaxPasswordLength`, `maxEmailLength` and
-    // `maxDisplayNameLength` in apps/api/internal/auth/service.go.
+    // `MinPasswordLength`, `MaxPasswordLength`, `maxEmailLength`,
+    // `maxDisplayNameLength` and `maxOrganizationNameLength` in
+    // apps/api/internal/auth/service.go.
     expect(MIN_PASSWORD_BYTES).toBe(12);
     expect(MAX_PASSWORD_BYTES).toBe(128);
     expect(MAX_EMAIL_BYTES).toBe(254);
     expect(MAX_DISPLAY_NAME_CODE_POINTS).toBe(128);
+    expect(MAX_ORGANIZATION_NAME_CODE_POINTS).toBe(200);
+  });
+
+  it("is not stricter than the service for a workspace name", () => {
+    /*
+     * The rule this file's opening paragraph states, applied to the number that
+     * used to break it. Until #67 the API bounded this field at nothing at all
+     * and the client bounded it at 128 — a refusal with no authority behind it,
+     * and one that could not be relaxed without deploying the wrong service.
+     *
+     * 200 code points, counted the way `utf8.RuneCountInString` counts: 200
+     * emoji are 200 runes to the API and 400 UTF-16 units to `String.length`.
+     */
+    const emoji = "🙂".repeat(MAX_ORGANIZATION_NAME_CODE_POINTS);
+
+    expect(codePointLength(emoji)).toBe(MAX_ORGANIZATION_NAME_CODE_POINTS);
+    expect(emoji.length).toBe(MAX_ORGANIZATION_NAME_CODE_POINTS * 2);
+    expect(
+      validateRegistration({ ...valid, organizationName: emoji }).organizationName,
+    ).toBeUndefined();
+
+    expect(
+      validateRegistration({ ...valid, organizationName: emoji + "🙂" }).organizationName,
+    ).toBe(`Workspace names can be at most ${MAX_ORGANIZATION_NAME_CODE_POINTS} characters.`);
   });
 });
 
