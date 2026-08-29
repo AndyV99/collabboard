@@ -19,9 +19,29 @@ on:
 permissions:
   contents: read
 
+# Supersede a PR's own older runs; never cancel a push.
+#
+# The distinction lives in the GROUP rather than in `cancel-in-progress`,
+# deliberately. The previous form asked the boolean to carry it --
+# `cancel-in-progress: ${{ github.event_name == 'pull_request' }}` -- and it did
+# not: four of seven pushes to `main` during one merge session were cancelled
+# before a single job started, because every push shares one group and a newer
+# run kills the older (#149).
+#
+# Here a pull_request run is keyed by PR number, so a new push to the branch
+# supersedes the previous run, which is what that behaviour is for. A push is
+# keyed by its own run id, which is unique -- so there is never anything for it
+# to cancel, whatever `cancel-in-progress` says. The property stops depending on
+# how an expression is coerced.
+#
+# It matters because a cancelled run on a merge commit is a commit on `main`
+# that nothing ever verified, and the post-merge run is the only thing that
+# catches a semantic conflict between two PRs that each passed alone. That is
+# not hypothetical here: #133 changed NewRouter's signature while #143 added a
+# call site, git merged both without a conflict, and the result did not compile.
 concurrency:
-  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
-  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: true
 
 env:
   # Pinned rather than floating so a toolchain release can never turn a green
