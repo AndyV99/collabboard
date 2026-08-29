@@ -4,6 +4,15 @@ Full-stack multi-tenant SaaS Kanban tool with real-time collaboration and Stripe
 
 **Vault note**: `Projects/01 Full-Stack SaaS Platform.md` (path relative to the vault root — see the `Source of truth` section in the global `CLAUDE.md` for how to find it).
 
+## What to work on
+
+`docs/BACKLOG.md` is the ordered backlog: every open issue, checked against the
+code rather than against its own description, grouped into phases by dependency.
+Start there rather than at `gh issue list` — the order matters, several issues
+no longer describe reality, and the file's "Audit notes" section says which.
+
+Within a phase, anything without an "after" line can be worked in parallel.
+
 ## Stack
 
 - `apps/web` — Next.js (TypeScript), React Server Components + a WebSocket client for live updates.
