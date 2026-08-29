@@ -17,7 +17,9 @@ import Link from "next/link";
 import { useEffect, useRef } from "react";
 import type { ReactNode } from "react";
 
-import type { Card } from "@/lib/api/types";
+import type { Card, Member } from "@/lib/api/types";
+import { assigneeName, initialsFor } from "@/lib/board/assignee";
+import { dueLabel, isOverdue } from "@/lib/board/due";
 import type { CardDirection, DropOver } from "@/lib/board/mutations";
 import { isPendingId } from "@/lib/board/mutations";
 import { cardHref } from "@/lib/workspace/routes";
@@ -133,6 +135,8 @@ export type DragReport = {
  */
 export function CardDragArea({
   children,
+  members,
+  now,
   onCancel,
   onDrop,
   onOver,
@@ -140,6 +144,8 @@ export function CardDragArea({
   overlay,
 }: {
   children: ReactNode;
+  members: readonly Member[] | null;
+  now: number | null;
   onStart: (cardId: string) => void;
   onOver: (report: DragReport) => void;
   onDrop: (report: DragReport | null) => void;
@@ -197,12 +203,12 @@ export function CardDragArea({
        */}
       <DragOverlay>
         {overlay === null ? null : (
+          // The same face as the tile it was lifted from, meta included. A copy
+          // that dropped the assignee and the due date would be a different
+          // height from the card it is standing in for, so picking a card up
+          // would visibly resize it.
           <div className={`${styles.card} ${styles.cardDragging}`}>
-            <span className={styles.cardTitle}>{overlay.title}</span>
-
-            {overlay.description !== "" && (
-              <span className={styles.cardBody}>{overlay.description}</span>
-            )}
+            <CardFace card={overlay} members={members} now={now} />
           </div>
         )}
       </DragOverlay>
@@ -276,6 +282,8 @@ export function CardDropZone({
  */
 export function DraggableCard({
   card,
+  members,
+  now,
   projectId,
   boardId,
   selected,
@@ -287,6 +295,10 @@ export function DraggableCard({
   onCancel,
 }: {
   card: Card;
+  /** Everyone in the workspace, or null when that list did not load. */
+  members: readonly Member[] | null;
+  /** The reader's clock, or null before there is one. */
+  now: number | null;
   projectId: string;
   boardId: string;
   selected: boolean;
@@ -423,13 +435,98 @@ export function DraggableCard({
         draggable={false}
         href={cardHref(projectId, boardId, card.id)}
       >
-        <span className={styles.cardTitle}>{card.title}</span>
-
-        {card.description !== "" && (
-          <span className={styles.cardBody}>{card.description}</span>
-        )}
+        <CardFace card={card} members={members} now={now} />
       </Link>
     </li>
+  );
+}
+
+/**
+ * What a card tile says, wherever one is drawn.
+ *
+ * # The assignee and the due date are here rather than in the panel alone
+ *
+ * A board is a scanning surface. "Who has this" and "when is it due" are the
+ * two questions asked of a column at a glance, and an answer that needs a click
+ * is not an answer to either — which is what made #48's fields invisible in
+ * practice even though the API had carried them since it was merged.
+ *
+ * Both are drawn small and only when they exist. A card with no assignee and no
+ * due date renders exactly what it rendered before, which is most cards.
+ *
+ * # The initials are decoration and the name is the content
+ *
+ * Two letters in a circle is a convention, not information: initials collide,
+ * and a screen reader announcing "DO" has told the listener nothing. So the
+ * circle is `aria-hidden` and the full name sits beside it in visually-hidden
+ * text, which is what actually reaches the link's accessible name — "Alpha,
+ * assigned to Dana Okoro, due 31 Aug 2026, 17:00" is a card you can find by
+ * name in an element list.
+ *
+ * # Overdue appears only once the reader's clock does
+ *
+ * `now` is null on the server and on the first client render, and
+ * `components/boards/use-due-clock.ts` explains why that is not a loading
+ * state. While it is null the date is shown in the fixed UTC form every other
+ * timestamp in this app uses and **nothing claims the card is late** — a claim
+ * made against the server's clock is a claim about a machine in Ireland, and it
+ * would be re-rendered as its opposite a frame later.
+ */
+export function CardFace({
+  card,
+  members,
+  now,
+}: {
+  card: Card;
+  members: readonly Member[] | null;
+  now: number | null;
+}) {
+  const name = card.assigneeId === null ? null : assigneeName(members, card.assigneeId);
+  const due = dueLabel(card.dueAt, now);
+  const overdue = now !== null && isOverdue(card.dueAt, now);
+
+  return (
+    <>
+      <span className={styles.cardTitle}>{card.title}</span>
+
+      {card.description !== "" && (
+        <span className={styles.cardBody}>{card.description}</span>
+      )}
+
+      {(card.assigneeId !== null || due !== null) && (
+        <span className={styles.cardMeta}>
+          {card.assigneeId !== null && (
+            <span className={styles.cardAvatar}>
+              <span aria-hidden="true">{name === null ? "?" : initialsFor(name)}</span>
+
+              <span className={styles.visuallyHidden}>
+                {name === null
+                  ? // Assigned to somebody this page cannot name — a stale
+                    // member list, or one that did not load. Saying so beats
+                    // printing the uuid, which would put a user id on screen
+                    // and still tell the reader nothing.
+                    "assigned to a member not in this list"
+                  : `assigned to ${name}`}
+              </span>
+            </span>
+          )}
+
+          {due !== null && (
+            <time
+              className={
+                overdue ? `${styles.cardDue} ${styles.cardDueOverdue}` : styles.cardDue
+              }
+              // The machine-readable half stays the instant the API sent,
+              // offset and all, whatever zone the text beside it is in.
+              dateTime={card.dueAt ?? undefined}
+            >
+              {overdue && <span className={styles.visuallyHidden}>overdue, </span>}
+              Due {due}
+            </time>
+          )}
+        </span>
+      )}
+    </>
   );
 }
 

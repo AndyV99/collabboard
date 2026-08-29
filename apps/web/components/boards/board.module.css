@@ -204,6 +204,60 @@
   overflow-wrap: anywhere;
 }
 
+/* --- assignee and due date on a tile (#157) ---------------------------- */
+
+/*
+ * The row under a card's text, drawn only when the card has something to put in
+ * it. `wrap` because an 18rem column at large text sizes does not fit an avatar
+ * and a date side by side, and a due date pushed off the edge is the half of
+ * this row that matters most.
+ */
+.cardMeta {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.375rem;
+  margin-top: 0.5rem;
+  font-size: 0.75rem;
+  line-height: 1.2;
+}
+
+/*
+ * Initials in a circle. Decorative — the name is beside it in visually-hidden
+ * text — so it is sized to be recognisable at a glance rather than readable at
+ * length, and a long pair of initials is clipped rather than allowed to stretch
+ * the row.
+ */
+.cardAvatar {
+  flex: 0 0 auto;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 1.5rem;
+  height: 1.5rem;
+  border-radius: 50%;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  color: var(--muted);
+  font-size: 0.6875rem;
+  font-weight: 600;
+  overflow: hidden;
+}
+
+.cardDue {
+  color: var(--muted);
+}
+
+/*
+ * Overdue is bold as well as coloured, because colour alone is not a
+ * distinction for a reader who cannot see this one — and the word "overdue" is
+ * in the visually-hidden text beside it for the reader who sees neither.
+ */
+.cardDueOverdue {
+  color: var(--down);
+  font-weight: 600;
+}
+
 /*
  * Since #65 this doubles as the empty column's drop zone, which is why it has a
  * height it does not need for two lines of text: a column with no cards is the
@@ -399,6 +453,13 @@
 .detailValue {
   margin: 0;
   overflow-wrap: anywhere;
+}
+
+/* Same reasoning as `.cardDueOverdue`: never colour alone. The word is the
+ * marker and the colour is the emphasis. */
+.detailOverdue {
+  color: var(--down);
+  font-weight: 600;
 }
 
 /* --- moving a card (#65) ---------------------------------------------- */

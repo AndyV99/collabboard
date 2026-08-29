@@ -103,7 +103,15 @@ type CommonProps = {
 };
 
 export type TextFieldProps = CommonProps & {
-  type?: "text" | "email";
+  /**
+   * `datetime-local` is here rather than in a field of its own because
+   * everything around the control — the label, the hint, `aria-describedby`,
+   * `aria-invalid` — is identical, and a second component would be that shell
+   * copied so one attribute could change. Where the type is unsupported the
+   * browser renders a text box, which is why `validateDueAt` in
+   * `lib/workspace/rules.ts` still checks what comes out of it.
+   */
+  type?: "text" | "email" | "datetime-local";
   autoComplete?: string;
   inputRef?: RefObject<HTMLInputElement | null>;
   /**

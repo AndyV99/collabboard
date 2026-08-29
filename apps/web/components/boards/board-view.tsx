@@ -2,6 +2,7 @@
 
 import { useCallback, useEffect, useId, useOptimistic, useRef, useState } from "react";
 
+import type { Member } from "@/lib/api/types";
 import {
   type BoardChange,
   type CardDirection,
@@ -23,6 +24,7 @@ import { CardDragArea, CardDropZone, DraggableCard, PendingCard } from "./card-d
 import type { DragReport } from "./card-drag";
 import { useCardMoves } from "./card-moves";
 import { ConnectionStatus } from "./connection-status";
+import { useDueClock } from "./use-due-clock";
 import { hasPendingEntities, useBoardLive } from "./use-board-live";
 import styles from "./board.module.css";
 import workspace from "@/components/workspace/workspace.module.css";
@@ -107,11 +109,26 @@ import workspace from "@/components/workspace/workspace.module.css";
  */
 export function BoardView({
   snapshot,
+  members,
   projectId,
   boardId,
   selectedCardId,
 }: {
   snapshot: BoardSnapshot;
+  /**
+   * Everyone in the workspace, read once by `page.tsx`, or null when that read
+   * failed.
+   *
+   * A prop rather than a fetch, because rule 2 above is not negotiable: this is
+   * one more list the *page* already asks for, and a `useEffect` here would be
+   * one request per board render and one more thing that can fail after the
+   * board has already drawn.
+   *
+   * Null is a real state and not an empty list. "Nobody is in this workspace"
+   * is impossible — the reader is — so an empty array would be a lie the
+   * assignee picker would then offer as fact.
+   */
+  members: readonly Member[] | null;
   projectId: string;
   boardId: string;
   /**
@@ -162,6 +179,10 @@ export function BoardView({
   }, [failure]);
 
   const [addingColumn, setAddingColumn] = useState(false);
+
+  // Null until the browser has run an effect, which is what keeps the overdue
+  // marker out of the server-rendered HTML. See `use-due-clock.ts`.
+  const now = useDueClock();
 
   const sendMove = useCardMoves(applyChange, report);
 
@@ -433,6 +454,8 @@ export function BoardView({
           />
         ) : (
           <CardDragArea
+            members={members}
+            now={now}
             onCancel={handleDragCancel}
             onDrop={handleDrop}
             onOver={handleDragOver}
@@ -446,7 +469,9 @@ export function BoardView({
                   columns={shown.columns}
                   entry={entry}
                   key={entry.column.id}
+                  members={members}
                   moving={moving}
+                  now={now}
                   projectId={projectId}
                   selectedCardId={openCard?.id ?? null}
                   wiring={wiring}
@@ -490,6 +515,8 @@ export function BoardView({
               closeHref={closeHref}
               columnName={columnNameOf(columns, openCard)}
               editing={wiring}
+              members={members}
+              now={now}
               // Opening another card resets the panel rather than carrying a
               // half-finished edit across to it.
               key={openCard.id}
@@ -601,6 +628,8 @@ function EmptyBoard({
 function BoardColumn({
   entry,
   columns,
+  members,
+  now,
   projectId,
   boardId,
   selectedCardId,
@@ -609,6 +638,8 @@ function BoardColumn({
 }: {
   entry: ColumnWithCards;
   columns: readonly ColumnWithCards[];
+  members: readonly Member[] | null;
+  now: number | null;
   projectId: string;
   boardId: string;
   selectedCardId: string | null;
@@ -676,6 +707,8 @@ function BoardColumn({
               instructionsId={moving.instructionsId}
               key={card.id}
               lifted={moving.lifted === card.id}
+              members={members}
+              now={now}
               onCancel={moving.onCancel}
               onDrop={moving.onDrop}
               onLift={() => moving.onLift(card.id)}
