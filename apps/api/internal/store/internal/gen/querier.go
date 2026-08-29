@@ -116,6 +116,12 @@ type Querier interface {
 	// identity, and a future column on `users` should have to be named here before
 	// it can travel to a client.
 	GetUser(ctx context.Context, userID uuid.UUID) (GetUserRow, error)
+	// The counterpart to ListProjects, which filters these out.
+	//
+	// Most recently archived first, rather than by name: the caller is somebody
+	// looking for the project they just archived by mistake, and that one is at the
+	// top. Name is the tiebreak so the order is total and a test can rely on it.
+	ListArchivedProjects(ctx context.Context) ([]Project, error)
 	ListBoardsByProject(ctx context.Context, projectID uuid.UUID) ([]Board, error)
 	// The board view loads every card for the board in one round trip and groups by
 	// column client-side; cards_tenant_board_idx serves this.
@@ -198,6 +204,15 @@ type Querier interface {
 	// at 16383 of them. Renumbering to 1..n collapses that, preserves the order, and
 	// is the only statement here that writes every row in a column.
 	RebalanceColumnCards(ctx context.Context, columnID uuid.UUID) error
+	// The other direction, idempotent by construction: unarchiving an active
+	// project writes the null it already holds and returns the row, so a retried
+	// request is a success rather than a 404 -- the same contract as ArchiveProject
+	// and for the same reason.
+	//
+	// Nothing cascades, because nothing cascaded on the way in. Archiving never
+	// touched the project's boards, columns or cards, so there is no state to
+	// restore here beyond the flag itself.
+	UnarchiveProject(ctx context.Context, projectID uuid.UUID) (Project, error)
 	UpdateBoard(ctx context.Context, arg UpdateBoardParams) (Board, error)
 	// Two different shapes in one statement, because the columns differ in kind.
 	//

@@ -200,6 +200,7 @@ func mountBoardRoutes(
 	authenticated.GET("/projects/:project_id", getProjectHandler(logger, tenantStore))
 	authenticated.PATCH("/projects/:project_id", patchProjectHandler(logger, tenantStore))
 	authenticated.POST("/projects/:project_id/archive", archiveProjectHandler(logger, tenantStore))
+	authenticated.DELETE("/projects/:project_id/archive", unarchiveProjectHandler(logger, tenantStore))
 
 	authenticated.POST("/projects/:project_id/boards", createBoardHandler(logger, tenantStore))
 	authenticated.GET("/projects/:project_id/boards", listBoardsHandler(logger, tenantStore))

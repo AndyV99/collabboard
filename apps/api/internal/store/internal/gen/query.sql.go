@@ -489,6 +489,46 @@ func (q *Queries) GetUser(ctx context.Context, userID uuid.UUID) (GetUserRow, er
 	return i, err
 }
 
+const listArchivedProjects = `-- name: ListArchivedProjects :many
+SELECT id, tenant_id, name, description, archived_at, created_at, updated_at
+FROM projects
+WHERE archived_at IS NOT NULL
+ORDER BY archived_at DESC, name
+`
+
+// The counterpart to ListProjects, which filters these out.
+//
+// Most recently archived first, rather than by name: the caller is somebody
+// looking for the project they just archived by mistake, and that one is at the
+// top. Name is the tiebreak so the order is total and a test can rely on it.
+func (q *Queries) ListArchivedProjects(ctx context.Context) ([]Project, error) {
+	rows, err := q.db.Query(ctx, listArchivedProjects)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []Project{}
+	for rows.Next() {
+		var i Project
+		if err := rows.Scan(
+			&i.ID,
+			&i.TenantID,
+			&i.Name,
+			&i.Description,
+			&i.ArchivedAt,
+			&i.CreatedAt,
+			&i.UpdatedAt,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const listBoardsByProject = `-- name: ListBoardsByProject :many
 SELECT id, tenant_id, project_id, name, archived_at, created_at, updated_at
 FROM boards
@@ -1018,6 +1058,36 @@ WHERE c.id = ranked.id
 func (q *Queries) RebalanceColumnCards(ctx context.Context, columnID uuid.UUID) error {
 	_, err := q.db.Exec(ctx, rebalanceColumnCards, columnID)
 	return err
+}
+
+const unarchiveProject = `-- name: UnarchiveProject :one
+UPDATE projects
+SET archived_at = NULL
+WHERE id = $1
+RETURNING id, tenant_id, name, description, archived_at, created_at, updated_at
+`
+
+// The other direction, idempotent by construction: unarchiving an active
+// project writes the null it already holds and returns the row, so a retried
+// request is a success rather than a 404 -- the same contract as ArchiveProject
+// and for the same reason.
+//
+// Nothing cascades, because nothing cascaded on the way in. Archiving never
+// touched the project's boards, columns or cards, so there is no state to
+// restore here beyond the flag itself.
+func (q *Queries) UnarchiveProject(ctx context.Context, projectID uuid.UUID) (Project, error) {
+	row := q.db.QueryRow(ctx, unarchiveProject, projectID)
+	var i Project
+	err := row.Scan(
+		&i.ID,
+		&i.TenantID,
+		&i.Name,
+		&i.Description,
+		&i.ArchivedAt,
+		&i.CreatedAt,
+		&i.UpdatedAt,
+	)
+	return i, err
 }
 
 const updateBoard = `-- name: UpdateBoard :one

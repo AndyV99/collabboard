@@ -37,6 +37,7 @@ import (
 	"errors"
 	"log/slog"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 	"unicode/utf8"
@@ -435,6 +436,31 @@ func optionalText(c *gin.Context, field string, value *string, limit int, allowE
 }
 
 // timestamp renders a database timestamp the one way this API renders them.
+// boolQuery reads an optional boolean query parameter, or aborts with 400.
+//
+// Absent is false. A present-but-unparseable value is an ERROR rather than
+// false, which is the whole reason this is not one line of
+// `c.Query(name) == "true"`: `?archived=yes` and `?archived=1` are what people
+// actually type, and silently answering them with the unfiltered list is a
+// wrong answer delivered with a 200. strconv.ParseBool accepts 1/t/T/TRUE/true
+// and their negatives, so the surprising inputs are genuinely surprising.
+func boolQuery(c *gin.Context, name string) (bool, bool) {
+	raw, present := c.GetQuery(name)
+	if !present || raw == "" {
+		return false, true
+	}
+
+	value, err := strconv.ParseBool(raw)
+	if err != nil {
+		c.AbortWithStatusJSON(http.StatusBadRequest,
+			errorResponse{Error: name + " must be true or false"})
+
+		return false, false
+	}
+
+	return value, true
+}
+
 func timestamp(t time.Time) string {
 	return t.UTC().Format(time.RFC3339)
 }
