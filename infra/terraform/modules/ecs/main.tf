@@ -33,6 +33,17 @@ locals {
     POSTGRES_DB        = var.database_name
     POSTGRES_SSLMODE   = var.database_sslmode
     POSTGRES_MAX_CONNS = tostring(var.database_max_conns)
+
+    # In the COMMON block, not the serve block, and that is the point. `api
+    # migrate` connects as the schema owner -- the one credential in the system
+    # that can drop a row-level-security policy -- so it is the last connection
+    # that should be encrypted-but-unverified. Every mode of the binary that
+    # opens a Postgres connection gets the same trust anchors.
+    #
+    # The path is a contract with apps/api/Dockerfile, which copies the bundle
+    # to exactly this location. Terraform cannot see inside the image, so the
+    # coupling is enforced by the comment at each end and by nothing else.
+    POSTGRES_SSLROOTCERT = var.database_ssl_root_cert
   }
 
   api_serve_environment = merge(local.api_common_environment, {
@@ -488,7 +499,20 @@ resource "aws_ecs_task_definition" "admin" {
 
         # RDS enforces rds.force_ssl, so a psql that does not ask for TLS is
         # refused. Setting it here means the operator does not have to remember.
-        { name = "PGSSLMODE", value = var.database_sslmode },
+        #
+        # Its own variable, and deliberately weaker than the API's. This task
+        # runs a stock postgres image nothing in this repository builds, so
+        # there is no way to put the RDS trust anchors inside it: the bundle
+        # #115 vendored is copied into apps/api's image, and RDS certificates
+        # chain to a private Amazon CA that appears in no public trust store.
+        # Pointing this at  would produce a break-glass session
+        # that cannot connect, discovered at the moment somebody needs it.
+        #
+        # What that gives up is small and bounded: the session is human-started,
+        # short-lived, and reaches RDS from inside the data subnet. The operator
+        # can confirm the endpoint out of band, which is exactly the check
+        # verify-full automates for a process that cannot.
+        { name = "PGSSLMODE", value = var.admin_database_sslmode },
       ]
 
       logConfiguration = {

@@ -504,3 +504,93 @@ run "rejects_a_cache_host_that_is_an_address" {
 
   expect_failures = [var.cache_host]
 }
+
+# ---------------------------------------------------------------------------
+# Encrypted is not the same as verified
+# ---------------------------------------------------------------------------
+
+# `rds.force_ssl = 1` guarantees the connection is encrypted and says nothing
+# about who answered. Until #115 the only reachable setting was `require`, which
+# is encryption without authentication -- it stops passive eavesdropping and
+# does not stop something in the VPC answering for the RDS endpoint's address.
+#
+# verify-full is only as good as the CA file libpq resolves, and libpq resolves
+# it from sslrootcert. So the mode and the path have to travel together: either
+# alone is a connection that fails, or a connection that verifies nothing.
+run "every_postgres_connection_verifies_the_server_rather_than_merely_encrypting" {
+  command = apply
+
+  assert {
+    condition = alltrue([
+      for definition in [
+        jsondecode(aws_ecs_task_definition.api.container_definitions)[0],
+        jsondecode(aws_ecs_task_definition.api_migrate.container_definitions)[0],
+        jsondecode(aws_ecs_task_definition.api_provision.container_definitions)[0],
+      ] :
+      anytrue([
+        for entry in definition.environment :
+        entry.name == "POSTGRES_SSLMODE" && entry.value == "verify-full"
+      ])
+    ])
+    error_message = "every API task definition must connect with sslmode=verify-full; `require` encrypts without checking who answered"
+  }
+
+  # The migrate and provision tasks are covered above rather than excluded, and
+  # that is deliberate: those two carry the schema owner's credential, the one
+  # identity in the system that can drop a row-level-security policy. An
+  # unverified connection is least acceptable there, not most.
+  assert {
+    condition = alltrue([
+      for definition in [
+        jsondecode(aws_ecs_task_definition.api.container_definitions)[0],
+        jsondecode(aws_ecs_task_definition.api_migrate.container_definitions)[0],
+        jsondecode(aws_ecs_task_definition.api_provision.container_definitions)[0],
+      ] :
+      anytrue([
+        for entry in definition.environment :
+        entry.name == "POSTGRES_SSLROOTCERT" && entry.value == var.database_ssl_root_cert
+      ])
+    ])
+    error_message = "verify-full without POSTGRES_SSLROOTCERT is a connection that cannot succeed: libpq falls back to ~/.postgresql/root.crt, which does not exist in a distroless image"
+  }
+}
+
+# The administrative task is the one place the weaker setting is correct, and
+# this asserts that it is a decision rather than an omission. It runs a stock
+# postgres image nothing here builds, so the RDS anchors cannot be put inside
+# it; verify-full would make the break-glass path fail at the moment somebody
+# needs it. If a future change unifies the two variables, this fails and says
+# why.
+run "the_break_glass_task_asks_for_tls_it_can_actually_negotiate" {
+  command = apply
+
+  assert {
+    condition = anytrue([
+      for entry in jsondecode(aws_ecs_task_definition.admin.container_definitions)[0].environment :
+      entry.name == "PGSSLMODE" && entry.value == "require"
+    ])
+    error_message = "the administrative task must use `require`: it runs a stock postgres image with no RDS trust anchors, so verify-full produces a break-glass session that cannot connect"
+  }
+
+  # And it must not be handed a certificate path that resolves to nothing in
+  # that image, which would fail in exactly the confusing way this avoids.
+  assert {
+    condition = !anytrue([
+      for entry in jsondecode(aws_ecs_task_definition.admin.container_definitions)[0].environment :
+      entry.name == "PGSSLROOTCERT"
+    ])
+    error_message = "the administrative task must not name a CA file: apps/api's bundle is not in the postgres image, so the path would resolve to nothing"
+  }
+}
+
+# An absolute path, because libpq resolves a relative one against the process
+# working directory -- which this image does not set.
+run "rejects_a_relative_certificate_path" {
+  command = plan
+
+  variables {
+    database_ssl_root_cert = "certs/rds-global-bundle.pem"
+  }
+
+  expect_failures = [var.database_ssl_root_cert]
+}
