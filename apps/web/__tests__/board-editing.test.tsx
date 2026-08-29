@@ -462,6 +462,24 @@ describe("adding a card", () => {
 
     await waitFor(() => expect(refresh).toHaveBeenCalled());
 
+    // `refresh` having been CALLED is not the transition having ENDED, and the
+    // gap between those two is where this test used to lose a race (#147). It
+    // failed on unrelated PRs roughly one run in three under full-suite load,
+    // and never once locally.
+    //
+    // While the transition is still pending React keeps showing the optimistic
+    // card, which is deliberately not a link because its id is invented -- the
+    // case two tests above asserts exactly that. Re-rendering into that window
+    // leaves `getByRole("link")` searching until its 1000ms budget runs out on
+    // a loaded runner.
+    //
+    // The transition has ended when React has discarded the optimistic value
+    // and re-rendered from the *unchanged* snapshot prop -- which has no card
+    // called "Fresh" at all. So its absence is the signal, and waiting for it
+    // is waiting for the thing that actually has to happen rather than for a
+    // longer timeout.
+    await waitFor(() => expect(screen.queryByText("Fresh")).not.toBeInTheDocument());
+
     // What `router.refresh()` produces in production: the Server Component runs
     // again and the page re-renders with the stored row. The optimistic value
     // is dropped and this is what is left.
@@ -758,6 +776,17 @@ describe("deleting a column", () => {
     // `waitFor` first samples the DOM, roughly three runs in eight under
     // full-suite load. The optimistic disappearance is covered by the ROLLBACK
     // test below, which holds the request open so the window is real.
+    //
+    // Same transition boundary as the add-card test above (#147), with the
+    // opposite polarity and a milder failure. Here the unchanged snapshot still
+    // HAS the Doing column, so once the transition ends it comes back -- which
+    // means re-rendering mid-transition would let the final assertion pass
+    // against the optimistic removal rather than against the re-rendered board.
+    // That is a test passing for the wrong reason rather than a flake: quieter,
+    // and no better. Waiting for the column to return makes what follows
+    // unambiguous.
+    await waitFor(() => expect(columnOrder()).toEqual(["To do", "Doing", "Done"]));
+
     view.rerender(
       <BoardView
         boardId={BOARD}
