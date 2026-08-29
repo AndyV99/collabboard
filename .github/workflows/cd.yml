@@ -1,0 +1,266 @@
+name: CD
+
+# Stages 6-9 of Standards/CI-CD Standards.md: push image, deploy to staging
+# automatically, smoke check, promote to prod behind a manual gate.
+#
+# ---------------------------------------------------------------------------
+# WHY THIS IS A SEPARATE WORKFLOW FROM ci.yml
+# ---------------------------------------------------------------------------
+# `ci` is the required status check on `main`, and #30 exists about the class of
+# mistake where a job that should gate a merge silently cannot. Putting deploy
+# jobs into that workflow would entangle the two: a deploy job in `ci`'s `needs`
+# makes every PR wait for something that cannot run on a PR, and a deploy job
+# outside it that still lives in the same file is an invitation to add it to the
+# aggregate later without thinking. Two files, one required check, no overlap.
+#
+# ---------------------------------------------------------------------------
+# WHY THIS CANNOT RUN FROM A FORK
+# ---------------------------------------------------------------------------
+# Three independent reasons, because this is the failure that hands an attacker
+# a deploy credential and one mechanism is not enough:
+#
+#   1. The trigger is `push` to `main`. A fork's PR fires `pull_request`, which
+#      this workflow does not listen for at all.
+#   2. `permissions: id-token: write` is granted per job, and GitHub refuses to
+#      mint an OIDC token for a workflow triggered by a fork's pull_request
+#      regardless of what the file asks for.
+#   3. The deploy role's trust policy conditions on
+#      `sub = repo:OWNER/NAME:ref:refs/heads/main`. Even holding a token, a fork
+#      run's subject does not match and AssumeRoleWithWebIdentity is refused.
+#
+# The third is the one that still holds if somebody edits this file, which is
+# why it exists in Terraform rather than only here.
+on:
+  push:
+    branches: [main]
+
+  # Manual re-run of a specific commit, for the rollback path. Rolling back is
+  # "deploy the previous SHA", which is only meaningful because images are
+  # tagged by SHA and the tags are immutable -- see docs/adr/0015.
+  workflow_dispatch:
+    inputs:
+      sha:
+        description: 'Commit SHA to deploy. Defaults to the current ref. An image must already exist for it.'
+        required: false
+        type: string
+
+# Read-only at the top. Every job that needs to mint an OIDC token widens this
+# for itself, so a job added later does not silently inherit the ability to
+# assume a deploy role.
+permissions:
+  contents: read
+
+# Deploys queue rather than race. Two overlapping runs would both call
+# UpdateService and the loser's task definition would win or lose by timing --
+# `cancel-in-progress: false` because cancelling a deploy midway leaves the
+# service half rolled, which is worse than waiting.
+concurrency:
+  group: cd-staging
+  cancel-in-progress: false
+
+env:
+  AWS_REGION: us-east-1
+  ECR_NAMESPACE: collabboard
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Build and push. One job, both images, because they share the login and the
+  # SHA and splitting them would double the OIDC exchange for no parallelism
+  # worth having at this size.
+  # ---------------------------------------------------------------------------
+  build:
+    name: build and push
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    environment: staging
+    permissions:
+      contents: read
+      # The one grant that matters. Job-scoped, not workflow-scoped.
+      id-token: write
+    outputs:
+      sha: ${{ steps.resolve.outputs.sha }}
+    steps:
+      - name: Resolve the commit to deploy
+        id: resolve
+        env:
+          REQUESTED: ${{ inputs.sha }}
+          CURRENT: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          SHA="${REQUESTED:-$CURRENT}"
+          # Full 40-character SHA, never the short form and never a branch
+          # name. A tag is the answer to "what is running", and an ambiguous
+          # tag makes that question unanswerable during an incident.
+          if ! [[ "$SHA" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::error title=Bad SHA::'$SHA' is not a full 40-character commit SHA."
+            exit 1
+          fi
+          echo "sha=$SHA" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ steps.resolve.outputs.sha }}
+
+      - uses: aws-actions/configure-aws-credentials@v5
+        with:
+          role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+          # Names the run in CloudTrail, so "who deployed this" is answerable
+          # from the audit log rather than by correlating timestamps.
+          role-session-name: cd-${{ github.run_id }}
+
+      - uses: aws-actions/amazon-ecr-login@v2
+        id: ecr
+
+      - uses: docker/setup-buildx-action@v3
+
+      # Both images are built for the architecture the task definitions declare.
+      # A mismatch is not a build failure -- the image builds fine -- it is a
+      # task that dies at start with an exec format error, which reads like a
+      # broken image rather than like a wrong platform.
+      - name: Build and push the API image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: apps/api/Dockerfile
+          push: true
+          tags: ${{ steps.ecr.outputs.registry }}/${{ env.ECR_NAMESPACE }}/api:${{ steps.resolve.outputs.sha }}
+          # GitHub's own cache, not a registry cache. A registry cache would
+          # write cache manifests into the ECR repository, which is
+          # `IMMUTABLE` and lifecycle-managed to keep the last 30 tagged
+          # images -- cache blobs would compete with rollback targets for that
+          # budget. This workflow only ever runs on `main`, so the per-branch
+          # scoping that makes gha cache awkward elsewhere costs nothing here.
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Build and push the web image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: apps/web/Dockerfile
+          push: true
+          tags: ${{ steps.ecr.outputs.registry }}/${{ env.ECR_NAMESPACE }}/web:${{ steps.resolve.outputs.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  # ---------------------------------------------------------------------------
+  # Migrate BEFORE the service rolls, and stop if it fails.
+  #
+  # ADR 0013's ordering, enforced here rather than documented: a service rolled
+  # onto a schema that has not been migrated is a service answering 500s, and a
+  # migration run after the rollout is a migration racing the traffic it was
+  # supposed to precede.
+  # ---------------------------------------------------------------------------
+  migrate:
+    name: migrate
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    environment: staging
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.build.outputs.sha }}
+
+      - uses: aws-actions/configure-aws-credentials@v5
+        with:
+          role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+          role-session-name: cd-migrate-${{ github.run_id }}
+
+      - name: Run `api migrate up` and wait for it
+        env:
+          CLUSTER: ${{ vars.ECS_CLUSTER_NAME }}
+          TASK_DEFINITION: ${{ vars.MIGRATE_TASK_DEFINITION }}
+          NETWORK_CONFIGURATION: ${{ vars.RUN_TASK_NETWORK_CONFIGURATION }}
+          IMAGE: ${{ vars.API_REPOSITORY_URL }}:${{ needs.build.outputs.sha }}
+        run: ./scripts/ci/run-one-shot-task.sh
+
+  # ---------------------------------------------------------------------------
+  # Roll the services, then prove they are actually serving.
+  # ---------------------------------------------------------------------------
+  deploy:
+    name: deploy staging
+    needs: [build, migrate]
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    environment: staging
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.build.outputs.sha }}
+
+      - uses: aws-actions/configure-aws-credentials@v5
+        with:
+          role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+          role-session-name: cd-deploy-${{ github.run_id }}
+
+      - name: Roll the API service
+        env:
+          CLUSTER: ${{ vars.ECS_CLUSTER_NAME }}
+          SERVICE: ${{ vars.API_SERVICE_NAME }}
+          CONTAINER: api
+          IMAGE: ${{ vars.API_REPOSITORY_URL }}:${{ needs.build.outputs.sha }}
+        run: ./scripts/ci/deploy-service.sh
+
+      - name: Roll the web service
+        env:
+          CLUSTER: ${{ vars.ECS_CLUSTER_NAME }}
+          SERVICE: ${{ vars.WEB_SERVICE_NAME }}
+          CONTAINER: web
+          IMAGE: ${{ vars.WEB_REPOSITORY_URL }}:${{ needs.build.outputs.sha }}
+        run: ./scripts/ci/deploy-service.sh
+
+      # A service reaching steady state means ECS is happy with the task, not
+      # that the product works. This is the check that would have caught a
+      # WebSocket killed by the load balancer's idle timeout, and it runs
+      # against the public hostname rather than from inside the VPC.
+      - name: Smoke check
+        env:
+          WEB_URL: ${{ vars.WEB_URL }}
+        run: ./scripts/ci/smoke.sh
+
+  # ---------------------------------------------------------------------------
+  # Promotion to prod.
+  #
+  # The shape is the point: prod does not exist yet, so this job asserts that
+  # and stops. It is wired up now so the gate is real when the environment
+  # arrives, rather than being invented under time pressure on the day.
+  #
+  # The gate is the `production` GitHub Environment's required-reviewer rule.
+  # That is not decorative: GitHub will not mint an OIDC token whose `sub`
+  # carries `environment:production` until the approval is given, so a prod
+  # deploy role trusting that subject cannot be assumed by an unapproved run --
+  # the approval is enforced by the identity provider, not by this file.
+  # ---------------------------------------------------------------------------
+  promote:
+    name: promote to prod
+    needs: [build, deploy]
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    environment: production
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - name: Confirm a prod environment exists
+        env:
+          PROD_ROLE: ${{ vars.PROD_AWS_DEPLOY_ROLE_ARN }}
+        run: |
+          set -euo pipefail
+          if [ -z "$PROD_ROLE" ]; then
+            echo '::notice title=No prod environment::PROD_AWS_DEPLOY_ROLE_ARN is unset, so there is nothing to promote to.'
+            echo 'infra/terraform/environments/prod does not exist yet. This job is the approval gate, wired'
+            echo 'and waiting: when the environment lands, set the repository variables and remove this guard.'
+            exit 0
+          fi
+          echo "::error title=Not implemented::A prod deploy role exists but this job does not yet deploy to it."
+          exit 1

@@ -218,3 +218,15 @@ output "private_subnet_cidrs" {
   EOT
   value       = module.network.private_subnet_cidrs
 }
+
+output "deploy_role_arn" {
+  description = <<-EOT
+    ARN of the role GitHub Actions assumes to deploy this environment.
+
+    Set it as the repository VARIABLE `AWS_DEPLOY_ROLE_ARN` -- a variable and
+    not a secret. A role ARN is not a credential (it is useless without a
+    trusted OIDC token), and masking it turns a failed AssumeRole into an error
+    message with the interesting part replaced by asterisks.
+  EOT
+  value       = module.cicd.deploy_role_arn
+}

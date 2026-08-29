@@ -198,3 +198,37 @@ resource "aws_s3_bucket_policy" "state" {
   # mistake in the policy is actually public.
   depends_on = [aws_s3_bucket_public_access_block.state]
 }
+
+# --------------------------------------------------------------------------
+# GitHub Actions OIDC (#103)
+# --------------------------------------------------------------------------
+
+# The identity provider that lets a GitHub Actions job exchange a
+# workflow-scoped token for temporary AWS credentials, so nothing in this
+# project ever needs a long-lived access key in a repository secret. A stored
+# key pair is the finding a reviewer raises first, and it is the credential that
+# cannot be revoked by revoking anything else.
+#
+# It lives in `bootstrap` rather than in an environment because an
+# OpenIDConnectProvider is an account-wide singleton keyed by its URL: a second
+# environment creating one would fail with EntityAlreadyExists, and whichever
+# environment happened to own it would take it away on destroy. Environments
+# look it up with a data source instead, which also means an environment can be
+# destroyed and rebuilt without touching account-level identity.
+#
+# No `thumbprint_list`. AWS has verified this provider's certificate chain
+# against its own trust store since mid-2023 and ignores the field for the
+# GitHub endpoint; pinning a thumbprint here would be a value that looks
+# load-bearing, is not, and silently expires. Terraform still records whatever
+# AWS returns, so a diff on this resource is worth reading rather than applying.
+resource "aws_iam_openid_connect_provider" "github" {
+  url = "https://token.actions.githubusercontent.com"
+
+  # The audience a workflow requests. `sts.amazonaws.com` is what
+  # aws-actions/configure-aws-credentials asks for; a role's trust policy
+  # asserts it again, so this list being wrong shows up as a refused
+  # AssumeRoleWithWebIdentity rather than as a wider trust.
+  client_id_list = ["sts.amazonaws.com"]
+
+  tags = { Name = "${var.project}-github-actions" }
+}
