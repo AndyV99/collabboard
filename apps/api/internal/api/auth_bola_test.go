@@ -183,6 +183,12 @@ type membershipService struct {
 	// not in it has no account anywhere.
 	store    *recordingStore
 	accounts map[string]uuid.UUID
+
+	// createdFor records every subject POST /me/organizations was called with,
+	// which is the whole of what that route's attack has to check: the id the
+	// service receives must be the token's and never anything from the request.
+	mu         sync.Mutex
+	createdFor []uuid.UUID
 }
 
 func (s *membershipService) Register(context.Context, auth.RegisterInput) (auth.RegisterResult, error) {
@@ -212,6 +218,31 @@ func (s *membershipService) CreateFirstOrganization(
 	context.Context, auth.CreateOrganizationInput,
 ) (auth.CreateOrganizationResult, error) {
 	panic("membershipService: CreateFirstOrganization is not modelled")
+}
+
+// CreateAdditionalOrganization records the subject it was called with, and
+// nothing else.
+//
+// Modelled rather than panicking, unlike its sibling above, because this one IS
+// authenticated and is therefore in scope for this file: the question every
+// attack here asks is "whose id reached the service", and a panic would answer
+// it with a stack trace instead of an assertion. It returns a fixed
+// organization, because what is under test is the subject, not the workspace.
+func (s *membershipService) CreateAdditionalOrganization(
+	_ context.Context, userID uuid.UUID, _ auth.CreateAdditionalOrganizationInput,
+) (auth.CreateOrganizationResult, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	s.createdFor = append(s.createdFor, userID)
+
+	return auth.CreateOrganizationResult{
+		UserID:           userID,
+		OrganizationID:   uuid.New(),
+		OrganizationName: "A workspace",
+		OrganizationSlug: "a-workspace",
+		Role:             auth.RoleOwner,
+	}, nil
 }
 
 // Me models both halves of GET /me the way the real service does them: the
@@ -315,8 +346,13 @@ func (s *membershipService) SwitchOrganization(_ context.Context, principal auth
 }
 
 type bolaFixture struct {
-	router     *gin.Engine
-	store      *recordingStore
+	router *gin.Engine
+	store  *recordingStore
+	// service is the fake the router was built with, so an attack can ask what
+	// the handler actually passed down rather than inferring it from a status
+	// code. POST /me/organizations needs that: the subject it acts on does not
+	// appear in the response body.
+	service    *membershipService
 	issuer     *auth.Issuer
 	aliceToken string
 	tenantA    uuid.UUID
@@ -388,6 +424,7 @@ func newBOLAFixture(t *testing.T) *bolaFixture {
 	return &bolaFixture{
 		router:     router,
 		store:      tenantStore,
+		service:    service,
 		issuer:     issuer,
 		aliceToken: token,
 		tenantA:    tenantA,
@@ -685,6 +722,64 @@ func TestAddingAMemberByEmailIsNotADirectoryLookup(t *testing.T) {
 
 // TestRewritingTheOrgClaimDoesNotWork is the same attack against the only
 // channel that would actually carry a tenant if it were believed.
+// TestCreatingAWorkspaceLandsOnTheCallerAndNobodyElse covers the route #86 added
+// (POST /api/v1/me/organizations).
+//
+// The attack is short because the shape refuses it: the request struct has one
+// field and it is the workspace's name, so there is no user id to steer. What is
+// asserted is that the *absence* is load-bearing — extra fields in the body,
+// however they are spelled, reach nothing, and the id the service receives is
+// always the token's subject.
+func TestCreatingAWorkspaceLandsOnTheCallerAndNobodyElse(t *testing.T) {
+	t.Parallel()
+
+	f := newBOLAFixture(t)
+
+	// The control, without which every assertion below would also hold for a
+	// route that answered 500 to everything.
+	t.Run("control: alice creates one for herself", func(t *testing.T) {
+		rec := f.do(t, http.MethodPost, "/api/v1/me/organizations", nil,
+			map[string]any{"name": "Alice's Side Project"})
+
+		t.Logf("control -> %d %s", rec.Code, rec.Body.String())
+
+		if rec.Code != http.StatusCreated {
+			t.Fatalf("status = %d, want 201 — nothing below proves anything", rec.Code)
+		}
+	})
+
+	// Every spelling of "do this for bob instead" that a client could try. Each
+	// one is either ignored by the binder or rejected by it; in neither case may
+	// bob's id reach the service.
+	for _, field := range []string{"user_id", "userId", "subject", "owner_id", "account_id"} {
+		steered := map[string]any{"name": "Taken", field: f.bobID.String()}
+
+		rec := f.do(t, http.MethodPost, "/api/v1/me/organizations", nil, steered)
+
+		t.Logf("%v -> %d", steered, rec.Code)
+
+		if rec.Code >= 500 {
+			t.Errorf("body %v produced %d; a steering attempt must be refused or ignored, not crash",
+				steered, rec.Code)
+		}
+	}
+
+	// The assertion that matters: whatever was sent, every call named alice.
+	f.service.mu.Lock()
+	defer f.service.mu.Unlock()
+
+	if len(f.service.createdFor) == 0 {
+		t.Fatal("the service was never called; the control above is not testing this route")
+	}
+
+	for i, subject := range f.service.createdFor {
+		if subject != f.aliceID {
+			t.Errorf("call %d created a workspace for %s, want alice (%s)",
+				i, subject, f.aliceID)
+		}
+	}
+}
+
 func TestRewritingTheOrgClaimDoesNotWork(t *testing.T) {
 	t.Parallel()
 

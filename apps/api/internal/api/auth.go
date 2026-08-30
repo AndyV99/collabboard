@@ -35,6 +35,7 @@ type AuthService interface {
 	Logout(ctx context.Context, refreshToken string) error
 	SwitchOrganization(ctx context.Context, principal auth.Principal, target uuid.UUID) (auth.LoginResult, error)
 	CreateFirstOrganization(ctx context.Context, in auth.CreateOrganizationInput) (auth.CreateOrganizationResult, error)
+	CreateAdditionalOrganization(ctx context.Context, userID uuid.UUID, in auth.CreateAdditionalOrganizationInput) (auth.CreateOrganizationResult, error)
 	Me(ctx context.Context, principal auth.Principal) (auth.MeResult, error)
 	AddMember(ctx context.Context, in auth.AddMemberInput) (auth.AddMemberResult, error)
 }
@@ -120,6 +121,20 @@ type createOrganizationRequest struct {
 	Email            string `json:"email"    binding:"required"`
 	Password         string `json:"password" binding:"required"`
 	OrganizationName string `json:"organization_name"`
+}
+
+// createAdditionalOrganizationRequest is the body of POST /api/v1/me/organizations.
+//
+// One field, and nowhere to put a second. There is no email, no password and no
+// user id: the credential is the bearer token and the subject is whatever it
+// verified as, which is the same property [addMemberRequest] has and for the
+// same reason — a struct with nowhere to name another account cannot be made to
+// act on one.
+//
+// The name is required here where registration defaults it. See
+// [auth.Service.CreateAdditionalOrganization] for why.
+type createAdditionalOrganizationRequest struct {
+	Name string `json:"name" binding:"required"`
 }
 
 // createOrganizationResponse is what a repaired account gets back.
@@ -366,6 +381,74 @@ func createOrganizationHandler(logger *slog.Logger, service AuthService) gin.Han
 			return
 		}
 
+		c.JSON(http.StatusCreated, createOrganizationResponse{
+			UserID: result.UserID.String(),
+			Organization: organizationBody{
+				ID:   result.OrganizationID.String(),
+				Name: result.OrganizationName,
+				Slug: result.OrganizationSlug,
+				Role: result.Role,
+			},
+		})
+	}
+}
+
+// createAdditionalOrganizationHandler creates another workspace for the
+// authenticated subject (issue #86).
+//
+// # It is mounted on the authenticated group, unlike its sibling
+//
+// [createOrganizationHandler] sits with the unauthenticated routes because the
+// account it serves cannot hold a token. This one serves an account that can, so
+// the credential is the token and nothing in this handler reads a password.
+// Two routes rather than one route with two authentication modes: router_test.go
+// asserts exactly which routes answer without a token, and that inventory is
+// only meaningful while each route has one answer.
+//
+// # The subject is the principal and cannot be anything else
+//
+// `principal.UserID`, from the verified token, is the only expression here that
+// could be. The request struct has one field and it is the workspace's name —
+// there is no user id in it to attack with, which is the same shape
+// [addMemberHandler] has and the reason auth_bola_test.go's attack on this route
+// is a short test rather than a long one.
+//
+// # A new tenant, created by a request carrying a different tenant claim
+//
+// Worth naming because it looks like a boundary crossing and is not. The new
+// organization gets a fresh tenant id generated inside
+// [auth.Service.provisionOrganization], which opens its own transaction with
+// `WithTenant` for that id — the same code registration runs. The caller's own
+// org claim is never used as a tenant here and no row belonging to it is read or
+// written. What the claim is used for is authentication only: it is what makes
+// the token valid, and `principal.UserID` is what the operation acts on.
+func createAdditionalOrganizationHandler(logger *slog.Logger, service AuthService) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		principal, ok := principalFrom(c)
+		if !ok {
+			rejectUnauthenticated(c, logger, "no_principal", nil)
+
+			return
+		}
+
+		var req createAdditionalOrganizationRequest
+		if !bindJSON(c, &req) {
+			return
+		}
+
+		result, err := service.CreateAdditionalOrganization(c.Request.Context(),
+			principal.UserID, auth.CreateAdditionalOrganizationInput{Name: req.Name})
+		if err != nil {
+			writeAuthError(c, logger, err)
+
+			return
+		}
+
+		// The same body the recovery path answers with, and deliberately not a
+		// [sessionResponse]. This creates a workspace; it does not move the
+		// caller into it. The client's next call is POST /auth/organization,
+		// which is the existing way to switch and which re-reads the membership
+		// before minting a token that names it.
 		c.JSON(http.StatusCreated, createOrganizationResponse{
 			UserID: result.UserID.String(),
 			Organization: organizationBody{
@@ -689,6 +772,15 @@ func writeAuthError(c *gin.Context, logger *slog.Logger, err error) {
 		// exists.
 		c.AbortWithStatusJSON(http.StatusConflict,
 			errorResponse{Error: "this account already belongs to an organization"})
+
+	case errors.Is(err, auth.ErrTooManyOrganizations):
+		// 409 rather than 403, on the same reading as the line above: the
+		// caller is entitled to create workspaces and has created as many as
+		// they may. The cap is named because it is a fact about the account's
+		// own state, not about anyone else's, and a limit the client cannot see
+		// is a limit it cannot explain to the person who hit it.
+		c.AbortWithStatusJSON(http.StatusConflict,
+			errorResponse{Error: "this account already owns the maximum number of workspaces"})
 
 	case errors.Is(err, auth.ErrNotAMember):
 		c.AbortWithStatusJSON(http.StatusForbidden,
