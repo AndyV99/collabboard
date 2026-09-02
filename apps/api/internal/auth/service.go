@@ -92,6 +92,21 @@ const (
 
 	// maxDisplayNameLength keeps a display name from being a payload.
 	maxDisplayNameLength = 128
+
+	// maxOrganizationNameLength bounds the workspace name, in runes.
+	//
+	// 200 rather than 128, because this is the same *kind* of value as a
+	// project, board, column or card title and those are `maxNameLength` in
+	// internal/api/crud.go. The number is repeated rather than imported:
+	// internal/auth cannot import internal/api (the dependency runs the other
+	// way), and a shared constants package for one integer would be worse than
+	// the duplication it removed. The test below pins them together.
+	//
+	// It was the one user-supplied field on this API with no bound at all --
+	// #50's 16 KiB body limit made the practical ceiling "whatever fits", which
+	// is containment rather than validation, and an 8,000-character name was
+	// still accepted, stored, slugged and rendered into every member's UI.
+	maxOrganizationNameLength = 200
 )
 
 // Store is the slice of internal/store this package uses.
@@ -235,7 +250,19 @@ func (s *Service) Register(ctx context.Context, in RegisterInput) (RegisterResul
 	email := NormalizeEmail(in.Email)
 	displayName := strings.TrimSpace(in.DisplayName)
 
-	if err := validateRegistration(email, in.Password, displayName); err != nil {
+	// Resolved here rather than at the call to provisionOrganization below, so
+	// that the name -- the requested one, or the default when none was given --
+	// is validated *before* the account exists.
+	//
+	// That ordering is the whole reason this is not left to the funnel guard in
+	// provisionOrganization. Registration is two transactions, and a failure
+	// between them strands an account that can authenticate and belongs
+	// nowhere (see the comment above this function, and #34). An over-long
+	// workspace name is a 400 the caller can fix; it must not also be a way to
+	// manufacture that state on demand.
+	organizationName := workspaceName(in.OrganizationName, displayName)
+
+	if err := validateRegistration(email, in.Password, displayName, organizationName); err != nil {
 		return RegisterResult{}, err
 	}
 
@@ -286,8 +313,7 @@ func (s *Service) Register(ctx context.Context, in RegisterInput) (RegisterResul
 		return RegisterResult{}, fmt.Errorf("creating the account: %w", err)
 	}
 
-	organization, err := s.provisionOrganization(ctx, user.ID,
-		workspaceName(in.OrganizationName, displayName))
+	organization, err := s.provisionOrganization(ctx, user.ID, organizationName)
 	if err != nil {
 		s.logger.ErrorContext(ctx, "registration created an account with no organization",
 			slog.String("event", "auth.register.partial"),
@@ -351,6 +377,14 @@ func (s *Service) provisionOrganization(ctx context.Context, userID uuid.UUID, n
 
 	var organization store.Organization
 
+	// Every write to organizations.name goes through here, so this is where the
+	// bound cannot be forgotten. Register checks the same rule earlier for a
+	// different reason -- see the comment there -- and this one is what covers
+	// CreateFirstOrganization and whatever calls it next.
+	if err := validateWorkspaceName(name); err != nil {
+		return store.Organization{}, err
+	}
+
 	err := s.store.WithTenant(ctx, tenantID, func(ctx context.Context, q store.Querier) error {
 		created, cerr := q.CreateOrganization(ctx, store.CreateOrganizationParams{
 			Name: name,
@@ -399,6 +433,27 @@ func workspaceName(requested, displayName string) string {
 	}
 
 	return displayName + "'s workspace"
+}
+
+// validateWorkspaceName bounds the one name a caller can set without a
+// credential.
+//
+// Blank is not checked here and is not an oversight: [workspaceName] has
+// already substituted the default by the time anything is validated, and the
+// column's own `CHECK (length(btrim(name)) > 0)` is the backstop for a default
+// that somehow came out empty.
+//
+// The generated default is subject to the same cap. It cannot exceed it today —
+// a 128-rune display name plus "'s workspace" is 140 — but "cannot today" is a
+// fact about `maxDisplayNameLength`, and the two numbers have no reason to know
+// about each other.
+func validateWorkspaceName(name string) error {
+	if utf8.RuneCountInString(name) > maxOrganizationNameLength {
+		return fmt.Errorf("%w: workspace name must be at most %d characters",
+			ErrInvalidInput, maxOrganizationNameLength)
+	}
+
+	return nil
 }
 
 // LoginInput is a credential presentation. ClientIP is used only for rate
@@ -959,8 +1014,12 @@ func validateEmailAddress(email string) error {
 	}
 }
 
-func validateRegistration(email, password, displayName string) error {
+func validateRegistration(email, password, displayName, organizationName string) error {
 	if err := validateEmailAddress(email); err != nil {
+		return err
+	}
+
+	if err := validateWorkspaceName(organizationName); err != nil {
 		return err
 	}
 
