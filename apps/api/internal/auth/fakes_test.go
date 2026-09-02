@@ -207,6 +207,15 @@ type fakeStore struct {
 	credentials  map[uuid.UUID]fakeCredential
 	memberships  map[uuid.UUID][]store.UserOrganization
 
+	// organizations is the organizations table, keyed by tenant id.
+	//
+	// Added for #90. Before it, CreateMembership invented a name and a slug
+	// from the tenant's uuid, so `Me` reported a different name than the one
+	// CreateOrganization had just returned — which nothing noticed until a
+	// rename made "what does the organization list say afterwards" a question
+	// worth asking.
+	organizations map[uuid.UUID]store.Organization
+
 	// reasons records every reason the pre-tenant door was opened with, which
 	// is what makes "the audit trail is real" testable.
 	reasons []string
@@ -236,10 +245,11 @@ type fakeCredential struct {
 
 func newFakeStore() *fakeStore {
 	return &fakeStore{
-		usersByEmail: map[string]store.IdentityUser{},
-		usersByID:    map[uuid.UUID]store.IdentityUser{},
-		credentials:  map[uuid.UUID]fakeCredential{},
-		memberships:  map[uuid.UUID][]store.UserOrganization{},
+		organizations: map[uuid.UUID]store.Organization{},
+		usersByEmail:  map[string]store.IdentityUser{},
+		usersByID:     map[uuid.UUID]store.IdentityUser{},
+		credentials:   map[uuid.UUID]fakeCredential{},
+		memberships:   map[uuid.UUID][]store.UserOrganization{},
 	}
 }
 

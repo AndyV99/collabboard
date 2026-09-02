@@ -97,6 +97,12 @@ func (stubAuthService) CreateAdditionalOrganization(
 	panic("stubAuthService: CreateAdditionalOrganization is not reachable from the realtime routes")
 }
 
+func (stubAuthService) RenameOrganization(
+	context.Context, auth.RenameOrganizationInput,
+) (auth.Organization, error) {
+	panic("stubAuthService: RenameOrganization is not reachable from the realtime routes")
+}
+
 func (stubAuthService) AddMember(context.Context, auth.AddMemberInput) (auth.AddMemberResult, error) {
 	panic("stubAuthService: AddMember is not reachable from the realtime routes")
 }

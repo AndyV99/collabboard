@@ -102,6 +102,8 @@ import (
 	"context"
 
 	"github.com/google/uuid"
+
+	"github.com/AndyV99/collabboard/apps/api/internal/store"
 )
 
 // ErrAlreadyHasOrganization means the subject authenticated but already belongs
@@ -388,4 +390,161 @@ func (s *Service) CreateAdditionalOrganization(
 		OrganizationSlug: organization.Slug,
 		Role:             RoleOwner,
 	}, nil
+}
+
+// RenameOrganizationInput is the new name, and nothing that names an
+// organization.
+//
+// The tenant is the caller's verified `org` claim, which is where every other
+// tenant-scoped route gets it. There is no organization id in this struct, in
+// the route, or in [Service.RenameOrganization]'s signature — the same absence
+// [AddMemberInput] has, and the reason auth_bola_test.go's attack on this route
+// is short.
+type RenameOrganizationInput struct {
+	Principal Principal
+	Name      string
+}
+
+// RenameOrganization changes the current workspace's name (issue #90).
+//
+// # Why the name was permanent until now
+//
+// `POST /organizations` was the only route under that path and nothing anywhere
+// else wrote `organizations.name`, so the name an organization was created with
+// was the name it had forever. That was easy to miss while the only way to make
+// one was registration, where the user types it and can see what they are
+// choosing. #85 made it visible: the recovery screen creates a workspace for an
+// account whose first attempt was interrupted, and the name that account chose
+// the first time went with the transaction that never committed — so the form
+// had to ask again, under a hint reading "It cannot be renamed later."
+//
+// # Authorization: owner or admin, read inside the transaction
+//
+// The same rule `POST /members` applies, and read the same way — the caller's
+// membership comes from a tenant-scoped query rather than from the token's role
+// claim. ADR 0008 explains why that matters: a role claim is minted at login and
+// re-derived at most once per access-token lifetime, so a demoted account
+// carries a stale one, and a caller whose membership was revoked entirely finds
+// no row and is refused as [ErrNotAMember] rather than acting on a workspace
+// they have been removed from.
+//
+// Whether renaming the workspace should be *stricter* than adding a member —
+// owner only — is a real question and the answer here is no, deliberately: #90
+// asked for parity with `POST /members`, and inventing a third authorization
+// tier for one endpoint is the kind of thing that is easy to add and impossible
+// to remember.
+//
+// # The slug is frozen, and that is a decision
+//
+// It is not recomputed on rename. Two reasons, in this order:
+//
+//   - `organizations_slug_key` is a global unique index, so regenerating would
+//     make a rename fail whenever another tenant already holds the slug for that
+//     name — turning a cosmetic edit into a 409 about somebody else's workspace,
+//     which is also a small existence oracle.
+//   - it appears in **no URL** in this application. Not in `apps/web`'s routes,
+//     not in any API path. So there is nothing for a fresh slug to fix.
+//
+// The moment a slug does appear in a URL, "regenerate and redirect" becomes a
+// real design with real work in it — and it should be decided then, against a
+// URL that exists, rather than pre-emptively now against one that does not.
+func (s *Service) RenameOrganization(ctx context.Context, in RenameOrganizationInput) (Organization, error) {
+	name := strings.TrimSpace(in.Name)
+
+	if name == "" {
+		return Organization{}, fmt.Errorf("%w: workspace name is required", ErrInvalidInput)
+	}
+
+	// The bound from #67, applied here so a rename cannot reintroduce the
+	// unbounded field by the back door. provisionOrganization's own guard does
+	// not cover this path -- nothing here goes through it -- which is exactly
+	// the third writer that migration 00007's CHECK was added for.
+	if err := validateWorkspaceName(name); err != nil {
+		return Organization{}, err
+	}
+
+	var renamed store.Organization
+
+	err := s.store.WithTenant(ctx, in.Principal.TenantID, func(ctx context.Context, q store.Querier) error {
+		if aerr := authorizeRename(ctx, q, in.Principal.UserID); aerr != nil {
+			return aerr
+		}
+
+		// Same transaction as the authorization read, so the role the decision
+		// was made against is the role the write is checked against. The
+		// alternative -- authorize, then write -- is a window in which a
+		// membership can be revoked between the two.
+		organization, uerr := q.RenameOrganization(ctx, name)
+		if uerr != nil {
+			return uerr
+		}
+
+		renamed = organization
+
+		return nil
+	})
+	if err != nil {
+		if errors.Is(err, ErrNotAMember) || errors.Is(err, ErrInsufficientRole) {
+			s.logger.InfoContext(ctx, "workspace rename refused",
+				slog.String("event", "auth.organization.rename_refused"),
+				slog.String("actor_user_id", in.Principal.UserID.String()),
+				slog.String("tenant_id", in.Principal.TenantID.String()),
+				// The reason, not the name: a refused rename says nothing about
+				// what the caller tried to call it.
+				slog.String("reason", refusalReason(err)),
+			)
+
+			return Organization{}, err
+		}
+
+		return Organization{}, fmt.Errorf("renaming the organization: %w", err)
+	}
+
+	s.logger.InfoContext(ctx, "workspace renamed",
+		slog.String("event", "auth.organization.renamed"),
+		slog.String("actor_user_id", in.Principal.UserID.String()),
+		slog.String("tenant_id", renamed.ID.String()),
+	)
+
+	return Organization{
+		ID:   renamed.ID,
+		Name: renamed.Name,
+		Slug: renamed.Slug,
+		Role: in.Principal.Role,
+	}, nil
+}
+
+// authorizeRename decides whether one member of the current tenant may rename
+// it.
+//
+// Deliberately a sibling of [authorizeAddMember] rather than a call into it:
+// that function's signature takes the role being *granted*, which this operation
+// does not have, and giving it a sentinel would make one function answer two
+// unrelated questions. What they share is the part that matters — the membership
+// is read from the current tenant's rows, so RLS supplies
+// `tenant_id = current_tenant_id()` and a token for an organization the caller
+// has been removed from finds no row.
+func authorizeRename(ctx context.Context, q store.Querier, actorID uuid.UUID) error {
+	membership, err := q.GetMembership(ctx, actorID)
+	if errors.Is(err, store.ErrNoRows) {
+		return ErrNotAMember
+	} else if err != nil {
+		return fmt.Errorf("reading the caller's membership: %w", err)
+	}
+
+	switch membership.Role {
+	case RoleOwner, RoleAdmin:
+		return nil
+	default:
+		return ErrInsufficientRole
+	}
+}
+
+// refusalReason names why a rename was refused, for the log line only.
+func refusalReason(err error) string {
+	if errors.Is(err, ErrNotAMember) {
+		return "not_a_member"
+	}
+
+	return "insufficient_role"
 }

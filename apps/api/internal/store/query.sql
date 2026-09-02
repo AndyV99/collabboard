@@ -61,6 +61,30 @@ INSERT INTO organizations (id, name, slug)
 VALUES (public.current_tenant_id(), @name, @slug)
 RETURNING *;
 
+-- name: RenameOrganization :one
+-- Changing the workspace's name, for issue #90.
+--
+-- `WHERE id = public.current_tenant_id()` rather than a bare UPDATE, and rather
+-- than an id parameter. The policy on `organizations` would already restrict an
+-- unqualified UPDATE to the one visible row, so the predicate is redundant
+-- today -- and it is written anyway, for the same reason CreateOrganization
+-- names the same function: the tenant comes from the transaction and never from
+-- the caller, and a query that says so cannot later acquire an id parameter by
+-- accident. There is no `organization_id` anywhere in this file and there is not
+-- meant to be.
+--
+-- `slug` is deliberately not recomputed. It is globally unique behind an index,
+-- so regenerating it on every rename would turn "two workspaces picked the same
+-- name" into a failed rename -- and it appears in no URL in this application, so
+-- there is nothing for a fresh one to fix. See internal/auth/organizations.go.
+--
+-- `updated_at` is left alone: organizations_set_updated_at (migration 00002)
+-- bumps it, and setting it here would be a second implementation of that.
+UPDATE organizations
+SET name = @name
+WHERE id = public.current_tenant_id()
+RETURNING *;
+
 -- name: CreateMembership :one
 -- The second half of an invite, and the half that is *not* pre-tenant.
 --

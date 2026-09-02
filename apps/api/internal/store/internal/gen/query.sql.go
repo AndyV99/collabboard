@@ -1060,6 +1060,44 @@ func (q *Queries) RebalanceColumnCards(ctx context.Context, columnID uuid.UUID) 
 	return err
 }
 
+const renameOrganization = `-- name: RenameOrganization :one
+UPDATE organizations
+SET name = $1
+WHERE id = public.current_tenant_id()
+RETURNING id, name, slug, created_at, updated_at
+`
+
+// Changing the workspace's name, for issue #90.
+//
+// `WHERE id = public.current_tenant_id()` rather than a bare UPDATE, and rather
+// than an id parameter. The policy on `organizations` would already restrict an
+// unqualified UPDATE to the one visible row, so the predicate is redundant
+// today -- and it is written anyway, for the same reason CreateOrganization
+// names the same function: the tenant comes from the transaction and never from
+// the caller, and a query that says so cannot later acquire an id parameter by
+// accident. There is no `organization_id` anywhere in this file and there is not
+// meant to be.
+//
+// `slug` is deliberately not recomputed. It is globally unique behind an index,
+// so regenerating it on every rename would turn "two workspaces picked the same
+// name" into a failed rename -- and it appears in no URL in this application, so
+// there is nothing for a fresh one to fix. See internal/auth/organizations.go.
+//
+// `updated_at` is left alone: organizations_set_updated_at (migration 00002)
+// bumps it, and setting it here would be a second implementation of that.
+func (q *Queries) RenameOrganization(ctx context.Context, name string) (Organization, error) {
+	row := q.db.QueryRow(ctx, renameOrganization, name)
+	var i Organization
+	err := row.Scan(
+		&i.ID,
+		&i.Name,
+		&i.Slug,
+		&i.CreatedAt,
+		&i.UpdatedAt,
+	)
+	return i, err
+}
+
 const unarchiveProject = `-- name: UnarchiveProject :one
 UPDATE projects
 SET archived_at = NULL

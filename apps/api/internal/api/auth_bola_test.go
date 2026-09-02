@@ -189,6 +189,11 @@ type membershipService struct {
 	// service receives must be the token's and never anything from the request.
 	mu         sync.Mutex
 	createdFor []uuid.UUID
+
+	// renamedIn records every tenant PATCH /organizations was asked to rename,
+	// which is that route's whole attack surface: the workspace acted on must
+	// be the token's and never anything from the request.
+	renamedIn []uuid.UUID
 }
 
 func (s *membershipService) Register(context.Context, auth.RegisterInput) (auth.RegisterResult, error) {
@@ -242,6 +247,28 @@ func (s *membershipService) CreateAdditionalOrganization(
 		OrganizationName: "A workspace",
 		OrganizationSlug: "a-workspace",
 		Role:             auth.RoleOwner,
+	}, nil
+}
+
+// RenameOrganization records the tenant it was asked to act on.
+//
+// Modelled rather than panicking for the same reason
+// CreateAdditionalOrganization is: this route is authenticated, so it is in
+// scope for this file, and the question every attack here asks is "whose tenant
+// reached the service".
+func (s *membershipService) RenameOrganization(
+	_ context.Context, in auth.RenameOrganizationInput,
+) (auth.Organization, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	s.renamedIn = append(s.renamedIn, in.Principal.TenantID)
+
+	return auth.Organization{
+		ID:   in.Principal.TenantID,
+		Name: in.Name,
+		Slug: "a-workspace",
+		Role: in.Principal.Role,
 	}, nil
 }
 
@@ -776,6 +803,86 @@ func TestCreatingAWorkspaceLandsOnTheCallerAndNobodyElse(t *testing.T) {
 		if subject != f.aliceID {
 			t.Errorf("call %d created a workspace for %s, want alice (%s)",
 				i, subject, f.aliceID)
+		}
+	}
+}
+
+// TestRenamingAWorkspaceActsOnTheCallersOwnTenant covers the route #90 added
+// (PATCH /api/v1/organizations).
+//
+// The workspace renamed is the token's `org` claim. There is no id in the path
+// and none in the body, so the attack is the same shape as #86's: prove the
+// absence is load-bearing rather than incidental.
+//
+// The second half is the one specific to this route. `PATCH` shares a path with
+// an **unauthenticated** `POST` — the repair path from #34 — so "is this route
+// public?" is answered per method here and nowhere else in the API. That is
+// asserted directly, because the route inventory's map is keyed on method and
+// path together and would otherwise be the only thing standing behind it.
+func TestRenamingAWorkspaceActsOnTheCallersOwnTenant(t *testing.T) {
+	t.Parallel()
+
+	f := newBOLAFixture(t)
+
+	t.Run("control: alice renames her own workspace", func(t *testing.T) {
+		rec := f.do(t, http.MethodPatch, "/api/v1/organizations", nil,
+			map[string]any{"name": "Alice Co"})
+
+		t.Logf("control -> %d %s", rec.Code, rec.Body.String())
+
+		if rec.Code != http.StatusOK {
+			t.Fatalf("status = %d, want 200 — nothing below proves anything", rec.Code)
+		}
+	})
+
+	for _, field := range []string{"organization_id", "organizationId", "tenant_id", "id", "org"} {
+		steered := map[string]any{"name": "Taken", field: f.tenantB.String()}
+
+		rec := f.do(t, http.MethodPatch, "/api/v1/organizations", nil, steered)
+
+		t.Logf("%v -> %d", steered, rec.Code)
+
+		if rec.Code >= 500 {
+			t.Errorf("body %v produced %d; a steering attempt must be refused or ignored, not crash",
+				steered, rec.Code)
+		}
+	}
+
+	// The POST on this path is public and the PATCH must not be. Asserted here
+	// rather than left to router_test.go, because a path serving two groups is
+	// the one shape where "the route table says so" is least obvious.
+	t.Run("the PATCH is not public even though the POST on that path is", func(t *testing.T) {
+		req := httptest.NewRequestWithContext(t.Context(), http.MethodPatch,
+			"/api/v1/organizations", bytes.NewReader([]byte(`{"name":"Anonymous"}`)))
+		req.Header.Set("Content-Type", "application/json")
+
+		rec := httptest.NewRecorder()
+		f.router.ServeHTTP(rec, req)
+
+		if rec.Code != http.StatusUnauthorized {
+			t.Fatalf("an unauthenticated PATCH answered %d, want 401", rec.Code)
+		}
+	})
+
+	f.service.mu.Lock()
+	defer f.service.mu.Unlock()
+
+	if len(f.service.renamedIn) == 0 {
+		t.Fatal("the service was never called; the control above is not testing this route")
+	}
+
+	for i, tenant := range f.service.renamedIn {
+		if tenant != f.tenantA {
+			t.Errorf("call %d renamed tenant %s, want alice's own (%s)", i, tenant, f.tenantA)
+		}
+	}
+
+	// And tenant B was never opened, which is the second assertion every attack
+	// in this file gets: the id did not merely fail to change the outcome, it
+	// never reached a tenant context at all.
+	for _, opened := range f.store.opened {
+		if opened == f.tenantB {
+			t.Fatalf("tenant %s was opened during a rename attack", f.tenantB)
 		}
 	}
 }

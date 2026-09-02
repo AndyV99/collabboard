@@ -138,9 +138,18 @@ type fakeTenantQuerier struct {
 }
 
 func (q fakeTenantQuerier) CreateOrganization(_ context.Context, arg store.CreateOrganizationParams) (store.Organization, error) {
+	q.store.mu.Lock()
+	defer q.store.mu.Unlock()
+
 	// The id is the transaction's tenant, exactly as the real INSERT takes it
 	// from current_tenant_id().
-	return store.Organization{ID: q.tenantID, Name: arg.Name, Slug: arg.Slug}, nil
+	organization := store.Organization{ID: q.tenantID, Name: arg.Name, Slug: arg.Slug}
+
+	// Recorded, so CreateMembership can join to a real row rather than
+	// inventing a name and a slug from the uuid.
+	q.store.organizations[q.tenantID] = organization
+
+	return organization, nil
 }
 
 // CreateMembership models the unique index on (tenant_id, user_id) as well as
@@ -163,10 +172,21 @@ func (q fakeTenantQuerier) CreateMembership(_ context.Context, arg store.CreateM
 		}
 	}
 
+	// The organization this membership is joined to, as CreateOrganization
+	// recorded it. The fallback covers a tenant seeded directly by a test
+	// fixture rather than through the create path.
+	organization, ok := q.store.organizations[q.tenantID]
+	if !ok {
+		organization = store.Organization{
+			Name: "org " + q.tenantID.String()[:8],
+			Slug: "org-" + q.tenantID.String()[:8],
+		}
+	}
+
 	q.store.memberships[arg.UserID] = append(q.store.memberships[arg.UserID], store.UserOrganization{
 		OrganizationID: q.tenantID,
-		Name:           "org " + q.tenantID.String()[:8],
-		Slug:           "org-" + q.tenantID.String()[:8],
+		Name:           organization.Name,
+		Slug:           organization.Slug,
 		Role:           arg.Role,
 	})
 
@@ -202,6 +222,45 @@ func (q fakeTenantQuerier) GetUser(_ context.Context, userID uuid.UUID) (store.G
 	}
 
 	return store.GetUserRow{ID: user.ID, Email: user.Email, DisplayName: user.DisplayName}, nil
+}
+
+// RenameOrganization writes the transaction's own tenant and no other, exactly
+// as `WHERE id = public.current_tenant_id()` does.
+//
+// It updates every membership row naming that organization, because
+// `ListUserOrganizations` is what the service reads afterwards and a fake that
+// renamed a row nobody looks at would make the rename untestable end to end.
+// Returning `ErrNoRows` for a tenant with no memberships models the policy: an
+// organization the transaction cannot see is not one it can update.
+func (q fakeTenantQuerier) RenameOrganization(_ context.Context, name string) (store.Organization, error) {
+	q.store.mu.Lock()
+	defer q.store.mu.Unlock()
+
+	organization, ok := q.store.organizations[q.tenantID]
+	if !ok {
+		// No such organization in this transaction's tenant. The policy on
+		// `organizations` produces the same outcome: a row it cannot see is
+		// not a row it can update.
+		return store.Organization{}, store.ErrNoRows
+	}
+
+	// `SET name = @name` and nothing else. The slug is carried through
+	// untouched, so "renaming does not change the slug" is a fact a caller can
+	// assert rather than a constant this fake happens to return.
+	organization.Name = name
+	q.store.organizations[q.tenantID] = organization
+
+	// Every membership row naming it, because ListUserOrganizations is what the
+	// service reads afterwards.
+	for userID, orgs := range q.store.memberships {
+		for i := range orgs {
+			if orgs[i].OrganizationID == q.tenantID {
+				q.store.memberships[userID][i].Name = name
+			}
+		}
+	}
+
+	return organization, nil
 }
 
 // GetMembership answers only for the transaction's own tenant, exactly as the

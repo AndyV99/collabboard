@@ -220,6 +220,12 @@ func NewRouter(
 	// there is nowhere in the path or the body to name another account.
 	authenticated.POST("/me/organizations", createAdditionalOrganizationHandler(logger, authDeps.Service))
 
+	// Renaming the workspace the token names (#90). Same path as the
+	// unauthenticated POST above, different method and different group -- see
+	// renameOrganizationHandler for why that is safe and what makes it stay
+	// safe.
+	authenticated.PATCH("/organizations", renameOrganizationHandler(logger, authDeps.Service))
+
 	// Adding a member goes through the service rather than the store, because
 	// half of it — resolving an address to an account that may live entirely
 	// outside this tenant's visibility — travels the pre-tenant door, and
