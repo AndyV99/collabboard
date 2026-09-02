@@ -485,6 +485,60 @@ describe("/api/proxy", () => {
     expect(response.status).toBe(204);
   });
 
+  it("relays a 201 as a 201, not as a 200", async () => {
+    /*
+     * The module comment promises "the API's own status", and until #80 that
+     * was true of failures and false of successes: `Response.json` defaults to
+     * 200, so every create route on the Go side — which all answer 201 — was
+     * quietly flattened.
+     *
+     * Nothing in `apps/web` branched on a success status, so this never broke
+     * anything. It is worth fixing because the file claimed otherwise and
+     * because the next endpoint to answer 202 would have been rewritten too.
+     */
+    seedSession();
+
+    vi.stubGlobal(
+      "fetch",
+      (async () => json({ project: { id: "p1" } }, 201)) as typeof fetch,
+    );
+
+    const response = await proxyPost(
+      post("/api/proxy/projects", { name: "Launch" }),
+      context(["projects"]),
+    );
+
+    expect(response.status).toBe(201);
+    expect(await response.json()).toEqual({ project: { id: "p1" } });
+  });
+
+  it("relays a 200 as a 200, so the fix did not just move the constant", async () => {
+    seedSession();
+
+    vi.stubGlobal("fetch", (async () => json({ projects: [] })) as typeof fetch);
+
+    const response = await proxyGet(get("/api/proxy/projects"), context(["projects"]));
+
+    expect(response.status).toBe(200);
+  });
+
+  it("relays a 205 without rewriting it into a 204", async () => {
+    // Both empty-bodied statuses go through `expectNoContent`, so a hard-coded
+    // 204 in that branch would silently change the meaning of the other one.
+    // No route answers 205 today; that is the point of asserting it.
+    seedSession();
+
+    vi.stubGlobal(
+      "fetch",
+      (async () => new Response(null, { status: 205 })) as typeof fetch,
+    );
+
+    const response = await proxyGet(get("/api/proxy/cards/c1"), context(["cards", "c1"]));
+
+    expect(response.status).toBe(205);
+    expect(await response.text()).toBe("");
+  });
+
   it("never caches a relayed response", async () => {
     seedSession();
 
