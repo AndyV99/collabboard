@@ -2,7 +2,13 @@ import { describe, expect, it, vi } from "vitest";
 
 import { sendRequest } from "@/lib/api/http";
 import * as endpoints from "@/lib/api/endpoints";
-import { parseAddedMember, parseCard, parseEmpty, parseProject } from "@/lib/api/types";
+import {
+  parseAddedMember,
+  parseCard,
+  parseCurrentUser,
+  parseEmpty,
+  parseProject,
+} from "@/lib/api/types";
 
 const BASE = "http://api.test/api/v1";
 
@@ -332,6 +338,37 @@ describe("parsers", () => {
   it("rejects a card whose assignee_id is neither a string nor null", () => {
     expect(parseCard({ ...CARD, assignee_id: 12 })).toBeNull();
     expect(parseCard({ ...CARD, due_at: false })).toBeNull();
+  });
+
+  it("reads the caller's own name and address out of /me", () => {
+    // #75 added both to `meResponse` precisely so the shell would stop reading
+    // the whole member list to find one row — see #78.
+    const me = {
+      user_id: "u1",
+      email: "andy@example.com",
+      display_name: "Andy Vorndran",
+      role: "owner",
+      session_id: "s1",
+      organization: { id: "o1", name: "Acme", slug: "acme", role: "owner" },
+      organizations: [{ id: "o1", name: "Acme", slug: "acme", role: "owner" }],
+    };
+
+    expect(parseCurrentUser(me)).toMatchObject({
+      email: "andy@example.com",
+      displayName: "Andy Vorndran",
+    });
+
+    // Required, not optional: `meResponse` carries neither with `omitempty`, so
+    // an absent one is a body this client does not understand. Defaulting to ""
+    // would put an empty name in the corner of every page and look like a
+    // styling bug.
+    for (const key of ["email", "display_name"]) {
+      const without: Record<string, unknown> = { ...me };
+
+      delete without[key];
+
+      expect(parseCurrentUser(without)).toBeNull();
+    }
   });
 
   it("rejects an added-member body missing a field", () => {

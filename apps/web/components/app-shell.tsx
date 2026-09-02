@@ -1,8 +1,7 @@
 import Link from "next/link";
 import type { ReactNode } from "react";
 
-import type { Organization } from "@/lib/api/types";
-import type { Viewer } from "@/lib/session/viewer";
+import type { CurrentUser, Organization } from "@/lib/api/types";
 import { MEMBERS_PATH, WORKSPACE_PATH } from "@/lib/workspace/routes";
 import { SignOutButton } from "./sign-out-button";
 import styles from "./app-shell.module.css";
@@ -18,6 +17,12 @@ import styles from "./app-shell.module.css";
  * `viewer` is null when the API could not tell us who we are. The shell still
  * renders: the workspace comes from the session cookie and needs no request, so
  * an API outage costs the user a name in the corner rather than the page.
+ *
+ * It is narrowed to the two fields this component reads rather than taking the
+ * whole {@link CurrentUser}. The layout has the rest — the role, the session id,
+ * the organizations — and handing them down here would be offering a header a
+ * choice about which source of truth to render the workspace from, when the
+ * cookie is already the answer.
  */
 export function AppShell({
   organization,
@@ -25,7 +30,7 @@ export function AppShell({
   children,
 }: {
   organization: Organization;
-  viewer: Viewer | null;
+  viewer: Pick<CurrentUser, "displayName" | "email"> | null;
   children: ReactNode;
 }) {
   return (

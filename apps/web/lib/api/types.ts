@@ -220,9 +220,22 @@ export function parseCreatedOrganization(value: unknown): CreatedOrganization | 
   return { userId, organization };
 }
 
-/** `GET /me`. */
+/**
+ * `GET /me` — who the caller is, and where they can act.
+ *
+ * `email` and `displayName` were added to `meResponse` by #75 and are why
+ * `lib/session/viewer.ts` no longer exists: naming the signed-in person is a
+ * property of the session, and the shell used to answer it by reading the whole
+ * member list and finding itself in it — O(members) work, and a read of every
+ * colleague's address to render your own.
+ *
+ * They are required here rather than optional. `meResponse` carries neither
+ * with `omitempty`, so an absent one is a body this client does not understand.
+ */
 export type CurrentUser = {
   userId: string;
+  email: string;
+  displayName: string;
   role: string;
   sessionId: string;
   organization: Organization;
@@ -235,6 +248,8 @@ export function parseCurrentUser(value: unknown): CurrentUser | null {
   }
 
   const userId = str(value, "user_id");
+  const email = str(value, "email");
+  const displayName = str(value, "display_name");
   const role = str(value, "role");
   const sessionId = str(value, "session_id");
   const organization = parseOrganization(value.organization);
@@ -242,6 +257,8 @@ export function parseCurrentUser(value: unknown): CurrentUser | null {
 
   if (
     userId === null ||
+    email === null ||
+    displayName === null ||
     role === null ||
     sessionId === null ||
     organization === null ||
@@ -250,7 +267,7 @@ export function parseCurrentUser(value: unknown): CurrentUser | null {
     return null;
   }
 
-  return { userId, role, sessionId, organization, organizations };
+  return { userId, email, displayName, role, sessionId, organization, organizations };
 }
 
 /** `GET /members`. */

@@ -2,7 +2,7 @@ import type { ReactNode } from "react";
 
 import { AppShell } from "@/components/app-shell";
 import { requireSession } from "@/lib/session/require";
-import { loadViewer } from "@/lib/session/viewer";
+import { loadCurrentUser } from "@/lib/session/me";
 
 /**
  * Route protection, in one place, for everything under this group.
@@ -18,7 +18,7 @@ import { loadViewer } from "@/lib/session/viewer";
  */
 export default async function ProtectedLayout({ children }: { children: ReactNode }) {
   const session = await requireSession();
-  const viewer = await loadViewer(session.userId);
+  const viewer = await loadCurrentUser();
 
   return (
     <AppShell organization={session.organization} viewer={viewer}>
