@@ -11,7 +11,11 @@ import (
 // the Observability standard (structured logs, consistent field names).
 // An unrecognised level falls back to info rather than failing startup.
 func New(w io.Writer, service, level string) *slog.Logger {
-	handler := slog.NewJSONHandler(w, &slog.HandlerOptions{Level: parseLevel(level)})
+	// Wrapped so that every line logged with a context carrying a request id
+	// gets one, without the call site asking. See requestid.go -- and note that
+	// the .With() below is exactly the call that would defeat a handler whose
+	// WithAttrs did not re-wrap.
+	handler := NewContextHandler(slog.NewJSONHandler(w, &slog.HandlerOptions{Level: parseLevel(level)}))
 
 	return slog.New(handler).With(slog.String("service", service))
 }

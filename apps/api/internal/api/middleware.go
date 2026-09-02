@@ -7,6 +7,8 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
+
+	"github.com/AndyV99/collabboard/apps/api/internal/logging"
 )
 
 // requestIDHeader is echoed back on every response so a client-side error can
@@ -28,6 +30,16 @@ func requestLogger(logger *slog.Logger) gin.HandlerFunc {
 		c.Set(requestIDHeader, requestID)
 		c.Header(requestIDHeader, requestID)
 
+		// On the *request's* context, not only in gin's, so that every package
+		// below this one can reach it without importing gin. internal/auth and
+		// internal/realtime both log during a request and neither has a
+		// *gin.Context; this is what lets their lines join to this one.
+		//
+		// Replacing c.Request is how a gin middleware amends the context --
+		// every handler downstream reads c.Request.Context().
+		c.Request = c.Request.WithContext(
+			logging.WithRequestID(c.Request.Context(), requestID))
+
 		c.Next()
 
 		status := c.Writer.Status()
@@ -37,8 +49,11 @@ func requestLogger(logger *slog.Logger) gin.HandlerFunc {
 			level = slog.LevelError
 		}
 
+		// No explicit request_id: logging.ContextHandler adds it from the
+		// context set above. Passing it here too would put the field on the
+		// line twice, which in JSON is a duplicate key -- valid, and read
+		// differently by different consumers.
 		logger.LogAttrs(c.Request.Context(), level, "http request",
-			slog.String("request_id", requestID),
 			slog.String("method", c.Request.Method),
 			slog.String("path", c.FullPath()),
 			slog.Int("status", status),

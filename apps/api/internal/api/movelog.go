@@ -84,15 +84,6 @@ const (
 	reasonCrossBoardColumn  = "column_on_another_board"
 )
 
-// requestIDFrom returns the id requestLogger assigned this request, so a domain
-// line joins to the request line that bracketed it.
-//
-// Empty only if this ran outside the middleware, which in this package means a
-// test that mounted a handler on a bare engine.
-func requestIDFrom(c *gin.Context) string {
-	return c.GetString(requestIDHeader)
-}
-
 // requestAttrs are the fields every domain line carries: which request, whose
 // tenant, and which member did it.
 //
@@ -110,8 +101,10 @@ func requestIDFrom(c *gin.Context) string {
 // websocket rather than a log key, and the two vocabularies are separate for
 // the reason the event-name comment above gives.)
 func requestAttrs(c *gin.Context) []slog.Attr {
-	attrs := make([]slog.Attr, 0, 3)
-	attrs = append(attrs, slog.String("request_id", requestIDFrom(c)))
+	// No request_id here any more: since #95 logging.ContextHandler adds it to
+	// every line whose context carries one, and every call site below logs with
+	// c.Request.Context(). Adding it here as well would emit the key twice.
+	attrs := make([]slog.Attr, 0, 2)
 
 	if principal, ok := principalFrom(c); ok {
 		attrs = append(attrs,
