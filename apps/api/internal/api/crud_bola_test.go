@@ -47,6 +47,7 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/AndyV99/collabboard/apps/api/internal/auth"
+	"github.com/AndyV99/collabboard/apps/api/internal/logging"
 	"github.com/AndyV99/collabboard/apps/api/internal/store"
 )
 
@@ -551,7 +552,11 @@ func newBoardFixture(t *testing.T) *boardFixture {
 	tenantStore := newCRUDStore()
 	publisher := &recordingPublisher{}
 	logs := &bytes.Buffer{}
-	logger := slog.New(slog.NewJSONHandler(logs, &slog.HandlerOptions{Level: slog.LevelDebug}))
+	// Built the way cmd/api builds it, rather than as a bare JSON handler.
+	// Since #95 the request id reaches a line through logging.ContextHandler
+	// rather than through an attr at the call site, so a fixture that skipped
+	// that wrapper would assert the absence of a field production has.
+	logger := logging.New(logs, "collabboard-api-test", "debug")
 
 	f := &boardFixture{
 		router: NewRouter(logger,

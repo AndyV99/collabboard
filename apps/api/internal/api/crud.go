@@ -262,7 +262,6 @@ func writeStoreError(c *gin.Context, logger *slog.Logger, event string, tenantID
 		if err != error(apiErr) {
 			logger.ErrorContext(c.Request.Context(), "a refusal carried an additional failure",
 				slog.String("event", event),
-				slog.String("request_id", requestIDFrom(c)),
 				slog.String("path", c.FullPath()),
 				slog.String("tenant_id", tenantID.String()),
 				slog.Int("status", apiErr.status),
@@ -280,7 +279,6 @@ func writeStoreError(c *gin.Context, logger *slog.Logger, event string, tenantID
 	default:
 		logger.ErrorContext(c.Request.Context(), "request failed",
 			slog.String("event", event),
-			slog.String("request_id", requestIDFrom(c)),
 			slog.String("path", c.FullPath()),
 			slog.String("tenant_id", tenantID.String()),
 			slog.Any("error", err),
