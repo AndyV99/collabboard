@@ -82,16 +82,19 @@ import styles from "./auth.module.css";
  *
  * `POST /organizations` defaults an absent name to `"<display name>'s
  * workspace"`, exactly as registration does, so not asking would have been
- * defensible and one field lighter. It is asked anyway because there is no
- * rename: `/organizations` is the only organizations route on the API, so a
- * workspace named by the default is named that permanently. This user very
+ * defensible and one field lighter. It is asked anyway because this user very
  * likely *did* choose a name during the sign-up that broke, and it was lost with
  * the transaction. Leaving the box blank still costs one click.
  *
- * The length cap mirrors `validateRegistration` rather than the API, which
- * bounds this field nowhere — that is issue #67, and the cap here is the same
- * client-side mitigation the sign-up form already applies, deliberately not a
- * new rule invented on this screen.
+ * Until #90 there was a stronger reason — `/organizations` was the only
+ * organizations route on the API, so a workspace named by the default was named
+ * that forever, and the hint under this field had to say so. `PATCH
+ * /api/v1/organizations` exists now, so the hint says the opposite. There is no
+ * screen offering it yet — #175.
+ *
+ * The length cap mirrors `validateRegistration`, which since #67 mirrors the
+ * service: 200 code points, the same bound `maxOrganizationNameLength` applies
+ * on the create path and on the rename.
  */
 export type WorkspaceRecoveryProps = {
   /**
@@ -321,7 +324,7 @@ export function WorkspaceRecovery({
             autoComplete="organization"
             disabled={pending}
             error={nameError}
-            hint="Leave this blank and it will be named after you. It cannot be renamed later."
+            hint="Leave this blank and it will be named after you. You can rename it later."
             label="Workspace name"
             name="organizationName"
             // Clears the length error as the name is shortened, rather than

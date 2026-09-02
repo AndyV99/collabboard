@@ -36,6 +36,7 @@ type AuthService interface {
 	SwitchOrganization(ctx context.Context, principal auth.Principal, target uuid.UUID) (auth.LoginResult, error)
 	CreateFirstOrganization(ctx context.Context, in auth.CreateOrganizationInput) (auth.CreateOrganizationResult, error)
 	CreateAdditionalOrganization(ctx context.Context, userID uuid.UUID, in auth.CreateAdditionalOrganizationInput) (auth.CreateOrganizationResult, error)
+	RenameOrganization(ctx context.Context, in auth.RenameOrganizationInput) (auth.Organization, error)
 	Me(ctx context.Context, principal auth.Principal) (auth.MeResult, error)
 	AddMember(ctx context.Context, in auth.AddMemberInput) (auth.AddMemberResult, error)
 }
@@ -134,6 +135,20 @@ type createOrganizationRequest struct {
 // The name is required here where registration defaults it. See
 // [auth.Service.CreateAdditionalOrganization] for why.
 type createAdditionalOrganizationRequest struct {
+	Name string `json:"name" binding:"required"`
+}
+
+// renameOrganizationRequest is the body of PATCH /api/v1/organizations.
+//
+// One field, and nowhere to name an organization. The workspace being renamed is
+// the caller's `org` claim — the same rule every tenant-scoped route follows,
+// and the reason there is no `:id` in the path either.
+//
+// Not a `*string` like [patchProjectRequest]'s fields: there is exactly one
+// mutable column here, so "absent" and "empty" would mean the same refusal and
+// the three-state machinery would be describing a distinction that does not
+// exist.
+type renameOrganizationRequest struct {
 	Name string `json:"name" binding:"required"`
 }
 
@@ -458,6 +473,57 @@ func createAdditionalOrganizationHandler(logger *slog.Logger, service AuthServic
 				Role: result.Role,
 			},
 		})
+	}
+}
+
+// renameOrganizationHandler changes the caller's workspace name (issue #90).
+//
+// # Why PATCH sits on the same path as an unauthenticated POST
+//
+// `POST /api/v1/organizations` is the password-authenticated repair path from
+// #34: it serves an account with no organization, which structurally cannot hold
+// a token. `PATCH` on the same path serves an account that has one, and is
+// mounted on the authenticated group.
+//
+// That is a wart worth naming rather than glossing: one path, two groups, two
+// answers to "is this public?". It is safe because the property the route
+// inventory protects is keyed on **method and path together** —
+// router_test.go's `publicRoutes` map has `POST /api/v1/organizations` in it and
+// nothing else on that path, so a `PATCH` that stopped requiring a token fails
+// that test by name. The alternative, a second path such as
+// `/me/organization`, would put "rename the workspace I am in" somewhere
+// different from "the workspaces", which reads worse for no gain.
+//
+// The tenant is `principal.TenantID` and cannot be anything else: the request
+// struct has one field and it is the name.
+func renameOrganizationHandler(logger *slog.Logger, service AuthService) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		principal, ok := principalFrom(c)
+		if !ok {
+			rejectUnauthenticated(c, logger, "no_principal", nil)
+
+			return
+		}
+
+		var req renameOrganizationRequest
+		if !bindJSON(c, &req) {
+			return
+		}
+
+		organization, err := service.RenameOrganization(c.Request.Context(),
+			auth.RenameOrganizationInput{Principal: principal, Name: req.Name})
+		if err != nil {
+			writeAuthError(c, logger, err)
+
+			return
+		}
+
+		c.JSON(http.StatusOK, gin.H{"organization": organizationBody{
+			ID:   organization.ID.String(),
+			Name: organization.Name,
+			Slug: organization.Slug,
+			Role: organization.Role,
+		}})
 	}
 }
 
@@ -787,6 +853,10 @@ func writeAuthError(c *gin.Context, logger *slog.Logger, err error) {
 			errorResponse{Error: "not a member of that organization"})
 
 	case errors.Is(err, auth.ErrInsufficientRole):
+		// One sentence for two operations since #90, and it names the wrong one
+		// for a refused rename. Left alone deliberately: the fix is either
+		// splitting the sentinel or carrying the subject on the error, and both
+		// are a decision rather than a one-line edit. Filed as #176.
 		c.AbortWithStatusJSON(http.StatusForbidden,
 			errorResponse{Error: "your role does not permit adding a member"})
 

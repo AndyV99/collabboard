@@ -198,6 +198,12 @@ func (s *countingAuthService) CreateAdditionalOrganization(
 	return auth.CreateOrganizationResult{}, auth.ErrTooManyOrganizations
 }
 
+func (s *countingAuthService) RenameOrganization(
+	context.Context, auth.RenameOrganizationInput,
+) (auth.Organization, error) {
+	return auth.Organization{}, auth.ErrInsufficientRole
+}
+
 // jsonOfExactly renders prefix + padding + suffix at exactly size bytes, so a
 // test can ask for a body one byte either side of a limit and mean it.
 func jsonOfExactly(t *testing.T, size int, prefix, suffix string) string {
