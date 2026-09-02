@@ -211,6 +211,15 @@ func NewRouter(
 	authenticated.GET("/me", meHandler(logger, authDeps.Service))
 	authenticated.POST("/auth/organization", switchOrganizationHandler(logger, authDeps.Service))
 
+	// Creating another workspace, for an account that already has one (#86).
+	//
+	// Under /me rather than at /organizations because /organizations is taken by
+	// the password-authenticated repair path (#34, ADR 0009) and the two must
+	// stay distinguishable from the route table alone -- see router_test.go's
+	// inventory. /me also says the right thing: the subject is the token's, and
+	// there is nowhere in the path or the body to name another account.
+	authenticated.POST("/me/organizations", createAdditionalOrganizationHandler(logger, authDeps.Service))
+
 	// Adding a member goes through the service rather than the store, because
 	// half of it — resolving an address to an account that may live entirely
 	// outside this tenant's visibility — travels the pre-tenant door, and

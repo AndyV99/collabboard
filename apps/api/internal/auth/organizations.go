@@ -56,12 +56,12 @@ package auth
 // # What it deliberately does not do
 //
 // It does not create a *second* organization for an account that already has
-// one. That is a real feature and issue #34 names it as the reason to prefer
-// this endpoint's shape over a self-healing login — but it is a different
-// authorization question (who may create a workspace, and how many) and it is not
-// what the issue asked for. An account with memberships gets
-// [ErrAlreadyHasOrganization]. Lifting that is one condition plus an answer to
-// the authorization question; filed as issue #86 rather than guessed at here.
+// one, and still does not. That is [Service.CreateAdditionalOrganization] (issue
+// #86), which is a different endpoint with a different credential: an account
+// with a workspace has a token, and should not be made to re-present a password
+// to use a feature. This one stays password-only because the account it serves
+// structurally cannot hold a token — see above. An account with memberships
+// still gets [ErrAlreadyHasOrganization] here.
 //
 // # The one-organization check is sequential, not serialized
 //
@@ -97,6 +97,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"strings"
 
 	"context"
 
@@ -112,6 +113,45 @@ import (
 // *after* a correct password, so it discloses nothing to anyone who does not
 // already hold the credential.
 var ErrAlreadyHasOrganization = errors.New("auth: account already belongs to an organization")
+
+// maxOwnedOrganizations is how many workspaces one account may own (issue #86).
+//
+// # The rule, and why it is a number rather than "as many as you like"
+//
+// Any authenticated account may create a workspace. There is no role check and
+// no allowlist: the product implies "create a workspace" is a thing a person
+// does, [Service.SwitchOrganization] and the web's org switcher already handle
+// an account belonging to several, and a rule that only let existing owners
+// create one would mean somebody invited into a colleague's workspace could
+// never start their own.
+//
+// What there is instead is a ceiling, because an uncapped create-workspace
+// endpoint is an uncapped **tenant factory**, and a tenant is the unit Stripe
+// will bill (#160). Uncapped, one account can mint arbitrarily many free tenants
+// and therefore arbitrarily many free seats, and the cap would then have to be
+// introduced retroactively against accounts already over it.
+//
+// Five is deliberately low and deliberately reversible. Raising a cap is a
+// one-line change nobody notices; lowering one strands accounts that are already
+// over it and needs a grandfathering rule, so the cheap direction is the one to
+// start in.
+//
+// # Why it counts what the account OWNS, not what it belongs to
+//
+// A membership someone else granted must not consume this budget. Being invited
+// into five colleagues' workspaces is not a reason to be unable to create your
+// own, and it would also hand every admin a way to exhaust another account's
+// quota by adding them to things. Ownership is also what maps to billing: the
+// owner is who pays for a tenant, so the owner is who should be limited in how
+// many they can create.
+const maxOwnedOrganizations = 5
+
+// ErrTooManyOrganizations means the account is at [maxOwnedOrganizations].
+//
+// Not an authorization failure: the caller may create workspaces, and has
+// created as many as they are allowed. That is why it maps to 409 rather than
+// 403 — the same reading as [ErrAlreadyHasOrganization], which it sits beside.
+var ErrTooManyOrganizations = errors.New("auth: account owns the maximum number of organizations")
 
 // CreateOrganizationInput is a password, and the workspace to create with it.
 //
@@ -215,6 +255,134 @@ func (s *Service) CreateFirstOrganization(ctx context.Context, in CreateOrganiza
 
 	return CreateOrganizationResult{
 		UserID:           subject.ID,
+		OrganizationID:   organization.ID,
+		OrganizationName: organization.Name,
+		OrganizationSlug: organization.Slug,
+		Role:             RoleOwner,
+	}, nil
+}
+
+// CreateAdditionalOrganizationInput names the workspace to create. It does not
+// name the account.
+//
+// The subject is a separate argument to [Service.CreateAdditionalOrganization]
+// and comes from the verified token, so there is structurally nowhere in this
+// struct to put somebody else's id — the same property [CreateOrganizationInput]
+// has, arrived at the same way.
+type CreateAdditionalOrganizationInput struct {
+	Name string
+}
+
+// CreateAdditionalOrganization gives an already-authenticated account another
+// workspace (issue #86).
+//
+// # Why this is a token endpoint and [Service.CreateFirstOrganization] is not
+//
+// They are the same operation for two accounts in different states, and the
+// difference is which credential the account has. A subject with zero
+// memberships cannot hold a token at all — four separate places in the auth path
+// refuse a nil tenant, and each of them *is* the tenant boundary — so the repair
+// path takes a password. An account that already has a workspace has a token,
+// and making it re-present a password to use an ordinary feature would be
+// friction with nothing behind it.
+//
+// So they are two routes rather than one route with two authentication modes.
+// router_test.go asserts exactly which routes answer without a token, and that
+// assertion is only meaningful while "is this route public?" has one answer per
+// route; a route that is sometimes public would make the anonymous surface
+// unanswerable from the route table, which is the property that test exists to
+// protect.
+//
+// # The authorization rule
+//
+// Any authenticated account, up to [maxOwnedOrganizations] owned. See that
+// constant for why there is a ceiling at all and why it counts ownership rather
+// than membership.
+//
+// # What it does not do
+//
+// It does not issue a session, and it does not switch the caller into the new
+// workspace. Token issuance stays in the three places the package doc names, each
+// of which derives the tenant from a membership it has just read; the caller's
+// next call is [Service.SwitchOrganization], which is the existing way to move
+// between workspaces and already does the membership read that makes the new
+// token honest. Returning a token here would make this a fourth writer of
+// [Principal.TenantID] to save one round trip.
+//
+// # The cap check is sequential, not serialized
+//
+// The same caveat [Service.CreateFirstOrganization] states, for the same
+// structural reason: the membership read and the provisioning are two
+// transactions, so two concurrent calls can both observe four owned workspaces
+// and both provision, leaving six. It needs the account's own valid token and
+// genuine concurrency, every workspace is correctly owned by that account, and
+// no boundary is crossed. A Redis single-flight was rejected there because a
+// stuck key would make the repair path unavailable; here the trade is milder
+// still, because the failure is one workspace over a soft ceiling rather than an
+// account that cannot recover.
+func (s *Service) CreateAdditionalOrganization(
+	ctx context.Context,
+	userID uuid.UUID,
+	in CreateAdditionalOrganizationInput,
+) (CreateOrganizationResult, error) {
+	// Required rather than defaulted, which is the one place this deliberately
+	// differs from the other two paths. "<display name>'s workspace" exists
+	// because registration has to produce *something* for a person who was not
+	// asked; somebody deliberately creating a second workspace has been asked,
+	// and a second "Andy's workspace" beside the first is not a kindness. It
+	// also saves a profile read this function otherwise has no reason to make.
+	name := strings.TrimSpace(in.Name)
+	if name == "" {
+		return CreateOrganizationResult{}, fmt.Errorf("%w: workspace name is required", ErrInvalidInput)
+	}
+
+	organizations, err := s.organizations(ctx, userID)
+	if err != nil {
+		return CreateOrganizationResult{}, err
+	}
+
+	owned := 0
+
+	for _, organization := range organizations {
+		if organization.Role == RoleOwner {
+			owned++
+		}
+	}
+
+	if owned >= maxOwnedOrganizations {
+		s.logger.InfoContext(ctx, "organization creation refused: the account is at the cap",
+			slog.String("event", "auth.organization.cap_reached"),
+			slog.String("user_id", userID.String()),
+			slog.Int("owned", owned),
+			slog.Int("cap", maxOwnedOrganizations),
+		)
+
+		return CreateOrganizationResult{}, ErrTooManyOrganizations
+	}
+
+	// userID, and there is no other expression in this function that could
+	// appear here. It is the subject the token verified as; nothing from the
+	// request body reaches this call.
+	organization, err := s.provisionOrganization(ctx, userID, name)
+	if err != nil {
+		s.logger.ErrorContext(ctx, "creating an additional organization failed",
+			slog.String("event", "auth.organization.create_failed"),
+			slog.String("user_id", userID.String()),
+			slog.Any("error", err),
+		)
+
+		return CreateOrganizationResult{}, fmt.Errorf("creating the organization: %w", err)
+	}
+
+	s.logger.InfoContext(ctx, "additional organization created",
+		slog.String("event", "auth.organization.created"),
+		slog.String("user_id", userID.String()),
+		slog.String("tenant_id", organization.ID.String()),
+		slog.Int("owned_before", owned),
+	)
+
+	return CreateOrganizationResult{
+		UserID:           userID,
 		OrganizationID:   organization.ID,
 		OrganizationName: organization.Name,
 		OrganizationSlug: organization.Slug,
