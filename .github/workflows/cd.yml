@@ -231,7 +231,7 @@ jobs:
       # task that dies at start with an exec format error, which reads like a
       # broken image rather than like a wrong platform.
       - name: Build and push the API image
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@v7
         with:
           context: .
           file: apps/api/Dockerfile
@@ -247,7 +247,7 @@ jobs:
           cache-to: type=gha,mode=max
 
       - name: Build and push the web image
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@v7
         with:
           context: .
           file: apps/web/Dockerfile
