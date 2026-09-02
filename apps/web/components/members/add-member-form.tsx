@@ -7,7 +7,11 @@ import { api } from "@/lib/api/browser";
 import { addMember } from "@/lib/api/endpoints";
 import { type AddMemberFailure, describeAddMemberFailure } from "@/lib/workspace/outcomes";
 import { ROLE_MEMBER, describeRole } from "@/lib/workspace/roles";
-import { MAX_EMAIL_BYTES, validateMemberEmail } from "@/lib/workspace/rules";
+import {
+  MAX_EMAIL_BYTES,
+  maxLengthForBytes,
+  validateMemberEmail,
+} from "@/lib/workspace/rules";
 import { FormMessage, SelectField, TextField } from "@/components/workspace/fields";
 import styles from "@/components/workspace/workspace.module.css";
 
@@ -141,7 +145,7 @@ export function AddMemberForm({ roles }: { roles: readonly string[] }) {
         id={emailId}
         inputRef={emailRef}
         label="Email address"
-        maxLength={MAX_EMAIL_BYTES}
+        maxLength={maxLengthForBytes(MAX_EMAIL_BYTES)}
         onChange={setEmail}
         type="email"
         value={email}

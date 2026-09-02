@@ -10,6 +10,7 @@ import { projectHref } from "@/lib/workspace/routes";
 import {
   MAX_DESCRIPTION_CODE_POINTS,
   MAX_NAME_CODE_POINTS,
+  maxLengthFor,
   validateDescription,
   validateName,
 } from "@/lib/workspace/rules";
@@ -153,7 +154,7 @@ export function CreateProjectForm({ autoFocus = false }: { autoFocus?: boolean }
         id={nameId}
         inputRef={nameRef}
         label="Project name"
-        maxLength={MAX_NAME_CODE_POINTS}
+        maxLength={maxLengthFor(MAX_NAME_CODE_POINTS)}
         onChange={setName}
         value={name}
       />
@@ -163,7 +164,7 @@ export function CreateProjectForm({ autoFocus = false }: { autoFocus?: boolean }
         error={descriptionError}
         id={descriptionId}
         label="Description"
-        maxLength={MAX_DESCRIPTION_CODE_POINTS}
+        maxLength={maxLengthFor(MAX_DESCRIPTION_CODE_POINTS)}
         onChange={setDescription}
         optional
         value={description}

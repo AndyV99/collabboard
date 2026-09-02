@@ -10,6 +10,7 @@ import { describeWriteFailure } from "@/lib/workspace/outcomes";
 import {
   MAX_DESCRIPTION_CODE_POINTS,
   MAX_NAME_CODE_POINTS,
+  maxLengthFor,
   projectChanged,
   validateDescription,
   validateName,
@@ -157,7 +158,7 @@ export function RenameProjectForm({ project }: { project: Project }) {
         error={nameError}
         id={nameId}
         label="Project name"
-        maxLength={MAX_NAME_CODE_POINTS}
+        maxLength={maxLengthFor(MAX_NAME_CODE_POINTS)}
         onChange={setName}
         value={name}
       />
@@ -168,7 +169,7 @@ export function RenameProjectForm({ project }: { project: Project }) {
         hint="Leave it empty to remove the description."
         id={descriptionId}
         label="Description"
-        maxLength={MAX_DESCRIPTION_CODE_POINTS}
+        maxLength={maxLengthFor(MAX_DESCRIPTION_CODE_POINTS)}
         onChange={setDescription}
         optional
         value={description}
