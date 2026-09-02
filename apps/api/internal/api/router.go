@@ -15,12 +15,49 @@ import (
 // why that fallback is a bypass once anything upstream is trusted.
 const forwardedForHeader = "X-Forwarded-For"
 
+// logEventAuthDepsAbsent names the warning NewRouter emits when it is asked to
+// build a router that cannot serve /api/v1. Same convention as
+// realtime.publisher.absent further down: a noun path, past tense of nothing.
+const logEventAuthDepsAbsent = "auth.dependencies.absent"
+
+// The names [missingAuthDeps] reports, matching the struct fields an operator
+// would go looking for. Constants because the warning and the test that asserts
+// it must agree on the spelling, and a typo in either would otherwise be a
+// green test about a log line nobody can grep for.
+const (
+	authDepService  = "Service"
+	authDepVerifier = "Verifier"
+	authDepsBoth    = authDepService + " and " + authDepVerifier
+	authDepsNone    = "none"
+)
+
+// missingAuthDeps names which halves of [AuthDeps] are nil, for the warning.
+//
+// Total rather than partial — "none" is unreachable from the one caller, which
+// checks first — because a function that is only correct under its caller's
+// guard is one that cannot be tested on its own, and the whole point of this
+// issue is a log line that says the right thing.
+func missingAuthDeps(deps AuthDeps) string {
+	switch {
+	case deps.Service == nil && deps.Verifier == nil:
+		return authDepsBoth
+	case deps.Service == nil:
+		return authDepService
+	case deps.Verifier == nil:
+		return authDepVerifier
+	default:
+		return authDepsNone
+	}
+}
+
 // NewRouter builds the Gin engine with the service's middleware and routes.
 //
 // Auth and realtime are optional so that a build without them — the health-only
 // configuration the tests for /healthz use — still produces a working engine
 // rather than a nil dereference on the first request. In cmd/api both are
-// always supplied.
+// always supplied. A router built without auth warns rather than returning
+// quietly; see the comment on the early return below for why, and for why
+// /healthz does not gain a component to match.
 //
 // limits is configuration rather than a dependency, which is why it comes first
 // and not as another Deps struct. Its zero value is a working pair of limits,
@@ -93,7 +130,50 @@ func NewRouter(
 
 	router.GET("/healthz", healthHandler(logger, deps))
 
+	// A router that cannot serve a single /api/v1 route, saying so.
+	//
+	// This is not reachable from cmd/api: resolveAuthSecret in internal/config
+	// either fails startup outside development or generates a per-process secret
+	// in it, so main.go never gets here with nil auth deps. The early return is
+	// a deliberate affordance for health_test.go, which wants an engine that
+	// serves /healthz and nothing else, and that use is worth keeping.
+	//
+	// It says so anyway because the failure mode is the expensive kind: the
+	// symptom is a 404 on a route you can read in the source, and the cause is
+	// nowhere near it. #72 was filed against exactly that and cost real
+	// debugging time before its premise turned out to be false. Any future
+	// caller that wires auth conditionally — a second entrypoint, an embedded
+	// test server, a half-configured deployment — reproduces it for real, with
+	// the same silence.
+	//
+	// # Why /healthz does not gain an auth component
+	//
+	// It reports 200 here while serving nothing, which looks like a health check
+	// that satisfies a load balancer and lies to a human. The answer is still
+	// no, for three reasons that all point the same way.
+	//
+	// A component that can only ever say one thing is not a signal. In every
+	// process that serves traffic this state is unreachable, so "auth: ok" would
+	// be a constant — a line of JSON on every probe, several times a second,
+	// carrying no information anyone could act on.
+	//
+	// Worse, it would over-promise. The only thing this function knows is that
+	// two pointers were non-nil when the engine was built; it knows nothing
+	// about whether the secret is the right one or whether the verifier will
+	// accept a single token. A component named "auth" reporting ok on that basis
+	// is a stronger claim than the code can support, which is a worse failure
+	// than the silence it replaces.
+	//
+	// And it is a startup fact, so it belongs where startup facts go. An
+	// operator reads the log once; the load balancer reads /healthz forever.
+	// Keeping it out also keeps it clear of whatever disclosure policy #31
+	// settles on for the health payload -- see HealthDeps.DiscloseErrors.
 	if authDeps.Service == nil || authDeps.Verifier == nil {
+		logger.Warn("auth dependencies are missing; this router serves /healthz and no /api/v1 route at all",
+			slog.String("event", logEventAuthDepsAbsent),
+			slog.String("missing", missingAuthDeps(authDeps)),
+		)
+
 		return router
 	}
 

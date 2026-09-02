@@ -23,6 +23,9 @@ package api
 // protected.
 
 import (
+	"bytes"
+	"encoding/json"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -156,4 +159,158 @@ func TestTheRouteInventoryAssertionHasTeeth(t *testing.T) {
 
 	t.Logf("an unprotected GET /api/v1/projects answers %d, and is not in publicRoutes, "+
 		"so the inventory test would fail on it", rec.Code)
+}
+
+// A router that cannot serve /api/v1 must say so (#84).
+//
+// The point of the issue is the log line, so an untested one does not close it.
+// The failure it guards against is the expensive kind: a 404 on a route you can
+// read in the source, with the cause nowhere near the symptom. #72 was filed
+// against exactly that.
+//
+// This state is unreachable from cmd/api today — resolveAuthSecret either fails
+// startup or generates a development secret — so what is being protected is the
+// next caller that wires auth conditionally, not the current one.
+func TestRouterWarnsWhenItCannotServeAnyAPIRoute(t *testing.T) {
+	t.Parallel()
+
+	gin.SetMode(gin.TestMode)
+
+	cases := []struct {
+		name    string
+		deps    AuthDeps
+		missing string
+	}{
+		{"neither", AuthDeps{}, authDepsBoth},
+		{"no verifier", AuthDeps{Service: &countingAuthService{}}, authDepVerifier},
+		{"no service", AuthDeps{Verifier: testIssuer(t)}, authDepService},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var logged bytes.Buffer
+
+			logger := slog.New(slog.NewJSONHandler(&logged, nil))
+
+			router := NewRouter(logger, BodyLimits{}, nil,
+				HealthDeps{Postgres: stubPinger{}, Redis: stubPinger{}},
+				tc.deps, RealtimeDeps{})
+
+			line := onlyWarning(t, &logged, logEventAuthDepsAbsent)
+
+			if got := line["missing"]; got != tc.missing {
+				t.Errorf("missing = %v, want %q", got, tc.missing)
+			}
+
+			// The consequence, in the message, in words. A reader who greps the
+			// logs for "404" will not find this; a reader who reads them will.
+			if msg, _ := line["msg"].(string); !strings.Contains(msg, "/api/v1") {
+				t.Errorf("message %q does not say which surface is missing", msg)
+			}
+
+			if level, _ := line["level"].(string); level != "WARN" {
+				t.Errorf("level = %q, want WARN", level)
+			}
+
+			// And the state the warning is about is real: /healthz answers,
+			// nothing else is mounted. Without this the test would pass against
+			// a router that logged the warning and served the routes anyway.
+			for _, route := range router.Routes() {
+				if strings.HasPrefix(route.Path, "/api/v1") {
+					t.Fatalf("%s %s is mounted; the warning describes a router that has no such route",
+						route.Method, route.Path)
+				}
+			}
+
+			rec := httptest.NewRecorder()
+			router.ServeHTTP(rec, httptest.NewRequestWithContext(
+				t.Context(), http.MethodGet, "/healthz", nil))
+
+			if rec.Code != http.StatusOK {
+				t.Errorf("/healthz = %d, want 200; the health-only router is the point of the early return",
+					rec.Code)
+			}
+		})
+	}
+}
+
+// A fully wired router must not warn, or the warning means nothing.
+func TestRouterDoesNotWarnWhenAuthIsWired(t *testing.T) {
+	t.Parallel()
+
+	gin.SetMode(gin.TestMode)
+
+	var logged bytes.Buffer
+
+	NewRouter(slog.New(slog.NewJSONHandler(&logged, nil)), BodyLimits{}, nil,
+		HealthDeps{Postgres: stubPinger{}, Redis: stubPinger{}},
+		AuthDeps{Service: &countingAuthService{}, Verifier: testIssuer(t), Store: newCRUDStore()},
+		RealtimeDeps{
+			Connect:   func(c *gin.Context) { c.Status(http.StatusSwitchingProtocols) },
+			Publisher: &recordingPublisher{},
+		})
+
+	if strings.Contains(logged.String(), logEventAuthDepsAbsent) {
+		t.Errorf("a fully wired router warned: %s", logged.String())
+	}
+}
+
+// missingAuthDeps is total on purpose, so its unreachable branch is reachable
+// from a test rather than being a claim about a caller.
+func TestMissingAuthDepsNamesWhatIsAbsent(t *testing.T) {
+	t.Parallel()
+
+	service := &countingAuthService{}
+	verifier := testIssuer(t)
+
+	cases := []struct {
+		deps AuthDeps
+		want string
+	}{
+		{AuthDeps{}, authDepsBoth},
+		{AuthDeps{Service: service}, authDepVerifier},
+		{AuthDeps{Verifier: verifier}, authDepService},
+		{AuthDeps{Service: service, Verifier: verifier}, authDepsNone},
+	}
+
+	for _, tc := range cases {
+		if got := missingAuthDeps(tc.deps); got != tc.want {
+			t.Errorf("missingAuthDeps(%+v) = %q, want %q", tc.deps, got, tc.want)
+		}
+	}
+}
+
+// onlyWarning returns the single logged line carrying an event name, failing if
+// there is not exactly one.
+//
+// "Exactly one" rather than "at least one": a warning emitted twice per router
+// is how a startup line becomes noise, and noise is what trains people to stop
+// reading warnings — which is the failure this issue is trying to avoid rather
+// than cause.
+func onlyWarning(t *testing.T, logged *bytes.Buffer, event string) map[string]any {
+	t.Helper()
+
+	var found []map[string]any
+
+	for _, raw := range strings.Split(strings.TrimSpace(logged.String()), "\n") {
+		if raw == "" {
+			continue
+		}
+
+		var line map[string]any
+		if err := json.Unmarshal([]byte(raw), &line); err != nil {
+			t.Fatalf("log line %q is not JSON: %v", raw, err)
+		}
+
+		if line["event"] == event {
+			found = append(found, line)
+		}
+	}
+
+	if len(found) != 1 {
+		t.Fatalf("found %d lines with event %q, want exactly 1; logged:\n%s",
+			len(found), event, logged.String())
+	}
+
+	return found[0]
 }
