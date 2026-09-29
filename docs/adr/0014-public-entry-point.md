@@ -1,7 +1,7 @@
 # 0014. The public entry point: the web tier on ECS, and an API that is not on the internet
 
 Date: 2026-08-10
-Status: accepted
+Status: accepted — scope narrowed by 0016 to the AWS reference stack
 
 ## Context
 

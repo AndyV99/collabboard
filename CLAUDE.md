@@ -1,8 +1,8 @@
 # CollabBoard
 
-Full-stack multi-tenant SaaS Kanban tool with real-time collaboration and Stripe billing. Global conventions and cross-cutting standards live in `~/.claude/CLAUDE.md` and the vault — this file only covers repo-local mechanics.
+Full-stack multi-tenant SaaS Kanban tool with real-time collaboration. Deploys to the shared Basecamp platform (ADR 0016). No payment integration: capabilities are gated by entitlements (#199). Global conventions and cross-cutting standards live in `~/.claude/CLAUDE.md` and the vault — this file only covers repo-local mechanics.
 
-**Vault note**: `Projects/01 Full-Stack SaaS Platform.md` (path relative to the vault root — see the `Source of truth` section in the global `CLAUDE.md` for how to find it).
+**Vault note**: `Projects/P1 CollabBoard.md` (path relative to the vault root — see the `Source of truth` section in the global `CLAUDE.md` for how to find it).
 
 ## What to work on
 
@@ -17,7 +17,7 @@ Within a phase, anything without an "after" line can be worked in parallel.
 
 - `apps/web` — Next.js (TypeScript), React Server Components + a WebSocket client for live updates.
 - `apps/api` — Go (Gin) REST API + WebSocket hub. Module path: `github.com/AndyV99/collabboard/apps/api`.
-- `infra/terraform` — VPC, ECS Fargate, RDS, ElastiCache, S3, ALB.
+- `infra/terraform` — the AWS **reference** production shape (VPC, ECS Fargate, RDS, ElastiCache, S3, ALB). Tested in CI, not applied continuously (ADR 0016). The live deploy is a tenant in `AndyV99/basecamp` (`tenants/collabboard/`).
 - `docs/adr` — architecture decision records.
 
 ## Decided stack — do not re-litigate these
@@ -33,10 +33,8 @@ without a new ADR.
 | Migrations | **goose** | Plain up/down SQL, embedded via `go:embed` so migrations ship with the binary. RLS policies expressed directly in SQL. |
 | Job queue | **Asynq (Redis)** | Redis is already in the compose stack, so the dev loop works offline with no AWS credentials. |
 
-The vault has been updated to match these choices — `Projects/01 Full-Stack
-SaaS Platform.md` now names Asynq in both the Async work section and the
-architecture diagram, so the vault and this file agree. Keep them that way: if
-one of these decisions changes, change it in both places in the same session.
+Keep the vault note (`Projects/P1 CollabBoard.md`) and this table in agreement:
+if one of these decisions changes, change it in both places in the same session.
 
 ## Layout conventions (Go side)
 
@@ -62,4 +60,5 @@ Run `scripts/setup-hooks.sh` once per clone. It points `core.hooksPath` at `.git
 ## Repo-specific notes
 
 - Tenant isolation is enforced via Postgres row-level security — any new query against tenant-scoped tables must go through the existing `internal/store` helpers that set the tenant context, never a raw query that bypasses it.
-- Stripe webhook handler must verify signatures and be idempotent (dedupe on Stripe's event ID) — this is exactly the kind of thing `review-standards` should specifically check on any PR touching billing.
+- Capability limits (owned workspaces, members, boards, attachment size) go through the entitlements check once #199 lands, never a constant and never payment state. There is no billing code, and none should be added without a new decision.
+- Anything that must work on the live deploy has to work behind Cloudflare Tunnel → Traefik on arm64 **and** amd64 (Basecamp stays portable to an x86 home server).
