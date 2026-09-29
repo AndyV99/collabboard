@@ -1,7 +1,7 @@
 # 0012. Three-tier VPC, and buying fidelity back where it is cheap
 
 Date: 2026-08-10
-Status: accepted
+Status: accepted — scope narrowed by 0016 to the AWS reference stack
 
 ## Context
 

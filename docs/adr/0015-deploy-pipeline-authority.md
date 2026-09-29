@@ -1,7 +1,7 @@
 # 0015. What the deploy pipeline is allowed to change
 
 Date: 2026-08-28
-Status: accepted
+Status: accepted — scope narrowed by 0016 to the AWS reference stack
 
 ## Context
 
