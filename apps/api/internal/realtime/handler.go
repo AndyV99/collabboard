@@ -94,7 +94,7 @@ func (h *Hub) ConnectHandler() gin.HandlerFunc {
 		})
 		if err != nil {
 			// Accept has already written the response.
-			h.logger.Info("realtime upgrade refused",
+			h.logger.InfoContext(c.Request.Context(), "realtime upgrade refused",
 				slog.String("event", "realtime.upgrade.refused"),
 				slog.String("client_ip", c.ClientIP()),
 				slog.Any("error", err),

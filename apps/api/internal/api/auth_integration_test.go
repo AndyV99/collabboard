@@ -21,7 +21,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -35,6 +34,7 @@ import (
 
 	"github.com/AndyV99/collabboard/apps/api/internal/api"
 	"github.com/AndyV99/collabboard/apps/api/internal/auth"
+	"github.com/AndyV99/collabboard/apps/api/internal/logging"
 	"github.com/AndyV99/collabboard/apps/api/internal/store"
 	"github.com/AndyV99/collabboard/apps/api/internal/testsupport/pgtest"
 	"github.com/AndyV99/collabboard/apps/api/internal/testsupport/redistest"
@@ -123,7 +123,11 @@ func newServer(t *testing.T, limits auth.RateLimitConfig, wrapAuthStore ...func(
 	}
 
 	logs := &bytes.Buffer{}
-	logger := slog.New(slog.NewJSONHandler(logs, &slog.HandlerOptions{Level: slog.LevelDebug}))
+	// The production constructor, because the wrapping it does is load-bearing:
+	// since #95 the request id reaches a line through logging.ContextHandler
+	// rather than through an attr at the call site, so a fixture built as a bare
+	// JSON handler asserts the absence of a field production has.
+	logger := logging.New(logs, "collabboard-api-test", "debug")
 
 	dataStore := store.New(testDB.AppPool(t, 6))
 	kv := auth.NewRedisKeyValue(testRedis.Client(t, int(redisDB.Add(1))%16))

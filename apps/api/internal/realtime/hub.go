@@ -449,7 +449,7 @@ func (h *Hub) shutdown(ctx context.Context) error {
 	// take (connections × grace), which at ten thousand sockets is minutes
 	// rather than the milliseconds it costs here.
 	for _, conn := range live {
-		conn.notifyShutdown(h.reconnectHint())
+		conn.notifyShutdown(ctx, h.reconnectHint())
 	}
 
 	if len(live) > 0 {

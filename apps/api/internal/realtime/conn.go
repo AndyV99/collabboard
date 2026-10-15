@@ -172,7 +172,7 @@ func (c *Conn) serve(ctx context.Context) {
 	go func() { defer wg.Done(); c.writePump(ctx) }()
 	go func() { defer wg.Done(); c.maintain(ctx) }()
 
-	c.logger.Info("realtime connection opened",
+	c.logger.InfoContext(ctx, "realtime connection opened",
 		slog.String("event", "realtime.connection.opened"),
 		slog.Time("token_expires_at", c.principal.ExpiresAt),
 	)
@@ -193,7 +193,7 @@ func (c *Conn) serve(ctx context.Context) {
 
 	status, reason := c.closeInfo()
 
-	c.logger.Info("realtime connection closed",
+	c.logger.InfoContext(ctx, "realtime connection closed",
 		slog.String("event", "realtime.connection.closed"),
 		slog.Int("close_status", int(status)),
 		slog.String("close_reason", reason),
@@ -206,7 +206,7 @@ func (c *Conn) readPump(ctx context.Context) {
 	for {
 		kind, data, err := c.ws.Read(ctx)
 		if err != nil {
-			c.logReadEnd(err)
+			c.logReadEnd(ctx, err)
 
 			return
 		}
@@ -225,7 +225,7 @@ func (c *Conn) readPump(ctx context.Context) {
 
 // logReadEnd records why the read side stopped, at a level that reflects
 // whether it is worth anybody's attention. A client closing a tab is not.
-func (c *Conn) logReadEnd(err error) {
+func (c *Conn) logReadEnd(ctx context.Context, err error) {
 	switch {
 	case errors.Is(err, context.Canceled), errors.Is(err, context.DeadlineExceeded):
 		return
@@ -240,7 +240,7 @@ func (c *Conn) logReadEnd(err error) {
 	default:
 	}
 
-	c.logger.Info("realtime connection read ended",
+	c.logger.InfoContext(ctx, "realtime connection read ended",
 		slog.String("event", "realtime.connection.read_ended"),
 		slog.Any("error", err),
 	)
@@ -269,9 +269,9 @@ func (c *Conn) handleFrame(ctx context.Context, data []byte) bool {
 	case clientUnsubscribe:
 		c.handleUnsubscribe(ctx, frame)
 	case clientPing:
-		c.sendFrame(Frame{Type: FramePong})
+		c.sendFrame(ctx, Frame{Type: FramePong})
 	default:
-		c.sendFrame(Frame{
+		c.sendFrame(ctx, Frame{
 			Type:    FrameError,
 			Reason:  ReasonInvalid,
 			Message: "unknown frame type",
@@ -284,7 +284,7 @@ func (c *Conn) handleFrame(ctx context.Context, data []byte) bool {
 func (c *Conn) handleSubscribe(ctx context.Context, frame clientFrame) {
 	boardID, ok := parseBoardID(frame.BoardID)
 	if !ok {
-		c.sendFrame(Frame{Type: FrameError, Reason: ReasonInvalid, Message: messageBoardIDNotUUID})
+		c.sendFrame(ctx, Frame{Type: FrameError, Reason: ReasonInvalid, Message: messageBoardIDNotUUID})
 
 		return
 	}
@@ -292,13 +292,13 @@ func (c *Conn) handleSubscribe(ctx context.Context, frame clientFrame) {
 	room := principalRoom(c.principal, boardID)
 
 	if c.holdsRoom(room) {
-		c.sendFrame(Frame{Type: FrameSubscribed, BoardID: &boardID})
+		c.sendFrame(ctx, Frame{Type: FrameSubscribed, BoardID: &boardID})
 
 		return
 	}
 
 	if c.roomCount() >= c.hub.cfg.MaxRoomsPerConnection {
-		c.sendFrame(Frame{Type: FrameError, BoardID: &boardID, Reason: ReasonTooManyRooms,
+		c.sendFrame(ctx, Frame{Type: FrameError, BoardID: &boardID, Reason: ReasonTooManyRooms,
 			Message: "unsubscribe from a board before watching another"})
 
 		return
@@ -308,26 +308,26 @@ func (c *Conn) handleSubscribe(ctx context.Context, frame clientFrame) {
 	// refusal, including the ones that are not ErrForbidden: an authorizer that
 	// could not reach the database has not said yes.
 	if err := c.authorizeBoard(ctx, boardID); err != nil {
-		c.refuseSubscription(boardID, err)
+		c.refuseSubscription(ctx, boardID, err)
 
 		return
 	}
 
 	if err := c.hub.join(ctx, room, c); err != nil {
 		if errors.Is(err, ErrHubClosed) {
-			c.sendFrame(Frame{Type: FrameError, BoardID: &boardID, Reason: ReasonUnavailable,
+			c.sendFrame(ctx, Frame{Type: FrameError, BoardID: &boardID, Reason: ReasonUnavailable,
 				Message: "this instance is restarting; reconnect"})
 
 			return
 		}
 
-		c.logger.Error("joining a realtime room failed",
+		c.logger.ErrorContext(ctx, "joining a realtime room failed",
 			slog.String("event", "realtime.room.join_failed"),
 			slog.String("room", room.String()),
 			slog.Any("error", err),
 		)
 
-		c.sendFrame(Frame{Type: FrameError, BoardID: &boardID, Reason: ReasonUnavailable,
+		c.sendFrame(ctx, Frame{Type: FrameError, BoardID: &boardID, Reason: ReasonUnavailable,
 			Message: "could not subscribe; try again"})
 
 		return
@@ -335,12 +335,12 @@ func (c *Conn) handleSubscribe(ctx context.Context, frame clientFrame) {
 
 	c.rememberRoom(room)
 
-	c.logger.Info("realtime subscription opened",
+	c.logger.InfoContext(ctx, "realtime subscription opened",
 		slog.String("event", "realtime.subscription.opened"),
 		slog.String("board_id", boardID.String()),
 	)
 
-	c.sendFrame(Frame{Type: FrameSubscribed, BoardID: &boardID})
+	c.sendFrame(ctx, Frame{Type: FrameSubscribed, BoardID: &boardID})
 }
 
 // authorizeBoard and authorizeTenant are the only two calls into the
@@ -366,33 +366,33 @@ func (c *Conn) authorizeTenant(ctx context.Context) error {
 // worth retrying — but neither discloses anything about the board. A refusal
 // looks identical for a board in another tenant and a board that does not
 // exist.
-func (c *Conn) refuseSubscription(boardID uuid.UUID, err error) {
+func (c *Conn) refuseSubscription(ctx context.Context, boardID uuid.UUID, err error) {
 	if errors.Is(err, ErrForbidden) {
-		c.logger.Info("refused a realtime subscription",
+		c.logger.InfoContext(ctx, "refused a realtime subscription",
 			slog.String("event", "realtime.subscription.refused"),
 			slog.String("board_id", boardID.String()),
 		)
 
-		c.sendFrame(Frame{Type: FrameError, BoardID: &boardID, Reason: ReasonForbidden,
+		c.sendFrame(ctx, Frame{Type: FrameError, BoardID: &boardID, Reason: ReasonForbidden,
 			Message: "not authorized for that board"})
 
 		return
 	}
 
-	c.logger.Error("authorizing a realtime subscription failed",
+	c.logger.ErrorContext(ctx, "authorizing a realtime subscription failed",
 		slog.String("event", "realtime.subscription.authorize_failed"),
 		slog.String("board_id", boardID.String()),
 		slog.Any("error", err),
 	)
 
-	c.sendFrame(Frame{Type: FrameError, BoardID: &boardID, Reason: ReasonUnavailable,
+	c.sendFrame(ctx, Frame{Type: FrameError, BoardID: &boardID, Reason: ReasonUnavailable,
 		Message: "could not check access; try again"})
 }
 
 func (c *Conn) handleUnsubscribe(ctx context.Context, frame clientFrame) {
 	boardID, ok := parseBoardID(frame.BoardID)
 	if !ok {
-		c.sendFrame(Frame{Type: FrameError, Reason: ReasonInvalid, Message: messageBoardIDNotUUID})
+		c.sendFrame(ctx, Frame{Type: FrameError, Reason: ReasonInvalid, Message: messageBoardIDNotUUID})
 
 		return
 	}
@@ -402,7 +402,7 @@ func (c *Conn) handleUnsubscribe(ctx context.Context, frame clientFrame) {
 	c.hub.leave(ctx, room, c)
 	c.forgetRoom(room)
 
-	c.sendFrame(Frame{Type: FrameUnsubscribed, BoardID: &boardID})
+	c.sendFrame(ctx, Frame{Type: FrameUnsubscribed, BoardID: &boardID})
 }
 
 // writePump owns every write on this socket, data frames and the close frame
@@ -492,7 +492,7 @@ func (c *Conn) maintain(ctx context.Context) {
 		// running on a token that has already expired. This makes the deadline
 		// the first thing considered after anything slow returns.
 		if !c.principal.ExpiresAt.IsZero() && c.hub.cfg.now().After(c.principal.ExpiresAt) {
-			c.logger.Info("closing a realtime connection whose token expired",
+			c.logger.InfoContext(ctx, "closing a realtime connection whose token expired",
 				slog.String("event", "realtime.connection.token_expired"))
 			c.close(StatusTokenExpired, "access token expired; refresh and reconnect")
 
@@ -505,7 +505,7 @@ func (c *Conn) maintain(ctx context.Context) {
 		case <-c.closed:
 			return
 		case <-expiry.C:
-			c.logger.Info("closing a realtime connection whose token expired",
+			c.logger.InfoContext(ctx, "closing a realtime connection whose token expired",
 				slog.String("event", "realtime.connection.token_expired"))
 			c.close(StatusTokenExpired, "access token expired; refresh and reconnect")
 
@@ -535,7 +535,7 @@ func (c *Conn) pingPeer(ctx context.Context) bool {
 	if err := c.ws.Ping(pingCtx); err != nil {
 		// Not logged at error: the overwhelmingly common cause is a client that
 		// went away, which is ordinary.
-		c.logger.Info("reaping an unresponsive realtime connection",
+		c.logger.InfoContext(ctx, "reaping an unresponsive realtime connection",
 			slog.String("event", "realtime.connection.reaped"),
 			slog.Any("error", err),
 		)
@@ -558,7 +558,7 @@ func (c *Conn) reauthorize(ctx context.Context) bool {
 			// a fleet-wide disconnect storm, and the next sweep is 30 seconds
 			// away. New subscriptions still fail closed, and the token deadline
 			// still caps the connection.
-			c.logger.Warn("re-authorizing a realtime connection failed",
+			c.logger.WarnContext(ctx, "re-authorizing a realtime connection failed",
 				slog.String("event", "realtime.connection.reauthorize_failed"),
 				slog.Any("error", err),
 			)
@@ -566,7 +566,7 @@ func (c *Conn) reauthorize(ctx context.Context) bool {
 			return true
 		}
 
-		c.logger.Info("closing a realtime connection whose membership was revoked",
+		c.logger.InfoContext(ctx, "closing a realtime connection whose membership was revoked",
 			slog.String("event", "realtime.connection.membership_revoked"))
 
 		c.close(StatusMembershipRevoked, "membership revoked")
@@ -583,14 +583,14 @@ func (c *Conn) reauthorize(ctx context.Context) bool {
 
 		boardID := room.BoardID
 
-		c.logger.Info("revoking a realtime subscription",
+		c.logger.InfoContext(ctx, "revoking a realtime subscription",
 			slog.String("event", "realtime.subscription.revoked"),
 			slog.String("board_id", boardID.String()),
 		)
 
 		c.hub.leave(ctx, room, c)
 		c.forgetRoom(room)
-		c.sendFrame(Frame{Type: FrameUnsubscribed, BoardID: &boardID, Reason: ReasonForbidden})
+		c.sendFrame(ctx, Frame{Type: FrameUnsubscribed, BoardID: &boardID, Reason: ReasonForbidden})
 	}
 
 	return true
@@ -635,10 +635,10 @@ func (c *Conn) trySend(payload []byte) bool {
 // sendFrame queues a server-generated frame. A client too slow to accept its
 // own subscription acknowledgement is dropped for the same reason it would be
 // dropped for lagging on events.
-func (c *Conn) sendFrame(frame Frame) {
+func (c *Conn) sendFrame(ctx context.Context, frame Frame) {
 	payload, err := frame.encode()
 	if err != nil {
-		c.logger.Error("encoding a realtime frame failed",
+		c.logger.ErrorContext(ctx, "encoding a realtime frame failed",
 			slog.String("event", "realtime.frame.encode_failed"),
 			slog.String("frame_type", frame.Type),
 			slog.Any("error", err),
@@ -659,8 +659,10 @@ func (c *Conn) sendFrame(frame Frame) {
 // per-connection would make a drain cost (connections × grace) — minutes at ten
 // thousand sockets, for a pause that is only there to let the write pump get
 // ahead of the close handshake.
-func (c *Conn) notifyShutdown(reconnectAfter time.Duration) {
-	c.sendFrame(Frame{
+// The context is the shutdown's, not a request's -- it carries no request id,
+// which is correct: a drain is not something a client asked for.
+func (c *Conn) notifyShutdown(ctx context.Context, reconnectAfter time.Duration) {
+	c.sendFrame(ctx, Frame{
 		Type:             FrameShutdown,
 		Message:          "this instance is restarting",
 		ReconnectAfterMs: reconnectAfter.Milliseconds(),
